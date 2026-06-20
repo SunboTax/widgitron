@@ -1,16 +1,49 @@
-use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::models::{
     AppConfig, ArxivConfig, ArxivPaper, GlobalState, GpuConfig,
     PaperConfig, PaperDeadlineInfo, WidgetThemeConfig, ServerGpuData,
-    QuotaConfig, QuotaItem,
+    QuotaConfig, QuotaItem, ToggleWidgetResponse,
 };
 use crate::config_store;
 
 #[tauri::command]
-pub async fn save_gpu_config(app: AppHandle, config: GpuConfig) -> Result<(), String> {
-    config_store::write_config(&app, "gpu_monitor.json", &config)
+pub async fn save_gpu_config(
+    app: AppHandle,
+    state: tauri::State<'_, GlobalState>,
+    mut config: GpuConfig,
+) -> Result<(), String> {
+    config.servers.retain(|server| !server.host.trim().is_empty());
+
+    let previous = config_store::read_config::<GpuConfig>(&app, "gpu_monitor.json");
+    let previous_hosts: std::collections::HashSet<String> = previous
+        .servers
+        .iter()
+        .map(|server| server.host.clone())
+        .collect();
+    let next_hosts: std::collections::HashSet<String> = config
+        .servers
+        .iter()
+        .map(|server| server.host.clone())
+        .collect();
+
+    config_store::write_config(&app, "gpu_monitor.json", &config)?;
+    let _ = app.emit("gpu_config_update", &config);
+
+    for host in previous_hosts.difference(&next_hosts) {
+        let removed = state
+            .gpu_data
+            .lock()
+            .ok()
+            .and_then(|mut data| data.remove(host));
+        if removed.is_some() {
+            let _ = app.emit("gpu_prune", host.clone());
+        }
+    }
+
+    crate::gpu::persist_gpu_data_cache(&app, state.inner());
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -20,25 +53,49 @@ pub async fn save_paper_config(
     config: PaperConfig,
 ) -> Result<(), String> {
     config_store::write_config(&app, "paper_deadline.json", &config)?;
+    let _ = app.emit("paper_config_update", &config);
 
-    // Trigger immediate UI refresh if we have cached YAML
-    let yaml = {
-        let last = state.last_yaml.lock().map_err(|e| e.to_string())?;
-        last.clone()
-    };
-    if let Some(text) = yaml {
-        let state_arc = Arc::new(GlobalState {
-            deadlines: state.deadlines.clone(),
-            gpu_data: state.gpu_data.clone(),
-            last_yaml: state.last_yaml.clone(),
-            active_monitors: state.active_monitors.clone(),
-            active_workers: state.active_workers.clone(),
-            arxiv_papers: state.arxiv_papers.clone(),
-            quota_data: state.quota_data.clone(),
-            widget_toggle_lock: state.widget_toggle_lock.clone(),
-        });
-        crate::deadlines::process_deadlines(app, state_arc, config, text);
+    let app_config = config_store::read_config::<AppConfig>(&app, "app_config.json");
+    if !app_config.deadline_enabled.unwrap_or(true) {
+        return Ok(());
     }
+
+    let yaml = state
+        .last_yaml
+        .lock()
+        .ok()
+        .and_then(|last| last.clone());
+
+    if let Some(text) = yaml {
+        let config_clone = config.clone();
+        let text_clone = text.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::deadlines::build_deadlines_from_yaml(&text_clone, &config_clone)
+        })
+        .await
+        {
+            Ok(Ok(deadlines)) => {
+                crate::deadlines::apply_deadline_fetch_success(
+                    &app,
+                    state.inner(),
+                    deadlines,
+                );
+            }
+            Ok(Err(e)) => {
+                log::warn!("Deadline reprocess after config save failed: {}", e);
+                let _ = app.emit("paper_error", e);
+            }
+            Err(e) => {
+                log::warn!("Deadline reprocess task failed: {}", e);
+            }
+        }
+    } else if let Err(e) =
+        crate::deadlines::fetch_and_update_paper_deadlines(&app, state.inner()).await
+    {
+        log::warn!("Deadline fetch after config save failed: {}", e);
+        let _ = app.emit("paper_error", e);
+    }
+
     Ok(())
 }
 
@@ -58,7 +115,9 @@ pub async fn get_paper_config(app: AppHandle) -> Result<PaperConfig, String> {
 
 #[tauri::command]
 pub async fn save_app_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
-    config_store::write_config(&app, "app_config.json", &config)
+    config_store::write_config(&app, "app_config.json", &config)?;
+    let _ = app.emit("app_config_update", &config);
+    Ok(())
 }
 
 #[tauri::command]
@@ -68,18 +127,75 @@ pub async fn get_app_config(app: AppHandle) -> Result<AppConfig, String> {
 
 #[tauri::command]
 pub async fn get_deadlines(
+    app: AppHandle,
     state: tauri::State<'_, GlobalState>,
 ) -> Result<Vec<PaperDeadlineInfo>, String> {
     let deadlines = state.deadlines.lock().map_err(|e| e.to_string())?;
-    Ok(deadlines.clone())
+    if !deadlines.is_empty() {
+        return Ok(deadlines.clone());
+    }
+    drop(deadlines);
+
+    let cached = crate::deadlines::hydrate_deadlines_from_cache(&app, state.inner());
+    Ok(cached)
+}
+
+#[tauri::command]
+pub async fn refresh_paper_deadlines(
+    app: AppHandle,
+    state: tauri::State<'_, GlobalState>,
+) -> Result<Vec<PaperDeadlineInfo>, String> {
+    crate::deadlines::fetch_and_update_paper_deadlines(&app, state.inner()).await
 }
 
 #[tauri::command]
 pub async fn get_gpu_data(
+    app: AppHandle,
     state: tauri::State<'_, GlobalState>,
 ) -> Result<Vec<ServerGpuData>, String> {
+    let config = config_store::read_config::<GpuConfig>(&app, "gpu_monitor.json");
     let gpu_data = state.gpu_data.lock().map_err(|e| e.to_string())?;
-    Ok(gpu_data.values().cloned().collect())
+    let disk_cache = crate::gpu::load_gpu_cache(&app);
+
+    let mut sorted_data = Vec::new();
+    for server_cfg in &config.servers {
+        if server_cfg.host.trim().is_empty() {
+            continue;
+        }
+        if let Some(data) = gpu_data.get(&server_cfg.host) {
+            sorted_data.push(data.clone());
+        } else if let Some(data) = disk_cache.get(&server_cfg.host) {
+            sorted_data.push(data.clone());
+        }
+    }
+    Ok(sorted_data)
+}
+
+#[tauri::command]
+pub async fn refresh_gpu_data(
+    app: AppHandle,
+    state: tauri::State<'_, GlobalState>,
+) -> Result<Vec<ServerGpuData>, String> {
+    {
+        let mut workers = state
+            .active_workers
+            .lock()
+            .map_err(|e| e.to_string())?;
+        for (_, handle) in workers.drain() {
+            handle.abort();
+        }
+    }
+    {
+        let mut monitors = state
+            .active_monitors
+            .lock()
+            .map_err(|e| e.to_string())?;
+        for (_, handle) in monitors.drain() {
+            handle.abort();
+        }
+    }
+    log::info!("GPU workers restarted via manual refresh");
+    get_gpu_data(app, state).await
 }
 
 #[tauri::command]
@@ -109,7 +225,14 @@ pub async fn save_theme_config(
     app: AppHandle,
     config: WidgetThemeConfig,
 ) -> Result<(), String> {
-    config_store::write_theme_config(&app, &config)
+    config_store::write_theme_config(&app, &config)?;
+    let _ = app.emit("theme_update", &config);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_corrupt_config_files(app: AppHandle) -> Result<Vec<String>, String> {
+    Ok(config_store::list_corrupt_config_files(&app))
 }
 
 pub async fn create_widget_impl(app: AppHandle, id: String, title: String) -> Result<(), String> {
@@ -176,7 +299,7 @@ pub async fn toggle_widget(
     state: tauri::State<'_, GlobalState>,
     id: String,
     title: String,
-) -> Result<(), String> {
+) -> Result<ToggleWidgetResponse, String> {
     let _lock = state.widget_toggle_lock.lock().await;
 
     // Read the current visibility from config to prevent `win.is_visible()` sync issues 
@@ -199,12 +322,26 @@ pub async fn toggle_widget(
         }
     }
     let _ = config_store::update_widget_visibility_config(&app, &id, new_visible).await;
-    Ok(())
+    Ok(ToggleWidgetResponse { visible: new_visible })
 }
 
 #[tauri::command]
-pub async fn save_arxiv_config(app: AppHandle, config: ArxivConfig) -> Result<(), String> {
-    config_store::write_config(&app, "arxiv_config.json", &config)
+pub async fn save_arxiv_config(
+    app: AppHandle,
+    state: tauri::State<'_, GlobalState>,
+    config: ArxivConfig,
+) -> Result<(), String> {
+    config_store::write_config(&app, "arxiv_config.json", &config)?;
+    let _ = app.emit("arxiv_config_update", &config);
+
+    let app_config = config_store::read_config::<AppConfig>(&app, "app_config.json");
+    if app_config.arxiv_enabled.unwrap_or(true) {
+        if let Err(e) = crate::arxiv::perform_arxiv_fetch(&app, state.inner()).await {
+            log::warn!("Arxiv immediate fetch after config save failed: {}", e);
+            let _ = app.emit("arxiv_error", e);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -352,6 +489,28 @@ pub async fn open_log_dir(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn open_config_dir(app: AppHandle) -> Result<(), String> {
+    let config_dir = crate::utils::get_config_dir(&app);
+    if let Err(e) = std::fs::create_dir_all(&config_dir) {
+        let err_str = e.to_string();
+        log::error!("Failed to create config directory '{:?}': {}", config_dir, err_str);
+        return Err(err_str);
+    }
+    use tauri_plugin_opener::OpenerExt;
+    let path_str = config_dir.to_string_lossy().to_string();
+    app.opener().open_url(&path_str, None::<String>).map_err(|e| {
+        let err_str = e.to_string();
+        log::error!("Failed to open config directory '{}': {}", path_str, err_str);
+        err_str
+    })
+}
+
+#[tauri::command]
+pub fn get_config_dir_path(app: AppHandle) -> Result<String, String> {
+    Ok(crate::utils::get_config_dir(&app).display().to_string())
+}
+
+#[tauri::command]
 pub async fn save_quota_config(
     app: AppHandle,
     state: tauri::State<'_, GlobalState>,
@@ -366,14 +525,12 @@ pub async fn save_quota_config(
     
     // Write config to disk
     config_store::write_config(&app, "quota_config.json", &config)?;
+    let _ = app.emit("quota_config_update", &config);
     
-    // Update in-memory state and emit event to all windows
-    {
-        if let Ok(mut state_quota) = state.quota_data.lock() {
-            *state_quota = config.items.clone();
-        }
+    // Refresh quota immediately so newly saved API keys take effect
+    if let Err(e) = crate::quota::perform_quota_fetch(&app, &*state).await {
+        log::warn!("Quota refresh after save failed: {}", e);
     }
-    let _ = app.emit("quota_update", &config.items);
     
     Ok(())
 }
@@ -385,10 +542,12 @@ pub async fn get_quota_config(app: AppHandle) -> Result<QuotaConfig, String> {
 
 #[tauri::command]
 pub async fn get_quota_data(
+    app: AppHandle,
     state: tauri::State<'_, GlobalState>,
 ) -> Result<Vec<QuotaItem>, String> {
+    let config = config_store::read_config::<QuotaConfig>(&app, "quota_config.json");
     let quota_data = state.quota_data.lock().map_err(|e| e.to_string())?;
-    Ok(quota_data.clone())
+    Ok(crate::quota::order_quota_items_by_config(&quota_data, &config))
 }
 
 #[tauri::command]
@@ -409,18 +568,29 @@ pub async fn update_manual_quota(
     let mut config = config_store::read_config::<QuotaConfig>(&app, "quota_config.json");
     if let Some(item) = config.items.iter_mut().find(|i| i.id == id) {
         item.current_value = Some(value);
+        item.error_msg = None;
         item.last_update = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
     }
     
     config_store::write_config(&app, "quota_config.json", &config)?;
     
-    // Update state and emit update
-    {
+    let emit_items = {
         if let Ok(mut state_quota) = state.quota_data.lock() {
-            *state_quota = config.items.clone();
+            if let Some(existing) = state_quota.iter_mut().find(|i| i.id == id) {
+                existing.current_value = Some(value);
+                existing.error_msg = None;
+                existing.last_update = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+            } else if let Some(cfg_item) = config.items.iter().find(|i| i.id == id) {
+                state_quota.push(cfg_item.clone());
+            }
+            let ordered = crate::quota::order_quota_items_by_config(&state_quota, &config);
+            *state_quota = ordered.clone();
+            ordered
+        } else {
+            config.items.clone()
         }
-    }
-    let _ = app.emit("quota_update", &config.items);
+    };
+    let _ = app.emit("quota_update", &emit_items);
     Ok(())
 }
 
@@ -482,4 +652,11 @@ pub async fn log_frontend_error(
         message,
         err_details
     );
+}
+
+#[tauri::command]
+pub fn get_antigravity_setup_status(
+    app: AppHandle,
+) -> Result<crate::antigravity::AntigravitySetupStatus, String> {
+    Ok(crate::antigravity::get_setup_status(&app))
 }

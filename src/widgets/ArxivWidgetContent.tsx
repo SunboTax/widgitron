@@ -1,18 +1,42 @@
 import { useState, useEffect } from "react";
 import { Activity, Check } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { WidgetTheme, WidgetThemeConfig } from "../types/theme";
+import { motion, AnimatePresence, type Variants } from "framer-motion";
+import type { ArxivConfig, ArxivPaper } from "../types/config";
+import { useWidgetTheme } from "../hooks/useWidgetTheme";
 import { hexToRgba } from "../utils/color";
+import { handleWidgetAppConfigUpdate } from "../utils/widgetLifecycle";
+import { listenBackendServiceError } from "../utils/backendServiceError";
+import { listenServiceUpdateEvents } from "../utils/serviceUpdateEvents";
+import { LIVE_DATA_SECTION, refetchSectionLiveData } from "../utils/sectionLiveData";
+import { CACHED_LABELS, cachedLabelWhen } from "../utils/cachedLabels";
+import { ServiceErrorBanners } from "../components/ServiceErrorBanners";
+import { tauriInvoke } from "../utils/tauriInvoke";
+import { tauriListen } from "../utils/tauriListen";
+
+type SwipeDirection = "left" | "right" | "up";
+
+const paperCardVariants: Variants = {
+  initial: { scale: 0.9, opacity: 0, y: 20 },
+  animate: { scale: 1, opacity: 1, y: 0 },
+  exit: (custom: SwipeDirection | undefined) => ({
+    x: custom === "left" ? -500 : custom === "right" ? 500 : 0,
+    y: custom === "up" ? -500 : 0,
+    opacity: 0,
+    rotate: custom === "left" ? -20 : custom === "right" ? 20 : 0,
+    transition: { duration: 0.4 },
+  }),
+};
 
 export function ArxivWidgetContent() {
-  const [papers, setPapers] = useState<any[]>([]);
-  const [arxivConfig, setArxivConfig] = useState<any>({});
+  const [papers, setPapers] = useState<ArxivPaper[]>([]);
+  const [arxivConfig, setArxivConfig] = useState<ArxivConfig>({});
+  const [arxivBackendError, setArxivBackendError] = useState<string | null>(null);
+  const [arxivRefreshError, setArxivRefreshError] = useState<string | null>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [currentTheme, setCurrentTheme] = useState<WidgetTheme | null>(null);
-  const win = getCurrentWindow();
+  const [exitDirection, setExitDirection] = useState<SwipeDirection | undefined>(undefined);
+  const [serviceEnabled, setServiceEnabled] = useState(true);
+  const [dashboardTheme, setDashboardTheme] = useState<"light" | "dark">("dark");
+  const currentTheme = useWidgetTheme("arxiv");
 
   useEffect(() => {
     let active = true;
@@ -20,20 +44,13 @@ export function ArxivWidgetContent() {
 
     const load = async () => {
       try {
-        const arxivPapers = await invoke("get_arxiv_papers");
+        const arxivPapers = await refetchSectionLiveData(LIVE_DATA_SECTION.ARXIV);
         if (!active) return;
-        setPapers(arxivPapers as any[]);
+        setPapers(arxivPapers);
 
-        const configArxiv = await invoke("get_arxiv_config");
+        const configArxiv = await tauriInvoke("get_arxiv_config");
         if (!active) return;
         setArxivConfig(configArxiv);
-
-        const config = (await invoke("get_theme_config")) as WidgetThemeConfig;
-        if (!active) return;
-        const themeId = config.assignments?.[win.label];
-        const theme =
-          config.themes.find((t) => t.id === themeId) || config.themes.find((t) => t.id === "theme-arxiv-default");
-        setCurrentTheme(theme || null);
       } catch (e) {
         console.error("Arxiv widget load failed", e);
       }
@@ -43,38 +60,79 @@ export function ArxivWidgetContent() {
 
     const setup = async () => {
       try {
-        const u1 = await listen<any[]>("arxiv_update", (event) => {
-          if (!active) return;
-          setPapers(event.payload);
-        });
+        const u1 = await listenServiceUpdateEvents(
+          () => active,
+          {
+            arxiv: {
+              clearRefresh: () => setArxivRefreshError(null),
+              clearBackend: () => setArxivBackendError(null),
+            },
+          },
+          { arxivSetter: setPapers }
+        );
         if (!active) {
           u1();
         } else {
           unlisteners.push(u1);
         }
 
-        const u2 = await listen("theme_update", (event: any) => {
-          if (!active) return;
-          const config = event.payload as WidgetThemeConfig;
-          const themeId = config.assignments?.[win.label];
-          const theme =
-            config.themes.find((t) => t.id === themeId) || config.themes.find((t) => t.id === "theme-arxiv-default");
-          setCurrentTheme(theme || null);
-        });
-        if (!active) {
-          u2();
-        } else {
-          unlisteners.push(u2);
-        }
-
-        const u3 = await listen("arxiv_config_update", (event: any) => {
+        const u3 = await tauriListen("arxiv_config_update", async (event) => {
           if (!active) return;
           setArxivConfig(event.payload);
+          setArxivRefreshError(null);
+          setCurrentIndex(0);
+          try {
+            const papers = await tauriInvoke("refresh_arxiv");
+            if (active) {
+              setPapers(papers);
+            }
+          } catch (e) {
+            console.error("Arxiv widget refresh after config change failed", e);
+            if (active) setArxivRefreshError(String(e));
+          }
         });
         if (!active) {
           u3();
         } else {
           unlisteners.push(u3);
+        }
+
+        const u4 = await listenBackendServiceError(
+          "arxiv_error",
+          setArxivBackendError,
+          () => active
+        );
+        if (!active) {
+          u4();
+        } else {
+          unlisteners.push(u4);
+        }
+
+        const appConfig = await tauriInvoke("get_app_config");
+        let arxivEnabled = appConfig?.arxiv_enabled !== false;
+        if (active) {
+          setServiceEnabled(arxivEnabled);
+          setDashboardTheme(appConfig?.theme === "light" ? "light" : "dark");
+        }
+
+        const u5 = await tauriListen("app_config_update", async (event) => {
+          if (!active) return;
+          arxivEnabled = await handleWidgetAppConfigUpdate(event.payload, arxivEnabled, {
+            serviceField: "arxiv_enabled",
+            setServiceEnabled: setServiceEnabled,
+            setDashboardTheme: setDashboardTheme,
+            disableClears: {
+              clearData: () => setPapers([]),
+              clearRefreshError: () => setArxivRefreshError(null),
+              clearBackendError: () => setArxivBackendError(null),
+              onExtra: () => setCurrentIndex(0),
+            },
+          });
+        });
+        if (!active) {
+          u5();
+        } else {
+          unlisteners.push(u5);
         }
       } catch (e) {
         console.error("Failed to setup arxiv listeners", e);
@@ -91,18 +149,20 @@ export function ArxivWidgetContent() {
 
   if (!currentTheme) return null;
 
-  const handleAction = async (direction: "left" | "right" | "up") => {
+  const handleAction = async (direction: SwipeDirection) => {
     const paper = papers[currentIndex];
     if (!paper) return;
 
+    setExitDirection(direction);
+
     if (direction === "left") {
-      await invoke("mark_arxiv_seen", { id: paper.id, saved: false });
+      await tauriInvoke("mark_arxiv_seen", { id: paper.id, saved: false });
       setCurrentIndex((prev) => prev + 1);
     } else if (direction === "right") {
-      await invoke("mark_arxiv_seen", { id: paper.id, saved: true });
+      await tauriInvoke("mark_arxiv_seen", { id: paper.id, saved: true });
       setCurrentIndex((prev) => prev + 1);
     } else if (direction === "up") {
-      await invoke("open_link", { url: paper.link });
+      await tauriInvoke("open_link", { url: paper.link });
     }
   };
 
@@ -133,7 +193,34 @@ export function ArxivWidgetContent() {
         </span>
       </div>
 
+      <ServiceErrorBanners
+        backendError={arxivBackendError}
+        refreshError={arxivRefreshError}
+        onDismissBackend={() => setArxivBackendError(null)}
+        onDismissRefresh={() => setArxivRefreshError(null)}
+        theme={dashboardTheme}
+        showBackend={serviceEnabled}
+        className="mb-2 space-y-2"
+        backendCachedLabel={cachedLabelWhen(
+          papers.length > 0,
+          CACHED_LABELS.arxiv.backend
+        )}
+        refreshCachedLabel={cachedLabelWhen(
+          papers.length > 0,
+          CACHED_LABELS.arxiv.refresh
+        )}
+      />
+
       <div className="flex-1 relative perspective-1000" data-no-drag="true">
+        {!serviceEnabled ? (
+          <div
+            className="absolute inset-0 flex flex-col items-center justify-center text-center px-4 rounded-xl border border-dashed"
+            style={{ borderColor: `${subText}33`, color: subText }}
+          >
+            <span className="text-[10px] font-black uppercase tracking-widest">Service Disabled</span>
+            <span className="text-[9px] opacity-70 mt-1">Enable Arxiv Radar in the dashboard.</span>
+          </div>
+        ) : (
         <AnimatePresence>
           {currentPaper ? (
             <motion.div
@@ -145,17 +232,14 @@ export function ArxivWidgetContent() {
                 else if (info.offset.x > 100) handleAction("right");
                 else if (info.offset.y < -100) handleAction("up");
               }}
-              initial={{ scale: 0.9, opacity: 0, y: 20 }}
-              animate={{ scale: 1, opacity: 1, y: 0 }}
-              exit={
-                ((custom: any) => ({
-                  x: custom === "left" ? -500 : custom === "right" ? 500 : 0,
-                  y: custom === "up" ? -500 : 0,
-                  opacity: 0,
-                  rotate: custom === "left" ? -20 : custom === "right" ? 20 : 0,
-                  transition: { duration: 0.4 }
-                })) as any
-              }
+              custom={exitDirection}
+              variants={paperCardVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              onAnimationComplete={(definition) => {
+                if (definition === "exit") setExitDirection(undefined);
+              }}
               data-no-drag="true"
               className="absolute inset-0 bg-white/5 rounded-2xl border border-white/10 p-5 flex flex-col shadow-2xl backdrop-blur-md cursor-grab active:cursor-grabbing overflow-hidden"
             >
@@ -207,6 +291,7 @@ export function ArxivWidgetContent() {
             </div>
           )}
         </AnimatePresence>
+        )}
       </div>
     </div>
   );

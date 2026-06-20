@@ -1,13 +1,32 @@
 import { useState, useEffect } from "react";
 import { Copy, Plus, X, Settings } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
+import type { DashboardTheme } from "../types/config";
 import { WidgetTheme, WidgetThemeConfig } from "../types/theme";
 import { hexToRgba } from "../utils/color";
+import {
+  defaultThemeIdForWidgetLabel,
+  widgetThemeKindFromLabel,
+  PRESET_THEME_IDS,
+} from "../utils/widgetTheme";
+import { serviceWidgetMeta, type ServiceField } from "../utils/widgetLifecycle";
+
+const THEME_ASSIGNABLE_FIELDS: ServiceField[] = [
+  "gpu_enabled",
+  "deadline_enabled",
+  "arxiv_enabled",
+  "quota_enabled",
+];
+
+function widgetAssignLabel(field: ServiceField): string {
+  if (field === "deadline_enabled") return "deadlines";
+  return field.replace("_enabled", "");
+}
 
 interface ThemeManagementSectionProps {
   themeConfig: WidgetThemeConfig;
   onSaveThemes: (config: WidgetThemeConfig) => void;
-  dashboardTheme: string;
+  dashboardTheme: DashboardTheme;
   activeWidgets: string[];
   widgetId?: string;
 }
@@ -92,7 +111,7 @@ export function ThemeManagementSection({
     save(next);
   };
 
-  const updateTheme = (id: string, field: keyof WidgetTheme, val: any) => {
+  const updateTheme = (id: string, field: keyof WidgetTheme, val: WidgetTheme[keyof WidgetTheme]) => {
     const next = {
       ...localThemes,
       themes: themes.map((t) => (t.id === id ? { ...t, [field]: val } : t))
@@ -103,10 +122,7 @@ export function ThemeManagementSection({
   const assignTheme = (widgetId: string, themeId: string) => {
     let finalThemeId = themeId;
     if (!finalThemeId) {
-      if (widgetId.includes("gpu")) finalThemeId = "theme-gpu-default";
-      else if (widgetId.includes("deadlines")) finalThemeId = "theme-deadline-default";
-      else if (widgetId.includes("arxiv")) finalThemeId = "theme-arxiv-default";
-      else if (widgetId.includes("quota")) finalThemeId = "theme-quota-default";
+      finalThemeId = defaultThemeIdForWidgetLabel(widgetId);
     }
     const next = {
       ...localThemes,
@@ -118,34 +134,17 @@ export function ThemeManagementSection({
   const isLight = dashboardTheme === "light";
 
   if (widgetId) {
-    const defaultThemeId = widgetId.includes("gpu")
-      ? "theme-gpu-default"
-      : widgetId.includes("deadlines")
-      ? "theme-deadline-default"
-      : widgetId.includes("arxiv")
-      ? "theme-arxiv-default"
-      : "theme-quota-default";
-
+    const defaultThemeId = defaultThemeIdForWidgetLabel(widgetId);
     const activeThemeId = localThemes.assignments?.[widgetId] || defaultThemeId;
     const activeTheme = themes.find((t) => t.id === activeThemeId) || themes.find((t) => t.id === defaultThemeId) || themes[0];
 
     if (!activeTheme) return null;
 
+    const widgetKind = widgetThemeKindFromLabel(widgetId);
     const filteredThemes = themes.filter((t) => {
-      // Default (preset) themes: only show those matching this widget type
       if (t.is_default) {
-        if (widgetId.includes("gpu")) {
-          return t.id === "theme-gpu-default" || t.id === "theme-gpu-transparent";
-        } else if (widgetId.includes("deadlines")) {
-          return t.id === "theme-deadline-default" || t.id === "theme-deadline-transparent";
-        } else if (widgetId.includes("arxiv")) {
-          return t.id === "theme-arxiv-default" || t.id === "theme-arxiv-transparent";
-        } else if (widgetId.includes("quota")) {
-          return t.id === "theme-quota-default" || t.id === "theme-quota-transparent";
-        }
-        return false;
+        return PRESET_THEME_IDS[widgetKind].includes(t.id);
       }
-      // Custom themes: only show if scoped to this widget (or legacy themes with no scope)
       if (t.widget_scope && t.widget_scope !== widgetId) return false;
       return true;
     });
@@ -580,15 +579,16 @@ export function ThemeManagementSection({
                 </div>
 
                 {/* Direct Assignment Buttons */}
-                <div className="flex items-center gap-1.5 mb-4 p-1.5 bg-black/10 rounded-lg border border-white/5">
-                  {["gpu", "deadlines", "arxiv"].map((type) => {
-                    const wid = `widget-${type}-default`;
+                <div className="grid grid-cols-2 gap-1.5 mb-4 p-1.5 bg-black/10 rounded-lg border border-white/5">
+                  {THEME_ASSIGNABLE_FIELDS.map((field) => {
+                    const { id: wid } = serviceWidgetMeta(field);
+                    const type = widgetAssignLabel(field);
                     const isActive = localThemes.assignments?.[wid] === theme.id;
                     return (
                       <button
                         key={wid}
                         onClick={() => assignTheme(wid, isActive ? "" : theme.id)}
-                        className={`flex-1 py-1 rounded-md text-[8px] font-black uppercase tracking-tighter transition-all border ${
+                        className={`py-1 rounded-md text-[8px] font-black uppercase tracking-tighter transition-all border ${
                           isActive
                             ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
                             : "bg-white/5 text-slate-600 border-transparent hover:border-white/10"
@@ -870,11 +870,11 @@ export function ThemeManagementSection({
                 <label className="text-[10px] font-black uppercase tracking-widest text-slate-500 block mb-4">
                   Assign Theme to Widgets
                 </label>
-                <div className="flex gap-4">
-                  {["gpu", "deadlines"].map((type) => {
-                    const wid = `widget-${type}-default`;
+                <div className="grid grid-cols-2 gap-4">
+                  {THEME_ASSIGNABLE_FIELDS.map((field) => {
+                    const { id: wid } = serviceWidgetMeta(field);
                     const isActive = localThemes.assignments?.[wid] === editingTheme.id;
-                    const name = type.toUpperCase();
+                    const name = widgetAssignLabel(field).toUpperCase();
                     return (
                       <button
                         key={wid}

@@ -3,13 +3,16 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use serde::Deserialize;
 use serde_json::Value;
+use tauri::AppHandle;
+
+use crate::config_store;
 
 const OAUTH_TOKEN_KEY: &str = "antigravityUnifiedStateSync.oauthToken";
 const OAUTH_TOKEN_SENTINEL: &str = "oauthTokenInfoSentinelKey";
-const GOOGLE_CLIENT_ID: &str =
+const DEFAULT_GOOGLE_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const GOOGLE_CLIENT_SECRET: &str = "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";
 const CLOUD_CODE_URLS: &[&str] = &[
     "https://daily-cloudcode-pa.googleapis.com",
     "https://cloudcode-pa.googleapis.com",
@@ -282,7 +285,170 @@ fn now_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-async fn refresh_google_access_token(refresh_token: &str) -> Result<String, String> {
+#[derive(Debug, Deserialize, Default)]
+struct AntigravityOAuthConfig {
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    client_secret: String,
+}
+
+fn extract_gocspx_secret(content: &str) -> Option<String> {
+    let marker = "GOCSPX-";
+    let start = content.find(marker)?;
+    let rest = &content[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .unwrap_or(rest.len());
+    let secret = rest[..end].trim();
+    if secret.len() > 8 {
+        Some(secret.to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_google_client_id(content: &str) -> Option<String> {
+    let marker = ".apps.googleusercontent.com";
+    let end = content.find(marker)? + marker.len();
+    let before = &content[..end];
+    let start = before.rfind('"').or_else(|| before.rfind('\''))? + 1;
+    let id = before[start..end].trim();
+    if id.contains(".apps.googleusercontent.com") && id.len() > 20 {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+fn read_scan_file(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+fn antigravity_install_scan_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for root in antigravity_install_roots() {
+        paths.push(root.join("resources/app/product.json"));
+        paths.push(root.join("resources/app/out/main.js"));
+        paths.push(root.join("resources/app/out/vs/code/electron-main/main.js"));
+        paths.push(root.join("resources/app/out/vs/workbench/workbench.desktop.main.js"));
+    }
+    paths
+}
+
+fn antigravity_install_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        for name in ["Antigravity", "Antigravity IDE", "Google Antigravity", "antigravity"] {
+                roots.push(PathBuf::from(&local).join("Programs").join(name));
+            }
+            for name in ["Antigravity", "Antigravity IDE", "Google Antigravity"] {
+                roots.push(PathBuf::from(&local).join(name));
+            }
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            for name in ["Antigravity", "Antigravity IDE"] {
+                roots.push(PathBuf::from(&pf).join(name));
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            for name in ["Antigravity.app", "Antigravity IDE.app"] {
+                roots.push(
+                    PathBuf::from(&home)
+                        .join("Applications")
+                        .join(name)
+                        .join("Contents/Resources/app"),
+                );
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            for name in ["antigravity", "Antigravity", "antigravity-ide"] {
+                roots.push(PathBuf::from(&home).join(".local/share").join(name));
+                roots.push(PathBuf::from(&home).join(name));
+            }
+        }
+    }
+    roots.retain(|path| path.exists());
+    roots
+}
+
+fn scan_antigravity_ide_client_secret() -> Option<String> {
+    for path in antigravity_install_scan_paths() {
+        if let Some(content) = read_scan_file(&path) {
+            if let Some(secret) = extract_gocspx_secret(&content) {
+                return Some(secret);
+            }
+        }
+    }
+    None
+}
+
+fn scan_antigravity_ide_client_id() -> Option<String> {
+    for path in antigravity_install_scan_paths() {
+        if let Some(content) = read_scan_file(&path) {
+            if let Some(client_id) = extract_google_client_id(&content) {
+                return Some(client_id);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_google_oauth_credentials(app: &AppHandle) -> Result<(String, String), String> {
+    let cfg: AntigravityOAuthConfig = config_store::read_config(app, "antigravity_oauth.json");
+
+    let client_id = std::env::var("ANTIGRAVITY_GOOGLE_CLIENT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let value = cfg.client_id.trim().to_string();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .or_else(scan_antigravity_ide_client_id)
+        .unwrap_or_else(|| DEFAULT_GOOGLE_CLIENT_ID.to_string());
+
+    let client_secret = std::env::var("ANTIGRAVITY_GOOGLE_CLIENT_SECRET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let value = cfg.client_secret.trim().to_string();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .or_else(scan_antigravity_ide_client_secret);
+
+    match client_secret {
+        Some(secret) if !secret.is_empty() => Ok((client_id, secret)),
+        _ => Err(
+            "Google OAuth client_secret not configured. Set ANTIGRAVITY_GOOGLE_CLIENT_SECRET, add client_secret to antigravity_oauth.json, or install Antigravity IDE."
+                .to_string(),
+        ),
+    }
+}
+
+async fn refresh_google_access_token(app: &AppHandle, refresh_token: &str) -> Result<String, String> {
+    let (client_id, client_secret) = resolve_google_oauth_credentials(app)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -293,7 +459,7 @@ async fn refresh_google_access_token(refresh_token: &str) -> Result<String, Stri
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
-            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, refresh_token
+            client_id, client_secret, refresh_token
         ))
         .send()
         .await
@@ -427,7 +593,7 @@ fn parse_cloud_model_quotas(data: &Value) -> Vec<ModelQuota> {
     models
 }
 
-async fn resolve_access_token(candidates: &[OAuthTokens]) -> Result<String, String> {
+async fn resolve_access_token(app: &AppHandle, candidates: &[OAuthTokens]) -> Result<String, String> {
     let now = now_epoch_seconds();
     let mut access_tokens = Vec::new();
 
@@ -462,7 +628,7 @@ async fn resolve_access_token(candidates: &[OAuthTokens]) -> Result<String, Stri
     }
 
     for refresh_token in refresh_tokens {
-        let access = refresh_google_access_token(&refresh_token).await?;
+        let access = refresh_google_access_token(app, &refresh_token).await?;
         match fetch_cloud_models(&access).await {
             Ok(data) if !parse_cloud_model_quotas(&data).is_empty() => return Ok(access),
             Ok(_) => continue,
@@ -474,7 +640,7 @@ async fn resolve_access_token(candidates: &[OAuthTokens]) -> Result<String, Stri
 }
 
 /// Fetch Antigravity quota via Google Cloud Code API using stored OAuth credentials.
-pub async fn fetch_antigravity_via_cloud() -> Result<QuotaSnapshot, String> {
+pub async fn fetch_antigravity_via_cloud(app: &AppHandle) -> Result<QuotaSnapshot, String> {
     let candidates = load_oauth_token_candidates();
     if candidates.is_empty() {
         return Err(
@@ -482,7 +648,7 @@ pub async fn fetch_antigravity_via_cloud() -> Result<QuotaSnapshot, String> {
         );
     }
 
-    let access_token = resolve_access_token(&candidates).await?;
+    let access_token = resolve_access_token(app, &candidates).await?;
     let data = fetch_cloud_models(&access_token).await?;
     let models = parse_cloud_model_quotas(&data);
     
@@ -501,4 +667,29 @@ pub async fn fetch_antigravity_via_cloud() -> Result<QuotaSnapshot, String> {
         models,
         tier_name,
     })
+}
+
+#[derive(serde::Serialize)]
+pub struct AntigravitySetupStatus {
+    pub has_oauth_tokens: bool,
+    pub cloud_auth_ready: bool,
+    pub language_server_running: bool,
+    pub oauth_config_path: String,
+    pub config_dir: String,
+    pub program_files_install: bool,
+}
+
+pub fn get_setup_status(app: &AppHandle) -> AntigravitySetupStatus {
+    let config_dir = crate::utils::get_config_dir(app);
+    AntigravitySetupStatus {
+        has_oauth_tokens: !load_oauth_token_candidates().is_empty(),
+        cloud_auth_ready: resolve_google_oauth_credentials(app).is_ok(),
+        language_server_running: crate::quota::is_antigravity_language_server_running(),
+        oauth_config_path: config_dir
+            .join("antigravity_oauth.json")
+            .display()
+            .to_string(),
+        config_dir: config_dir.display().to_string(),
+        program_files_install: crate::utils::is_program_files_install(),
+    }
 }

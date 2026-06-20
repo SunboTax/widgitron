@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -12,6 +13,55 @@ use std::os::windows::process::CommandExt;
 
 use crate::models::{ServerConfig, GpuConfig, AppConfig, GpuInfo, ServerGpuData, GlobalState};
 use crate::config_store;
+
+const GPU_CACHE_FILE: &str = "gpu_data_cache.json";
+
+pub fn load_gpu_cache(app: &AppHandle) -> HashMap<String, ServerGpuData> {
+    let items: Vec<ServerGpuData> = config_store::read_config(app, GPU_CACHE_FILE);
+    items
+        .into_iter()
+        .map(|item| (item.host.clone(), item))
+        .collect()
+}
+
+pub fn hydrate_gpu_from_cache(app: &AppHandle, state: &GlobalState) -> Vec<ServerGpuData> {
+    let cached = load_gpu_cache(app);
+    if cached.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(mut data) = state.gpu_data.lock() {
+        if data.is_empty() {
+            for (host, item) in cached {
+                data.insert(host, item);
+            }
+        }
+        data.values().cloned().collect()
+    } else {
+        cached.into_values().collect()
+    }
+}
+
+pub fn persist_gpu_data_cache(app: &AppHandle, state: &GlobalState) {
+    let items: Vec<ServerGpuData> = match state.gpu_data.lock() {
+        Ok(data) if !data.is_empty() => data.values().cloned().collect(),
+        _ => return,
+    };
+    if let Err(e) = config_store::write_config(app, GPU_CACHE_FILE, &items) {
+        log::warn!("Failed to persist GPU data cache: {}", e);
+    }
+}
+
+fn gpu_server_fingerprint(server: &ServerConfig) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    server.host.hash(&mut hasher);
+    server.port.unwrap_or(22).hash(&mut hasher);
+    server.id.as_deref().unwrap_or("").hash(&mut hasher);
+    server.user.as_deref().unwrap_or("").hash(&mut hasher);
+    server.password.as_deref().unwrap_or("").hash(&mut hasher);
+    server.key_file.as_deref().unwrap_or("").hash(&mut hasher);
+    server.use_slurm.hash(&mut hasher);
+    format!("{}:{:016x}", server.host, hasher.finish())
+}
 
 pub fn parse_nvidia_smi_output(output: &str) -> Vec<GpuInfo> {
     let mut list = Vec::new();
@@ -47,20 +97,133 @@ pub fn parse_nvidia_smi_output(output: &str) -> Vec<GpuInfo> {
 
 pub fn ssh_authenticate(sess: &mut Session, s: &ServerConfig) -> Result<(), String> {
     let user = s.user.as_deref().unwrap_or("root");
+    
+    // 1. Try custom key file if provided and not empty
     if let Some(key_path) = &s.key_file {
+        if !key_path.trim().is_empty() {
+            let expanded = shellexpand::tilde(key_path).to_string();
+            return sess.userauth_pubkey_file(user, None, std::path::Path::new(&expanded), None)
+                .map_err(|e| format!("Key auth failed for custom key '{}': {}", key_path, e));
+        }
+    }
+    
+    // 2. Try password auth if password is provided and not empty
+    if let Some(pass) = &s.password {
+        if !pass.is_empty() {
+            return sess.userauth_password(user, pass)
+                .map_err(|e| format!("Password auth failed: {}", e));
+        }
+    }
+    
+    // 3. Fallback to default keys and SSH agent
+    let default_keys = [
+        "~/.ssh/id_ed25519",
+        "~/.ssh/id_rsa",
+        "~/.ssh/id_ecdsa",
+        "~/.ssh/id_dsa",
+    ];
+    let mut authenticated = false;
+    let mut last_err = None;
+    for key_path in &default_keys {
         let expanded = shellexpand::tilde(key_path).to_string();
-        sess.userauth_pubkey_file(user, None, std::path::Path::new(&expanded), None).map_err(|e| format!("Key auth failed: {}", e))?;
-    } else if let Some(pass) = &s.password {
-        sess.userauth_password(user, pass).map_err(|e| format!("Password auth failed: {}", e))?;
-    } else {
-        let default_key = shellexpand::tilde("~/.ssh/id_rsa").to_string();
-        if std::path::Path::new(&default_key).exists() {
-            sess.userauth_pubkey_file(user, None, std::path::Path::new(&default_key), None).map_err(|e| format!("Default key auth failed: {}", e))?;
-        } else {
-            let _ = sess.userauth_agent(user);
+        let path = std::path::Path::new(&expanded);
+        if path.exists() {
+            match sess.userauth_pubkey_file(user, None, path, None) {
+                Ok(_) => {
+                    authenticated = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+    }
+    if !authenticated {
+        if let Err(agent_err) = sess.userauth_agent(user) {
+            return Err(format!(
+                "Authentication failed. Tried default keys (last error: {:?}) and SSH agent (error: {})",
+                last_err, agent_err
+            ));
         }
     }
     Ok(())
+}
+
+fn connect_ssh_session(s: &ServerConfig) -> Result<Session, String> {
+    connect_ssh_session_with_read_timeout(s, Duration::from_secs(30))
+}
+
+fn connect_ssh_session_with_read_timeout(
+    s: &ServerConfig,
+    read_timeout: Duration,
+) -> Result<Session, String> {
+    use std::net::ToSocketAddrs;
+
+    let host_id = format!("{}:{}", s.host, s.port.unwrap_or(22));
+    let addr = host_id
+        .to_socket_addrs()
+        .map_err(|e| format!("Invalid SSH address {}: {}", host_id, e))?
+        .next()
+        .ok_or_else(|| format!("Could not resolve SSH address {}", host_id))?;
+
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(15))
+        .map_err(|e| format!("TCP connect failed: {}", e))?;
+    let _ = tcp.set_read_timeout(Some(read_timeout));
+    let _ = tcp.set_write_timeout(Some(Duration::from_secs(30)));
+
+    let mut sess = Session::new().map_err(|e| e.to_string())?;
+    sess.set_timeout(30000);
+    sess.set_tcp_stream(tcp);
+    sess.handshake()
+        .map_err(|e| format!("SSH handshake failed: {}", e))?;
+    ssh_authenticate(&mut sess, s)?;
+    Ok(sess)
+}
+
+fn is_ssh_session_alive(sess: &Session) -> bool {
+    let mut channel = match sess.channel_session() {
+        Ok(channel) => channel,
+        Err(_) => return false,
+    };
+    if channel.exec("echo widgitron-ok").is_err() {
+        return false;
+    }
+    let mut output = String::new();
+    if channel.read_to_string(&mut output).is_err() {
+        return false;
+    }
+    let _ = channel.wait_close();
+    output.contains("widgitron-ok")
+}
+
+fn reuse_or_connect_ssh_session(
+    sess_opt: Option<Session>,
+    server: &ServerConfig,
+) -> Result<Session, String> {
+    if let Some(sess) = sess_opt {
+        if is_ssh_session_alive(&sess) {
+            return Ok(sess);
+        }
+        log::debug!("SSH session for {} is stale, reconnecting", server.host);
+    }
+
+    let sess = connect_ssh_session(server)?;
+
+    if server.use_slurm.unwrap_or(false) {
+        if let Ok(mut clean_chan) = sess.channel_session() {
+            let user = server.user.as_deref().unwrap_or("root");
+            let cleanup_cmd = format!(
+                "steps=$(squeue -s --me -h -o \"%i %j\" 2>/dev/null || squeue -s -u $(whoami) -h -o \"%i %j\" || squeue -s -u {} -h -o \"%i %j\"); targets=$(echo \"$steps\" | grep \"widgitron-gpu\" | awk '{{print $1}}'); [ -n \"$targets\" ] && scancel $targets",
+                user
+            );
+            let _ = clean_chan.exec(&cleanup_cmd);
+            let mut dummy = String::new();
+            let _ = clean_chan.read_to_string(&mut dummy);
+        }
+    }
+
+    Ok(sess)
 }
 
 pub fn start_ssh_monitor_task(
@@ -85,18 +248,11 @@ pub fn start_ssh_monitor_task(
                     Some(id) => format!("{}:{}:{}", s_m.host, id, n_m.as_deref().unwrap_or("1")),
                     None => format!("{}:node:0", s_m.host),
                 };
-                let host_id = format!("{}:{}", s_m.host, s_m.port.unwrap_or(22));
-                // Use a standard connect but set a dynamic read timeout (minimum 25 seconds) to avoid hangs
-                let tcp = TcpStream::connect(&host_id).map_err(|e| format!("TCP connect failed: {}", e))?;
                 let timeout_secs = (interval * 3).max(15) + 10;
-                let _ = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs)));
-                
-                let mut sess = Session::new().map_err(|e| e.to_string())?;
-                sess.set_timeout(30000); // 30s timeout for SSH operations
-                sess.set_tcp_stream(tcp);
-                sess.handshake().map_err(|e| format!("SSH handshake failed: {}", e))?;
-                
-                ssh_authenticate(&mut sess, &s_m).map_err(|e| format!("Authentication failed: {}", e))?;
+                let sess = connect_ssh_session_with_read_timeout(
+                    &s_m,
+                    Duration::from_secs(timeout_secs),
+                )?;
                 
                 let mut channel = sess.channel_session().map_err(|e| format!("Channel open failed: {}", e))?;
                 let watch_cmd = match &j_m {
@@ -203,8 +359,13 @@ pub fn start_ssh_monitor_task(
                             slurm_nodelists: None,
                             slurm_times: None,
                         });
-                        entry.is_online = false;
-                        entry.error = Some(err_msg.clone());
+                        let has_cached_gpus = !entry.gpu_list.is_empty();
+                        entry.is_online = has_cached_gpus;
+                        entry.error = Some(if has_cached_gpus {
+                            format!("{} (showing cached data)", err_msg)
+                        } else {
+                            err_msg.clone()
+                        });
                         entry.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
                         let data_clone = entry.clone();
                         let _ = app.emit("gpu_update", data_clone);
@@ -223,8 +384,30 @@ pub fn start_ssh_monitor_task(
 pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
     let smi_cmd = "nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits";
 
+        {
+            let snapshot = hydrate_gpu_from_cache(&app, state.as_ref());
+            let config = config_store::read_config::<GpuConfig>(&app, "gpu_monitor.json");
+            let configured_hosts: std::collections::HashSet<String> = config
+                .servers
+                .iter()
+                .map(|s| s.host.clone())
+                .collect();
+            let mut emitted = 0usize;
+            for item in snapshot {
+                if configured_hosts.contains(&item.host) {
+                    let _ = app.emit("gpu_update", item);
+                    emitted += 1;
+                }
+            }
+            if emitted > 0 {
+                log::info!("Loaded GPU data cache for {} host(s)", emitted);
+            }
+        }
+
     // Startup delay to let frontend initialize cleanly
     tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut last_cache_persist = std::time::Instant::now();
 
     loop {
         let app_config = config_store::read_config::<AppConfig>(&app, "app_config.json");
@@ -235,7 +418,10 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
         let mut current_server_ids = Vec::new();
         if gpu_enabled {
             for server in &config.servers {
-                let server_id = format!("{}:{}", server.host, server.port.unwrap_or(22));
+                if server.host.trim().is_empty() {
+                    continue;
+                }
+                let server_id = gpu_server_fingerprint(server);
                 current_server_ids.push(server_id.clone());
 
                 let mut workers = state.active_workers.lock().unwrap_or_else(|e| e.into_inner());
@@ -304,13 +490,68 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                             .args(local_smi_args)
                                             .output();
 
+                                        let cached_snapshot = state_task
+                                            .gpu_data
+                                            .lock()
+                                            .ok()
+                                            .and_then(|data| data.get(&s.host).cloned());
+
+                                        let mut local_smi_error: Option<String> = None;
                                         match output {
-                                            Ok(out) => {
+                                            Ok(out) if out.status.success() => {
                                                 let s_out = String::from_utf8_lossy(&out.stdout);
-                                                gpu_data.gpu_list = parse_nvidia_smi_output(&s_out);
-                                                gpu_data.is_online = true;
+                                                let parsed = parse_nvidia_smi_output(&s_out);
+                                                if parsed.is_empty() {
+                                                    local_smi_error = Some(
+                                                        "nvidia-smi returned no GPU data".to_string(),
+                                                    );
+                                                } else {
+                                                    gpu_data.gpu_list = parsed;
+                                                    gpu_data.is_online = true;
+                                                    gpu_data.error = None;
+                                                    gpu_data.last_update =
+                                                        Some(Utc::now().format("%H:%M:%S").to_string());
+                                                }
                                             }
-                                            Err(e) => { gpu_data.error = Some(format!("Local smi failed: {}", e)); }
+                                            Ok(out) => {
+                                                let stderr = String::from_utf8_lossy(&out.stderr)
+                                                    .trim()
+                                                    .to_string();
+                                                local_smi_error = Some(if stderr.is_empty() {
+                                                    format!(
+                                                        "nvidia-smi exited with status {}",
+                                                        out.status
+                                                    )
+                                                } else {
+                                                    format!("nvidia-smi failed: {}", stderr)
+                                                });
+                                            }
+                                            Err(e) => {
+                                                local_smi_error =
+                                                    Some(format!("Local smi failed: {}", e));
+                                            }
+                                        }
+
+                                        if let Some(err) = local_smi_error {
+                                            gpu_data.is_online = false;
+                                            if let Some(cached) = cached_snapshot {
+                                                if !cached.gpu_list.is_empty() {
+                                                    gpu_data.gpu_list = cached.gpu_list;
+                                                    gpu_data.last_update = cached.last_update;
+                                                    gpu_data.error = Some(format!(
+                                                        "{} (showing cached data)",
+                                                        err
+                                                    ));
+                                                } else {
+                                                    gpu_data.error = Some(err);
+                                                }
+                                            } else {
+                                                gpu_data.error = Some(err);
+                                            }
+                                            if gpu_data.last_update.is_none() {
+                                                gpu_data.last_update =
+                                                    Some(Utc::now().format("%H:%M:%S").to_string());
+                                            }
                                         }
                                         
                                         if let Ok(mut data) = state_task.gpu_data.lock() {
@@ -321,34 +562,7 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                         Ok((None, vec![], HashMap::new(), HashMap::new(), HashMap::new()))
                                     } else {
                                         // SSH Logic
-                                        let sess = match sess_opt {
-                                            Some(sess) => sess,
-                                            None => {
-                                                let host_id = format!("{}:{}", s.host, s.port.unwrap_or(22));
-                                                let tcp = TcpStream::connect(&host_id).map_err(|e| format!("TCP connect failed: {}", e))?;
-                                                let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
-                                                let mut sess = Session::new().map_err(|e| e.to_string())?;
-                                                sess.set_timeout(30000);
-                                                sess.set_tcp_stream(tcp);
-                                                sess.handshake().map_err(|e| format!("SSH handshake failed: {}", e))?;
-                                                ssh_authenticate(&mut sess, &s)?;
-                                                
-                                                if s.use_slurm.unwrap_or(false) {
-                                                    if let Ok(mut clean_chan) = sess.channel_session() {
-                                                        let user = s.user.as_deref().unwrap_or("root");
-                                                        let cleanup_cmd = format!(
-                                                            "steps=$(squeue -s --me -h -o \"%i %j\" 2>/dev/null || squeue -s -u $(whoami) -h -o \"%i %j\" || squeue -s -u {} -h -o \"%i %j\"); targets=$(echo \"$steps\" | grep \"widgitron-gpu\" | awk '{{print $1}}'); [ -n \"$targets\" ] && scancel $targets",
-                                                            user
-                                                        );
-                                                        let _ = clean_chan.exec(&cleanup_cmd);
-                                                        let mut dummy = String::new();
-                                                        let _ = clean_chan.read_to_string(&mut dummy);
-                                                    }
-                                                }
-                                                
-                                                sess
-                                            }
-                                        };
+                                        let sess = reuse_or_connect_ssh_session(sess_opt, &s)?;
 
                                         gpu_data.is_online = true;
                                         let mut desired_monitor_keys = Vec::new();
@@ -389,7 +603,52 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                      }
                                                  }
                                                  if !squeue_success {
-                                                     return Err("Failed to query squeue. SSH session may be dead.".to_string());
+                                                     log::warn!(
+                                                         "squeue query failed for {}, retaining cached Slurm state",
+                                                         s.host
+                                                     );
+                                                     let has_cached_jobs = !job_ids.is_empty();
+                                                     if let Ok(data) = state_task.gpu_data.lock() {
+                                                         if let Some(cached) = data.get(&s.host) {
+                                                             let has_cached_gpus =
+                                                                 !cached.gpu_list.is_empty();
+                                                             if has_cached_gpus || has_cached_jobs {
+                                                                 gpu_data.gpu_list =
+                                                                     cached.gpu_list.clone();
+                                                                 gpu_data.slurm_nodelists =
+                                                                     cached.slurm_nodelists.clone();
+                                                                 gpu_data.slurm_times =
+                                                                     cached.slurm_times.clone();
+                                                                 gpu_data.slurm_steps =
+                                                                     cached.slurm_steps.clone();
+                                                                 gpu_data.is_online = has_cached_gpus;
+                                                                 gpu_data.error = Some(
+                                                                     "squeue failed (showing cached job data)"
+                                                                         .to_string(),
+                                                                 );
+                                                                 gpu_data.last_update = Some(
+                                                                     Utc::now()
+                                                                         .format("%H:%M:%S")
+                                                                         .to_string(),
+                                                                 );
+                                                             } else if !has_cached_jobs {
+                                                                 return Err(
+                                                                     "Failed to query squeue. SSH session may be dead."
+                                                                         .to_string(),
+                                                                 );
+                                                             }
+                                                         } else if !has_cached_jobs {
+                                                             return Err(
+                                                                 "Failed to query squeue. SSH session may be dead."
+                                                                     .to_string(),
+                                                             );
+                                                         }
+                                                     } else if !has_cached_jobs {
+                                                         return Err(
+                                                             "Failed to query squeue. SSH session may be dead."
+                                                                 .to_string(),
+                                                         );
+                                                     }
                                                  }
                                              }
                                                 
@@ -557,9 +816,15 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                             if let Some(cached) = data.get(&s.host) {
                                                 gpu_data.gpu_list = cached.gpu_list.clone();
                                                 if s.use_slurm.unwrap_or(false) {
-                                                    gpu_data.is_online = true;
-                                                    gpu_data.error = None;
-                                                    gpu_data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
+                                                    let has_gpus = !gpu_data.gpu_list.is_empty();
+                                                    gpu_data.is_online = has_gpus || cached.is_online;
+                                                    gpu_data.error = if has_gpus {
+                                                        cached.error.as_ref().filter(|e| e.contains("showing cached")).cloned()
+                                                    } else {
+                                                        cached.error.clone()
+                                                    };
+                                                    gpu_data.last_update = cached.last_update.clone()
+                                                        .or_else(|| Some(Utc::now().format("%H:%M:%S").to_string()));
                                                 } else {
                                                     gpu_data.is_online = cached.is_online;
                                                     gpu_data.error = cached.error.clone();
@@ -596,6 +861,74 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                              if !query_success {
                                                  return Err("Failed to query nvidia-smi. SSH session may be dead.".to_string());
                                              }
+                                         } else if gpu_data.gpu_list.is_empty() && s.use_slurm.unwrap_or(false) {
+                                             let cached_snapshot = state_task
+                                                 .gpu_data
+                                                 .lock()
+                                                 .ok()
+                                                 .and_then(|data| data.get(&s.host).cloned());
+                                             let mut smi_error: Option<String> = None;
+                                             if let Ok(mut channel) = sess.channel_session() {
+                                                 if channel.exec(&smi).is_ok() {
+                                                     let mut s_out = String::new();
+                                                     if channel.read_to_string(&mut s_out).is_ok() {
+                                                         let parsed = parse_nvidia_smi_output(&s_out);
+                                                         if parsed.is_empty() {
+                                                             smi_error = Some(
+                                                                 "nvidia-smi returned no GPU data on login node".to_string(),
+                                                             );
+                                                         } else {
+                                                             gpu_data.gpu_list = parsed;
+                                                             gpu_data.is_online = true;
+                                                             gpu_data.error = None;
+                                                             gpu_data.last_update =
+                                                                 Some(Utc::now().format("%H:%M:%S").to_string());
+                                                         }
+                                                     } else {
+                                                         smi_error = Some(
+                                                             "Failed to read nvidia-smi output".to_string(),
+                                                         );
+                                                     }
+                                                 } else {
+                                                     smi_error = Some(
+                                                         "Failed to exec nvidia-smi on login node".to_string(),
+                                                     );
+                                                 }
+                                             } else {
+                                                 smi_error = Some(
+                                                     "Failed to open SSH channel for nvidia-smi".to_string(),
+                                                 );
+                                             }
+                                             if let Some(err) = smi_error {
+                                                 if gpu_data.gpu_list.is_empty() {
+                                                     if let Some(cached) = cached_snapshot {
+                                                         if !cached.gpu_list.is_empty() {
+                                                             gpu_data.gpu_list = cached.gpu_list;
+                                                             gpu_data.slurm_nodelists =
+                                                                 cached.slurm_nodelists.clone();
+                                                             gpu_data.slurm_times =
+                                                                 cached.slurm_times.clone();
+                                                             gpu_data.slurm_steps =
+                                                                 cached.slurm_steps.clone();
+                                                             gpu_data.is_online = true;
+                                                             gpu_data.error = Some(format!(
+                                                                 "{} (showing cached job data)",
+                                                                 err
+                                                             ));
+                                                             gpu_data.last_update = cached
+                                                                 .last_update
+                                                                 .clone()
+                                                                 .or_else(|| {
+                                                                     Some(Utc::now().format("%H:%M:%S").to_string())
+                                                                 });
+                                                         } else {
+                                                             gpu_data.error = Some(err);
+                                                         }
+                                                     } else {
+                                                         gpu_data.error = Some(err);
+                                                     }
+                                                 }
+                                             }
                                          }
                                         
                                          if let Ok(mut data) = state_task.gpu_data.lock() {
@@ -631,18 +964,46 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                  _ => {
                                      log::warn!("Worker for {} failed or disconnected, retrying in 10s", server_inner.host);
                                      session = None;
-                                     
-                                     // Update global state and emit!
-                                     let gpu_data = ServerGpuData {
-                                         host: server_inner.host.clone(),
-                                         is_online: false,
-                                         gpu_list: vec![],
-                                         error: Some("SSH connection failed or disconnected".to_string()),
-                                         last_update: Some(Utc::now().format("%H:%M:%S").to_string()),
-                                         slurm_steps: None,
-                                         slurm_nodelists: None,
-                                         slurm_times: None,
-                                     };
+
+                                     {
+                                         let mut monitors = state_inner.active_monitors.lock().unwrap_or_else(|e| e.into_inner());
+                                         let prefix = format!("{}:", server_inner.host);
+                                         monitors.retain(|key, handle| {
+                                             if key.starts_with(&prefix) {
+                                                 handle.abort();
+                                                 false
+                                             } else {
+                                                 true
+                                             }
+                                         });
+                                     }
+
+                                     let mut gpu_data = state_inner
+                                         .gpu_data
+                                         .lock()
+                                         .ok()
+                                         .and_then(|data| data.get(&server_inner.host).cloned())
+                                         .unwrap_or_else(|| ServerGpuData {
+                                             host: server_inner.host.clone(),
+                                             is_online: false,
+                                             gpu_list: vec![],
+                                             error: None,
+                                             last_update: None,
+                                             slurm_steps: None,
+                                             slurm_nodelists: None,
+                                             slurm_times: None,
+                                         });
+                                     gpu_data.is_online = false;
+                                     if gpu_data.gpu_list.is_empty() {
+                                         gpu_data.error =
+                                             Some("SSH connection failed or disconnected".to_string());
+                                     } else {
+                                         gpu_data.error = Some(
+                                             "SSH connection failed (showing cached data)".to_string(),
+                                         );
+                                     }
+                                     gpu_data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
+
                                      if let Ok(mut data) = state_inner.gpu_data.lock() {
                                          data.insert(server_inner.host.clone(), gpu_data.clone());
                                      }
@@ -663,6 +1024,7 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
             if let Ok(mut data) = state.gpu_data.lock() {
                 data.clear();
             }
+            let _ = config_store::write_config(&app, GPU_CACHE_FILE, &Vec::<ServerGpuData>::new());
             let _ = app.emit("gpu_clear", ());
         }
 
@@ -683,12 +1045,24 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                 false
                             } else { true }
                         });
+
+                        // Clean up gpu_data entry
+                        if let Ok(mut data) = state.gpu_data.lock() {
+                            if data.remove(host).is_some() {
+                                let _ = app.emit("gpu_prune", host.to_string());
+                            }
+                        }
                     }
                     false
                 } else {
                     true
                 }
             });
+        }
+
+        if last_cache_persist.elapsed() >= Duration::from_secs(30) {
+            persist_gpu_data_cache(&app, state.as_ref());
+            last_cache_persist = std::time::Instant::now();
         }
 
         tokio::time::sleep(Duration::from_secs(5)).await; // Re-check config every 5s

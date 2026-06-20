@@ -1,17 +1,65 @@
 import { useState, useEffect, useRef } from "react";
-import { Sun, Moon, X, Plus, RotateCcw, Settings, Cpu, Calendar, BookOpen, Coins, Info, GripVertical, ChevronDown } from "lucide-react";
+import { Sun, Moon, X, Plus, RotateCcw, RefreshCw, Settings, Cpu, Calendar, BookOpen, Coins, Info, GripVertical, ChevronDown } from "lucide-react";
 import { motion, AnimatePresence, Reorder, useDragControls } from "framer-motion";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { WidgetThemeConfig } from "../types/theme";
+import type {
+  AppConfig,
+  ArxivConfig,
+  ArxivPaper,
+  GpuConfig,
+  PaperConfig,
+  PaperDeadlineInfo,
+  QuotaConfig,
+  QuotaItem,
+  QuotaItemConfig,
+  ServerConfig,
+  ServerGpuData,
+} from "../types/config";
+import type { UpdateInfo, AntigravitySetupStatus } from "../types/tauri";
+import { tauriInvoke } from "../utils/tauriInvoke";
+import { tauriListen } from "../utils/tauriListen";
 import { MasterSwitch } from "../components/MasterSwitch";
+import { SettingsGeneralServiceToggleError } from "../components/SettingsRefreshError";
 import { ThemeManagementSection } from "./ThemeManagementSection";
+import { isStaleQuotaWarning } from "../utils/quotaDisplay";
+import { listenBackendServiceError } from "../utils/backendServiceError";
+import { listenQuotaMonitorStatus, type QuotaMonitorStatus } from "../utils/quotaMonitorStatus";
+import { listenServiceUpdateEvents } from "../utils/serviceUpdateEvents";
+import { listenGpuDataSync } from "../utils/gpuDataSync";
+import {
+  isLiveDataSection,
+  LIVE_DATA_SECTION,
+  refetchAllSectionLiveData,
+  refetchSectionLiveDataForSection,
+  LIVE_DATA_SECTION_LABELS,
+  SETTINGS_SECTION_LABELS,
+  type SettingsSection,
+} from "../utils/sectionLiveData";
+import { CACHED_LABELS, cachedLabelWhen, gpuRefreshCachedLabel } from "../utils/cachedLabels";
+import { ServiceErrorBanners } from "../components/ServiceErrorBanners";
+import {
+  buildServiceFieldToggleDeps,
+  buildServiceToggleCallbacks,
+  clearLiveDataSectionErrors,
+  createMasterServiceToggleHandler,
+  createSectionRefreshHandler,
+  createSetServiceBusy,
+  isServiceToggleBusy,
+  serviceToggleServiceLabel,
+  serviceWidgetMeta,
+  type ServiceField,
+  type ServiceToggleError,
+} from "../utils/widgetLifecycle";
 
 const PROVIDER_LOGOS: Record<string, string> = {
   antigravity: "/icons/antigravity.svg",
   codex: "/icons/codex.svg",
   cursor: "/icons/cursor.svg",
   copilot: "/icons/vscode.svg",
+  "qoder-cn": "/icons/qoder-cn.svg",
+  pioneer: "/icons/pioneer.svg",
+  "claude-code": "/icons/claude-code.svg",
+  "minimax-cn": "/icons/codex.svg",
 };
 
 const PROVIDER_OPTIONS = [
@@ -19,25 +67,155 @@ const PROVIDER_OPTIONS = [
   { value: "codex", label: "Codex" },
   { value: "cursor", label: "Cursor" },
   { value: "copilot", label: "VS Code Copilot" },
+  { value: "qoder-cn", label: "Qoder CN" },
+  { value: "pioneer", label: "Pioneer AI" },
+  { value: "claude-code", label: "Claude Code" },
+  { value: "minimax-cn", label: "MiniMax CN" },
+  { value: "openai-compatible", label: "OpenAI Compatible" },
 ];
 
-const BUILTIN_PROVIDERS = new Set(["antigravity", "codex", "cursor", "copilot"]);
+type AuthMode = "local" | "api_key";
+
+const PROVIDER_AUTH: Record<
+  string,
+  { local: boolean; apiKey: boolean; defaultMode: AuthMode }
+> = {
+  antigravity: { local: true, apiKey: false, defaultMode: "local" },
+  codex: { local: true, apiKey: false, defaultMode: "local" },
+  cursor: { local: true, apiKey: false, defaultMode: "local" },
+  copilot: { local: true, apiKey: false, defaultMode: "local" },
+  "qoder-cn": { local: true, apiKey: true, defaultMode: "local" },
+  pioneer: { local: false, apiKey: true, defaultMode: "api_key" },
+  "claude-code": { local: true, apiKey: true, defaultMode: "local" },
+  "minimax-cn": { local: false, apiKey: true, defaultMode: "api_key" },
+};
+
+function getEffectiveAuthMode(q: { provider: string; auth_mode?: string | null }): AuthMode {
+  if (q.auth_mode === "local" || q.auth_mode === "api_key") return q.auth_mode;
+  return PROVIDER_AUTH[q.provider]?.defaultMode ?? "local";
+}
+
+function apiKeyPlaceholder(provider: string): string {
+  if (provider === "claude-code") return "sk-cp-... (MiniMax proxy token)";
+  if (provider === "qoder-cn") return "pt-... PAT (optional if signed in to Qoder CN IDE)";
+  if (provider === "pioneer") return "pio-... from pioneer.ai Settings";
+  if (provider === "minimax-cn") return "MiniMax API key (Bearer token)";
+  return "Your API key";
+}
+
+function AuthModeSwitch({
+  mode,
+  localEnabled,
+  apiKeyEnabled,
+  onChange,
+  appConfig,
+}: {
+  mode: AuthMode;
+  localEnabled: boolean;
+  apiKeyEnabled: boolean;
+  onChange: (mode: AuthMode) => void;
+  appConfig: AppConfig;
+}) {
+  const baseBtn = "px-2.5 py-1.5 text-[10px] font-black uppercase tracking-wider transition-all rounded-lg";
+  const activeLight = "bg-blue-600 text-white shadow-sm";
+  const activeDark = "bg-blue-500 text-white shadow-sm";
+  const idleLight = "text-slate-500 hover:text-slate-800 hover:bg-slate-100";
+  const idleDark = "text-slate-400 hover:text-white hover:bg-white/10";
+  const disabledCls = "opacity-35 cursor-not-allowed";
+
+  return (
+    <div
+      className={`flex items-center gap-0.5 p-0.5 rounded-xl border flex-shrink-0 ${
+        appConfig.theme === "light" ? "bg-slate-100 border-slate-200" : "bg-black/30 border-white/10"
+      }`}
+    >
+      <button
+        type="button"
+        disabled={!localEnabled}
+        onClick={() => localEnabled && onChange("local")}
+        className={`${baseBtn} ${
+          mode === "local"
+            ? appConfig.theme === "light" ? activeLight : activeDark
+            : appConfig.theme === "light" ? idleLight : idleDark
+        } ${!localEnabled ? disabledCls : "cursor-pointer"}`}
+      >
+        Local
+      </button>
+      <button
+        type="button"
+        disabled={!apiKeyEnabled}
+        onClick={() => apiKeyEnabled && onChange("api_key")}
+        className={`${baseBtn} ${
+          mode === "api_key"
+            ? appConfig.theme === "light" ? activeLight : activeDark
+            : appConfig.theme === "light" ? idleLight : idleDark
+        } ${!apiKeyEnabled ? disabledCls : "cursor-pointer"}`}
+      >
+        API Key
+      </button>
+    </div>
+  );
+}
 
 function QuotaItemCard({
   q, appConfig, openProviderId,
-  onToggleProvider, onRemove, onUpdateField, onSave, localQuota,
+  onToggleProvider, onRemove, onUpdateField, onSave, localQuota, liveItem,
 }: {
-  q: any; appConfig: any; openProviderId: string | null;
+  q: QuotaItemConfig;
+  appConfig: AppConfig;
+  openProviderId: string | null;
   onToggleProvider: (id: string | null) => void;
   onRemove: (id: string) => void;
-  onUpdateField: (id: string, field: string, val: any, save?: boolean) => void;
-  onSave: (config: any) => void;
-  localQuota: any;
+  onUpdateField: <K extends keyof QuotaItemConfig>(
+    id: string,
+    field: K,
+    val: QuotaItemConfig[K],
+    save?: boolean
+  ) => void;
+  onSave: (config: QuotaConfig) => void;
+  localQuota: QuotaConfig;
+  liveItem?: QuotaItem;
 }) {
   const controls = useDragControls();
-  const isBuiltin = BUILTIN_PROVIDERS.has(q.provider);
   const isOpen = openProviderId === q.id;
   const selectedProvider = PROVIDER_OPTIONS.find(p => p.value === q.provider) || PROVIDER_OPTIONS[0];
+  const authCaps = PROVIDER_AUTH[q.provider] ?? { local: true, apiKey: true, defaultMode: "local" as AuthMode };
+  const authMode = getEffectiveAuthMode(q);
+  const isCustomProvider = !PROVIDER_AUTH[q.provider];
+  const isAntigravity = q.provider === "antigravity";
+  const [agStatus, setAgStatus] = useState<AntigravitySetupStatus | null>(null);
+
+  useEffect(() => {
+    if (!isAntigravity) {
+      setAgStatus(null);
+      return;
+    }
+    let active = true;
+    const refresh = () => {
+      tauriInvoke("get_antigravity_setup_status")
+        .then((status) => {
+          if (active) setAgStatus(status);
+        })
+        .catch(() => {
+          if (active) setAgStatus(null);
+        });
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 15000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [isAntigravity]);
+
+  const agReady =
+    agStatus?.language_server_running ||
+    (agStatus?.has_oauth_tokens && agStatus?.cloud_auth_ready);
+
+  const liveError = liveItem?.error_msg ?? undefined;
+  const liveStale = isStaleQuotaWarning(liveError);
+  const showLiveStatus = q.provider !== "manual" && (liveError || liveItem?.last_update);
+
   return (
     <Reorder.Item
       value={q}
@@ -90,7 +268,10 @@ function QuotaItemCard({
               {PROVIDER_OPTIONS.map((opt) => (
                 <button
                   key={opt.value}
-                  onClick={() => { onUpdateField(q.id, "provider", opt.value, true); onToggleProvider(null); }}
+                  onClick={() => {
+                    onUpdateField(q.id, "provider", opt.value, true);
+                    onToggleProvider(null);
+                  }}
                   className={`w-full flex items-center gap-3 px-4 py-2.5 text-xs font-bold transition-colors cursor-pointer ${
                     q.provider === opt.value
                       ? appConfig.theme === "light" ? "bg-blue-50 text-blue-600" : "bg-blue-500/10 text-blue-400"
@@ -108,30 +289,107 @@ function QuotaItemCard({
             </div>
           )}
         </div>
+        <AuthModeSwitch
+          mode={authMode}
+          localEnabled={authCaps.local}
+          apiKeyEnabled={authCaps.apiKey}
+          onChange={(mode) => onUpdateField(q.id, "auth_mode", mode, true)}
+          appConfig={appConfig}
+        />
       </div>
-      {!isBuiltin && (
+      {authMode === "api_key" && authCaps.apiKey && (
+        <div className="px-4 pb-4">
+          <div className="space-y-1.5">
+            <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">API Key</label>
+            <input
+              type="password"
+              value={q.api_key || ""}
+              onChange={(e) => onUpdateField(q.id, "api_key", e.target.value)}
+              onBlur={() => onSave(localQuota)}
+              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+              className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
+                appConfig.theme === "light"
+                  ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
+                  : "bg-black/40 border-white/10 text-white focus:bg-black/60"
+              }`}
+              placeholder={apiKeyPlaceholder(q.provider)}
+            />
+          </div>
+        </div>
+      )}
+      {isAntigravity && (
+        <div className="px-4 pb-4">
+          <div
+            className={`rounded-xl border px-3 py-2.5 text-[10px] leading-relaxed ${
+              agReady
+                ? appConfig.theme === "light"
+                  ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                  : "bg-emerald-500/5 border-emerald-500/15 text-emerald-300/90"
+                : appConfig.theme === "light"
+                ? "bg-amber-50 border-amber-200 text-amber-800"
+                : "bg-amber-500/5 border-amber-500/15 text-amber-300/90"
+            }`}
+          >
+            {agStatus ? (
+              <ul className="space-y-1">
+                <li>
+                  IDE language server:{" "}
+                  <span className="font-bold">
+                    {agStatus.language_server_running ? "Running" : "Not detected"}
+                  </span>
+                </li>
+                <li>
+                  OAuth tokens:{" "}
+                  <span className="font-bold">
+                    {agStatus.has_oauth_tokens ? "Found" : "Missing — sign in via Antigravity IDE"}
+                  </span>
+                </li>
+                <li>
+                  Cloud fallback:{" "}
+                  <span className="font-bold">
+                    {agStatus.cloud_auth_ready
+                      ? "Ready"
+                      : "Needs client_secret in antigravity_oauth.json or env"}
+                  </span>
+                </li>
+                <li className="pt-1 text-[9px] opacity-80 break-all">
+                  OAuth config: <code className="font-mono">{agStatus.oauth_config_path}</code>
+                </li>
+                {agStatus.program_files_install && (
+                  <li className="pt-1 text-[9px] opacity-90">
+                    Installed under Program Files — configs are stored in AppData, not next to the .exe.
+                    Config folder: <code className="font-mono break-all">{agStatus.config_dir}</code>
+                  </li>
+                )}
+                {!agReady && agStatus.has_oauth_tokens && !agStatus.language_server_running && (
+                  <li className="pt-2 font-bold">
+                    {agStatus.cloud_auth_ready
+                      ? "Launch Antigravity IDE to refresh quota via local mode."
+                      : "Launch Antigravity IDE (recommended), or add client_secret to antigravity_oauth.json for cloud fallback."}
+                  </li>
+                )}
+              </ul>
+            ) : (
+              <>
+                Local mode reads the running Antigravity IDE. Cloud fallback needs OAuth{" "}
+                <code className="font-mono text-[9px]">client_secret</code> in{" "}
+                <code className="font-mono text-[9px]">configs/antigravity_oauth.json</code>.
+              </>
+            )}
+          </div>
+        </div>
+      )}
+      {isCustomProvider && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 px-4 pb-4">
-          <div className="space-y-1.5">
-            <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Monitor Name</label>
-            <input type="text" value={q.name || ""} onChange={(e) => onUpdateField(q.id, "name", e.target.value)} onBlur={() => onSave(localQuota)}
-              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-              className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${appConfig.theme === "light" ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white" : "bg-black/40 border-white/10 text-white focus:bg-black/60"}`}
-              placeholder="e.g. My API" />
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">API Key / Token</label>
-            <input type="password" value={q.api_key || ""} onChange={(e) => onUpdateField(q.id, "api_key", e.target.value)} onBlur={() => onSave(localQuota)}
-              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-              className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${appConfig.theme === "light" ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white" : "bg-black/40 border-white/10 text-white focus:bg-black/60"}`}
-              placeholder="sk-..." />
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Max Quota</label>
-            <input type="number" value={q.max_quota || 0} onChange={(e) => onUpdateField(q.id, "max_quota", parseFloat(e.target.value) || 0)} onBlur={() => onSave(localQuota)}
-              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-              className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${appConfig.theme === "light" ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white" : "bg-black/40 border-white/10 text-white focus:bg-black/60"}`}
-              placeholder="e.g. 100" />
-          </div>
+          {q.provider === "openai-compatible" && (
+            <div className={`md:col-span-3 rounded-xl border px-3 py-2 text-[10px] leading-relaxed ${
+              appConfig.theme === "light"
+                ? "bg-slate-50 border-slate-200 text-slate-600"
+                : "bg-white/5 border-white/10 text-slate-400"
+            }`}>
+              Point at any OpenAI-style usage endpoint. Set JSON Path to the dot-separated field that holds the remaining quota value (e.g. <code className="font-mono">data.remaining</code>).
+            </div>
+          )}
           <div className="space-y-1.5 md:col-span-2">
             <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">API URL</label>
             <input type="text" value={q.api_url || ""} onChange={(e) => onUpdateField(q.id, "api_url", e.target.value)} onBlur={() => onSave(localQuota)}
@@ -140,36 +398,210 @@ function QuotaItemCard({
               placeholder="https://..." />
           </div>
           <div className="space-y-1.5">
-            <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Unit</label>
-            <input type="text" value={q.unit || ""} onChange={(e) => onUpdateField(q.id, "unit", e.target.value)} onBlur={() => onSave(localQuota)}
+            <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Max Quota</label>
+            <input type="number" value={q.max_quota || 0} onChange={(e) => onUpdateField(q.id, "max_quota", parseFloat(e.target.value) || 0)} onBlur={() => onSave(localQuota)}
               onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
               className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${appConfig.theme === "light" ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white" : "bg-black/40 border-white/10 text-white focus:bg-black/60"}`}
-              placeholder="Credits / Tokens" />
+              placeholder="100" />
           </div>
+          <div className="space-y-1.5 md:col-span-3">
+            <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">JSON Path</label>
+            <input type="text" value={q.json_path || ""} onChange={(e) => onUpdateField(q.id, "json_path", e.target.value)} onBlur={() => onSave(localQuota)}
+              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+              className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${appConfig.theme === "light" ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white" : "bg-black/40 border-white/10 text-white focus:bg-black/60"}`}
+              placeholder="data.remaining" />
+          </div>
+        </div>
+      )}
+      {showLiveStatus && (
+        <div className="px-4 pb-4">
+          {liveError ? (
+            <div
+              className={`rounded-xl border px-3 py-2 text-[10px] leading-relaxed ${
+                liveStale
+                  ? appConfig.theme === "light"
+                    ? "bg-amber-50 border-amber-200 text-amber-900"
+                    : "bg-amber-500/10 border-amber-500/20 text-amber-300/90"
+                  : appConfig.theme === "light"
+                  ? "bg-red-50 border-red-200 text-red-800"
+                  : "bg-red-500/10 border-red-500/20 text-red-300/90"
+              }`}
+            >
+              {liveError}
+            </div>
+          ) : (
+            <div className="text-[9px] text-slate-500 font-medium">
+              Last update: {liveItem?.last_update || "—"}
+              {liveItem?.current_value != null && (
+                <span className="ml-2 opacity-80">
+                  · {liveItem.current_value}
+                  {liveItem.unit ? ` ${liveItem.unit}` : ""}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       )}
     </Reorder.Item>
   );
 }
 
+const sanitizeGpuConfig = (config: GpuConfig): GpuConfig => {
+  const servers = (config.servers || []).map((s: ServerConfig, idx: number) => ({
+    ...s,
+    id: s.id || `server-${idx}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+  }));
+  return { ...config, servers };
+};
+
+function GpuServerCard({
+  s, idx, appConfig, removeServer, updateServer, localGpu, onSaveGpu
+}: {
+  s: ServerConfig;
+  idx: number;
+  appConfig: AppConfig;
+  removeServer: (idx: number) => void;
+  updateServer: (idx: number, field: keyof ServerConfig, val: ServerConfig[keyof ServerConfig], shouldSave?: boolean) => void;
+  localGpu: GpuConfig;
+  onSaveGpu: (config: GpuConfig) => void;
+}) {
+  const controls = useDragControls();
+  return (
+    <Reorder.Item
+      value={s}
+      dragListener={false}
+      dragControls={controls}
+      whileDrag={{ scale: 1.02, opacity: 0.8, zIndex: 99 }}
+      className={`p-6 border border-[var(--dashboard-border)] rounded-2xl relative group ${
+        appConfig.theme === "light" ? "bg-white" : "bg-white/5"
+      }`}
+    >
+      <button
+        onClick={() => removeServer(idx)}
+        className="absolute -top-2 -right-2 w-6 h-6 rounded-full bg-red-500 text-white opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center shadow-lg z-10"
+      >
+        <X size={12} />
+      </button>
+      
+      <div className="flex items-center gap-3 mb-4">
+        <div
+          onPointerDown={(e) => { controls.start(e); }}
+          className={`flex-shrink-0 p-1.5 rounded-lg cursor-grab active:cursor-grabbing select-none touch-none ${
+            appConfig.theme === "light" ? "text-slate-300 hover:text-slate-500 hover:bg-slate-100" : "text-slate-600 hover:text-slate-400 hover:bg-white/5"
+          }`}
+        >
+          <GripVertical size={16} />
+        </div>
+        <div className={`text-xs font-bold ${appConfig.theme === "light" ? "text-slate-700" : "text-slate-300"}`}>
+          Server #{idx + 1} {s.host ? `(${s.host})` : ""}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-4 gap-4">
+        <div className="space-y-1.5">
+          <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Host / IP</label>
+          <input
+            type="text"
+            value={s.host || ""}
+            onChange={(e) => updateServer(idx, "host", e.target.value)}
+            onBlur={() => onSaveGpu(localGpu)}
+            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+            className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
+              appConfig.theme === "light"
+                ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
+                : "bg-black/40 border-white/10 text-white focus:bg-black/60"
+            }`}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Username</label>
+          <input
+            type="text"
+            value={s.user || ""}
+            onChange={(e) => updateServer(idx, "user", e.target.value)}
+            onBlur={() => onSaveGpu(localGpu)}
+            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+            className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
+              appConfig.theme === "light"
+                ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
+                : "bg-black/40 border-white/10 text-white focus:bg-black/60"
+            }`}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Password</label>
+          <input
+            type="password"
+            value={s.password || ""}
+            onChange={(e) => updateServer(idx, "password", e.target.value)}
+            onBlur={() => onSaveGpu(localGpu)}
+            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+            className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
+              appConfig.theme === "light"
+                ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
+                : "bg-black/40 border-white/10 text-white focus:bg-black/60"
+            }`}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Port</label>
+          <input
+            type="number"
+            value={s.port || 22}
+            onChange={(e) => updateServer(idx, "port", parseInt(e.target.value))}
+            onBlur={() => onSaveGpu(localGpu)}
+            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+            className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
+              appConfig.theme === "light"
+                ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
+                : "bg-black/40 border-white/10 text-white focus:bg-black/60"
+            }`}
+          />
+        </div>
+        <div className="col-span-4 flex items-center gap-4 pt-2">
+          <button
+            onClick={() => updateServer(idx, "use_slurm", !s.use_slurm, true)}
+            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
+              s.use_slurm
+                ? "bg-amber-500/20 text-amber-400 border border-amber-500/20 shadow-lg shadow-amber-500/10"
+                : "bg-black/40 text-slate-500 border border-white/5 hover:border-white/20"
+            }`}
+          >
+            <div className={`w-2 h-2 rounded-full ${s.use_slurm ? "bg-amber-400 animate-pulse" : "bg-slate-600"}`} />
+            Slurm Cluster Mode
+          </button>
+          {s.use_slurm && (
+            <span className="text-[9px] text-amber-500/60 font-medium italic">
+              Enables job-based monitoring via squeue & srun
+            </span>
+          )}
+        </div>
+      </div>
+    </Reorder.Item>
+  );
+}
+
 interface SettingsPanelProps {
-  gpuConfig: any;
-  paperConfig: any;
-  arxivConfig: any;
-  appConfig: any;
-  quotaConfig: any;
+  gpuConfig: GpuConfig;
+  paperConfig: PaperConfig;
+  arxivConfig: ArxivConfig;
+  appConfig: AppConfig;
+  quotaConfig: QuotaConfig;
   themeConfig: WidgetThemeConfig;
-  onSaveGpu: (config: any) => void;
-  onSavePaper: (config: any) => void;
-  onSaveArxiv: (config: any) => void;
-  onSaveQuota: (config: any) => void;
-  onSaveApp: (config: any) => void;
+  onSaveGpu: (config: GpuConfig) => void;
+  onSavePaper: (config: PaperConfig) => void;
+  onSaveArxiv: (config: ArxivConfig) => void;
+  onSaveQuota: (config: QuotaConfig) => void;
+  onSaveApp: (config: AppConfig) => void;
   onSaveThemes: (config: WidgetThemeConfig) => void;
   isAutostart: boolean;
   onToggleAutostart: () => void;
   activeWidgets: string[];
-  updateInfo: any;
-  setUpdateInfo: (info: any) => void;
+  updateInfo: UpdateInfo | null;
+  setUpdateInfo: (info: UpdateInfo | null) => void;
+  updateCheckError?: string | null;
+  setUpdateCheckError?: (err: string | null) => void;
+  onActiveWidgetsChanged?: (labels: string[]) => void;
 }
 
 export function SettingsPanel({
@@ -189,23 +621,168 @@ export function SettingsPanel({
   onToggleAutostart,
   activeWidgets,
   updateInfo,
-  setUpdateInfo
+  setUpdateInfo,
+  updateCheckError,
+  setUpdateCheckError,
+  onActiveWidgetsChanged,
 }: SettingsPanelProps) {
-  const [localGpu, setLocalGpu] = useState<any>(gpuConfig);
-  const [localPaper, setLocalPaper] = useState<any>(paperConfig);
-  const [localArxiv, setLocalArxiv] = useState<any>(arxivConfig);
-  const [localQuota, setLocalQuota] = useState<any>(quotaConfig);
-  const [activeSection, setActiveSection] = useState<string>("general");
+  const [localGpu, setLocalGpu] = useState<GpuConfig>(() => sanitizeGpuConfig(gpuConfig));
+  const [localPaper, setLocalPaper] = useState<PaperConfig>(paperConfig);
+  const [localArxiv, setLocalArxiv] = useState<ArxivConfig>(arxivConfig);
+  const [localQuota, setLocalQuota] = useState<QuotaConfig>(quotaConfig);
+  const [activeSection, setActiveSection] = useState<SettingsSection>("general");
   const [openProviderId, setOpenProviderId] = useState<string | null>(null);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [downloadState, setDownloadState] = useState<"idle" | "downloading" | "completed" | "error">("idle");
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [configDirPath, setConfigDirPath] = useState("");
+  const [quotaMonitorStatus, setQuotaMonitorStatus] = useState<QuotaMonitorStatus | null>(null);
+  const [quotaBackendError, setQuotaBackendError] = useState<string | null>(null);
+  const [liveQuotaItems, setLiveQuotaItems] = useState<QuotaItem[]>([]);
+  const [liveDeadlines, setLiveDeadlines] = useState<PaperDeadlineInfo[]>([]);
+  const [liveArxivPapers, setLiveArxivPapers] = useState<ArxivPaper[]>([]);
+  const [liveGpuData, setLiveGpuData] = useState<ServerGpuData[]>([]);
+  const [isRefreshingQuotaAll, setIsRefreshingQuotaAll] = useState(false);
+  const [quotaRefreshError, setQuotaRefreshError] = useState<string | null>(null);
+  const [isRefreshingGpu, setIsRefreshingGpu] = useState(false);
+  const [isRefreshingDeadlines, setIsRefreshingDeadlines] = useState(false);
+  const [isRefreshingArxiv, setIsRefreshingArxiv] = useState(false);
+  const [gpuRefreshError, setGpuRefreshError] = useState<string | null>(null);
+  const [deadlinesRefreshError, setDeadlinesRefreshError] = useState<string | null>(null);
+  const [paperBackendError, setPaperBackendError] = useState<string | null>(null);
+  const [arxivRefreshError, setArxivRefreshError] = useState<string | null>(null);
+  const [arxivBackendError, setArxivBackendError] = useState<string | null>(null);
+  const [generalServiceRefreshError, setGeneralServiceRefreshError] = useState<ServiceToggleError | null>(null);
+  const [generalServiceErrorDismissed, setGeneralServiceErrorDismissed] = useState(false);
+  const prevActiveSectionRef = useRef(activeSection);
+  const [serviceToggleBusy, setServiceToggleBusy] = useState<Partial<Record<ServiceField, boolean>>>({});
+  const [corruptConfigFiles, setCorruptConfigFiles] = useState<string[]>([]);
+
+  useEffect(() => {
+    const prevSection = prevActiveSectionRef.current;
+    if (prevSection !== activeSection) {
+      if (
+        generalServiceErrorDismissed &&
+        generalServiceRefreshError &&
+        prevSection === "general"
+      ) {
+        setGeneralServiceRefreshError(null);
+      }
+      if (isLiveDataSection(prevSection)) {
+        clearLiveDataSectionErrors(prevSection, {
+          gpu: { clearRefresh: () => setGpuRefreshError(null) },
+          deadlines: {
+            clearRefresh: () => setDeadlinesRefreshError(null),
+            clearBackend: () => setPaperBackendError(null),
+          },
+          arxiv: {
+            clearRefresh: () => setArxivRefreshError(null),
+            clearBackend: () => setArxivBackendError(null),
+          },
+          quota: {
+            clearRefresh: () => setQuotaRefreshError(null),
+            clearBackend: () => setQuotaBackendError(null),
+          },
+        });
+      }
+      setGeneralServiceErrorDismissed(false);
+      prevActiveSectionRef.current = activeSection;
+
+      if (isLiveDataSection(activeSection)) {
+        const setters = {
+          [LIVE_DATA_SECTION.GPU]: setLiveGpuData,
+          [LIVE_DATA_SECTION.DEADLINES]: setLiveDeadlines,
+          [LIVE_DATA_SECTION.ARXIV]: setLiveArxivPapers,
+          [LIVE_DATA_SECTION.QUOTA]: setLiveQuotaItems,
+        };
+        refetchSectionLiveDataForSection(activeSection, setters);
+      }
+    }
+  }, [activeSection, generalServiceErrorDismissed, generalServiceRefreshError]);
+
+  useEffect(() => {
+    let active = true;
+    const unsubs: (() => void)[] = [];
+
+    refetchAllSectionLiveData({
+      [LIVE_DATA_SECTION.GPU]: (data) => {
+        if (active) setLiveGpuData(data);
+      },
+      [LIVE_DATA_SECTION.DEADLINES]: (data) => {
+        if (active) setLiveDeadlines(data);
+      },
+      [LIVE_DATA_SECTION.ARXIV]: (data) => {
+        if (active) setLiveArxivPapers(data);
+      },
+      [LIVE_DATA_SECTION.QUOTA]: (data) => {
+        if (active) setLiveQuotaItems(data);
+      },
+    });
+
+    const setup = async () => {
+      const u1 = await listenServiceUpdateEvents(
+        () => active,
+        {
+          gpu: { clearRefresh: () => setGpuRefreshError(null) },
+          paper: {
+            clearRefresh: () => setDeadlinesRefreshError(null),
+            clearBackend: () => setPaperBackendError(null),
+          },
+          arxiv: {
+            clearRefresh: () => setArxivRefreshError(null),
+            clearBackend: () => setArxivBackendError(null),
+          },
+          quota: {
+            clearRefresh: () => setQuotaRefreshError(null),
+            clearBackend: () => setQuotaBackendError(null),
+          },
+        },
+        {
+          gpuSetter: setLiveGpuData,
+          paperSetter: setLiveDeadlines,
+          arxivSetter: setLiveArxivPapers,
+          quotaSetter: setLiveQuotaItems,
+        }
+      );
+      unsubs.push(u1);
+
+      const u1e = await listenBackendServiceError(
+        "paper_error",
+        setPaperBackendError,
+        () => active
+      );
+      unsubs.push(u1e);
+
+      const u1f = await listenBackendServiceError(
+        "arxiv_error",
+        setArxivBackendError,
+        () => active
+      );
+      unsubs.push(u1f);
+
+      const u2 = await listenQuotaMonitorStatus(
+        setQuotaMonitorStatus,
+        setQuotaBackendError,
+        () => active
+      );
+      unsubs.push(u2);
+
+      const u3 = await listenGpuDataSync(setLiveGpuData, () => active);
+      unsubs.push(u3);
+    };
+    setup();
+
+    return () => {
+      active = false;
+      unsubs.forEach((f) => f());
+    };
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     const setup = async () => {
-      unlisten = await listen<any>("ota_download_progress", (event) => {
+      unlisten = await tauriListen("ota_download_progress", (event) => {
         const { state, progress, error } = event.payload;
         setDownloadState(state);
         setDownloadProgress(progress);
@@ -220,15 +797,27 @@ export function SettingsPanel({
     };
   }, []);
 
+  useEffect(() => {
+    tauriInvoke("get_config_dir_path")
+      .then((path) => setConfigDirPath(path))
+      .catch(console.error);
+    tauriInvoke("get_corrupt_config_files")
+      .then((files) => setCorruptConfigFiles(files))
+      .catch(console.error);
+  }, []);
+
   const handleCheckUpdate = async () => {
     setIsCheckingUpdate(true);
     setUpdateError(null);
+    setUpdateCheckError?.(null);
     try {
-      const res = await invoke<any>("check_for_updates");
+      const res = await tauriInvoke("check_for_updates");
       setUpdateInfo(res);
     } catch (err) {
       console.error(err);
-      setUpdateError(String(err));
+      const message = String(err);
+      setUpdateError(message);
+      setUpdateCheckError?.(message);
     } finally {
       setIsCheckingUpdate(false);
     }
@@ -243,7 +832,7 @@ export function SettingsPanel({
     setDownloadProgress(0);
     setDownloadState("downloading");
     try {
-      await invoke("download_and_install_update", {
+      await tauriInvoke("download_and_install_update", {
         downloadUrl: updateInfo.download_url,
         assetName: updateInfo.asset_name,
       });
@@ -254,17 +843,17 @@ export function SettingsPanel({
     }
   };
 
-  const tabs = [
-    { id: "general", label: "General", icon: Settings },
-    { id: "quota", label: "Quota Monitor", icon: Coins },
-    { id: "gpu", label: "GPU Monitor", icon: Cpu },
-    { id: "deadlines", label: "Paper Deadlines", icon: Calendar },
-    { id: "arxiv", label: "Arxiv Radar", icon: BookOpen },
-    { id: "about", label: "About", icon: Info }
+  const tabs: { id: SettingsSection; label: string; icon: typeof Settings }[] = [
+    { id: "general", label: SETTINGS_SECTION_LABELS.general, icon: Settings },
+    { id: LIVE_DATA_SECTION.QUOTA, label: LIVE_DATA_SECTION_LABELS.quota, icon: Coins },
+    { id: LIVE_DATA_SECTION.GPU, label: LIVE_DATA_SECTION_LABELS.gpu, icon: Cpu },
+    { id: LIVE_DATA_SECTION.DEADLINES, label: LIVE_DATA_SECTION_LABELS.deadlines, icon: Calendar },
+    { id: LIVE_DATA_SECTION.ARXIV, label: LIVE_DATA_SECTION_LABELS.arxiv, icon: BookOpen },
+    { id: "about", label: SETTINGS_SECTION_LABELS.about, icon: Info },
   ];
 
   useEffect(() => {
-    setLocalGpu(gpuConfig);
+    setLocalGpu(sanitizeGpuConfig(gpuConfig));
   }, [gpuConfig]);
 
   useEffect(() => {
@@ -282,7 +871,17 @@ export function SettingsPanel({
   useEffect(() => {
     if (quotaConfig !== initialQuotaRef.current) {
       if (!quotaInitialized.current) {
-        setLocalQuota(quotaConfig);
+        const normalized: QuotaConfig = {
+          ...quotaConfig,
+          items: (quotaConfig?.items || []).map((item) => ({
+            ...item,
+            auth_mode:
+              item.auth_mode ??
+              PROVIDER_AUTH[item.provider]?.defaultMode ??
+              "local",
+          })),
+        };
+        setLocalQuota(normalized);
         quotaInitialized.current = true;
       }
     }
@@ -298,19 +897,36 @@ export function SettingsPanel({
 
   const addServer = () => {
     const servers = localGpu?.servers || [];
-    const next = { ...localGpu, servers: [...servers, { host: "", user: "root", password: "", port: 22 }] };
+    const next = {
+      ...localGpu,
+      servers: [
+        ...servers,
+        {
+          id: `server-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          host: "",
+          user: "root",
+          password: "",
+          port: 22
+        }
+      ]
+    };
     setLocalGpu(next);
     onSaveGpu(next);
   };
 
   const removeServer = (idx: number) => {
     const servers = localGpu?.servers || [];
-    const next = { ...localGpu, servers: servers.filter((_: any, i: number) => i !== idx) };
+    const next = { ...localGpu, servers: servers.filter((_, i) => i !== idx) };
     setLocalGpu(next);
     onSaveGpu(next);
   };
 
-  const updateServer = (idx: number, field: string, val: any, shouldSave = false) => {
+  const updateServer = (
+    idx: number,
+    field: keyof ServerConfig,
+    val: ServerConfig[keyof ServerConfig],
+    shouldSave = false
+  ) => {
     const next = { ...localGpu };
     const servers = [...(next.servers || [])];
     if (servers[idx]) {
@@ -325,16 +941,18 @@ export function SettingsPanel({
 
   const addQuotaItem = () => {
     const items = localQuota?.items || [];
-    const newItem = {
+    const provider = "antigravity";
+    const label = PROVIDER_OPTIONS.find((p) => p.value === provider)?.label ?? "Antigravity";
+    const newItem: QuotaItemConfig = {
       id: "quota-" + Date.now(),
-      name: "Antigravity",
-      provider: "antigravity",
+      name: label,
+      provider,
+      auth_mode: PROVIDER_AUTH[provider]?.defaultMode ?? "local",
       api_key: "",
       api_url: "",
       json_path: "",
       max_quota: 100,
       unit: "%",
-      current_value: 0
     };
     const next = { ...localQuota, items: [...items, newItem] };
     setLocalQuota(next);
@@ -343,37 +961,152 @@ export function SettingsPanel({
 
   const removeQuotaItem = (id: string) => {
     const items = localQuota?.items || [];
-    const next = { ...localQuota, items: items.filter((item: any) => item.id !== id) };
+    const next = { ...localQuota, items: items.filter((item) => item.id !== id) };
     setLocalQuota(next);
     onSaveQuota(next);
   };
 
-  const updateQuotaItem = (id: string, field: string, val: any, shouldSave = false) => {
+  const updateQuotaItem = <K extends keyof QuotaItemConfig>(
+    id: string,
+    field: K,
+    val: QuotaItemConfig[K],
+    shouldSave = false
+  ) => {
     const next = { ...localQuota };
     const items = [...(next.items || [])];
-    const idx = items.findIndex((i: any) => i.id === id);
-    if (idx !== -1) {
-      let updatedItem = { ...items[idx], [field]: val };
-      if (field === "provider") {
-        const found = PROVIDER_OPTIONS.find(p => p.value === val);
-        if (found) updatedItem.name = found.label;
+    const idx = items.findIndex((i) => i.id === id);
+    if (idx === -1) return;
+
+    let updatedItem = { ...items[idx], [field]: val } as QuotaItemConfig;
+    if (field === "provider" && typeof val === "string") {
+      const found = PROVIDER_OPTIONS.find((p) => p.value === val);
+      if (found) {
+        const isOpenAiCompatible = val === "openai-compatible";
+        updatedItem = {
+          ...updatedItem,
+          name: found.label,
+          auth_mode: isOpenAiCompatible
+            ? "api_key"
+            : PROVIDER_AUTH[val]?.defaultMode ?? "local",
+          api_key: "",
+          api_url: isOpenAiCompatible ? "" : "",
+          json_path: isOpenAiCompatible ? "" : "",
+          max_quota: updatedItem.max_quota || 100,
+          unit: updatedItem.unit || (isOpenAiCompatible ? "tokens" : "%"),
+        };
       }
-      items[idx] = updatedItem;
-      next.items = items;
-      setLocalQuota(next);
-      if (shouldSave) {
-        onSaveQuota(next);
-      }
+    }
+
+    items[idx] = updatedItem;
+    next.items = items;
+    setLocalQuota(next);
+    if (shouldSave) {
+      onSaveQuota(next);
     }
   };
 
-  const handleRestorePosition = async (id: string, title: string) => {
+  const handleRestorePosition = async (field: ServiceField) => {
+    const { id, title } = serviceWidgetMeta(field);
     try {
-      await invoke("restore_widget_position", { id, title });
+      await tauriInvoke("restore_widget_position", { id, title });
     } catch (e) {
       console.error(`Failed to restore position for ${title}:`, e);
     }
   };
+
+  const sectionRefreshBtnClass = (disabled?: boolean) =>
+    `flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
+      appConfig.theme === "light"
+        ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300 disabled:opacity-50"
+        : "bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border-white/5 disabled:opacity-50"
+    } ${disabled ? "opacity-50 cursor-not-allowed" : ""}`;
+
+  const handleRefreshGpuSettings = createSectionRefreshHandler({
+    isRefreshing: isRefreshingGpu,
+    setIsRefreshing: setIsRefreshingGpu,
+    clearError: () => setGpuRefreshError(null),
+    setError: setGpuRefreshError,
+    section: LIVE_DATA_SECTION.GPU,
+    logLabel: "GPU refresh failed",
+  });
+
+  const handleRefreshDeadlinesSettings = createSectionRefreshHandler({
+    isRefreshing: isRefreshingDeadlines,
+    setIsRefreshing: setIsRefreshingDeadlines,
+    clearError: () => setDeadlinesRefreshError(null),
+    setError: setDeadlinesRefreshError,
+    section: LIVE_DATA_SECTION.DEADLINES,
+    onSuccess: (data) => setLiveDeadlines(data),
+    logLabel: "Paper deadlines refresh failed",
+  });
+
+  const handleRefreshArxivSettings = createSectionRefreshHandler({
+    isRefreshing: isRefreshingArxiv,
+    setIsRefreshing: setIsRefreshingArxiv,
+    clearError: () => setArxivRefreshError(null),
+    setError: setArxivRefreshError,
+    section: LIVE_DATA_SECTION.ARXIV,
+    onSuccess: (data) => setLiveArxivPapers(data),
+    logLabel: "Arxiv refresh failed",
+  });
+
+  const setServiceBusy = createSetServiceBusy(setServiceToggleBusy);
+
+  const serviceToggleCallbacks = buildServiceToggleCallbacks({
+    setServiceBusy,
+    onGeneralServiceError: setGeneralServiceRefreshError,
+    fields: {
+      gpu_enabled: buildServiceFieldToggleDeps(
+        () => setGpuRefreshError(null),
+        setGpuRefreshError
+      ),
+      deadline_enabled: buildServiceFieldToggleDeps(
+        () => setDeadlinesRefreshError(null),
+        setDeadlinesRefreshError
+      ),
+      arxiv_enabled: buildServiceFieldToggleDeps(
+        () => setArxivRefreshError(null),
+        setArxivRefreshError
+      ),
+      quota_enabled: buildServiceFieldToggleDeps(
+        () => setQuotaRefreshError(null),
+        setQuotaRefreshError,
+        setLiveQuotaItems
+      ),
+    },
+  });
+
+  const checkServiceToggleBusy = (field: ServiceField) =>
+    isServiceToggleBusy(field, serviceToggleBusy);
+
+  const handleMasterServiceToggle = createMasterServiceToggleHandler({
+    appConfig,
+    onSaveApp,
+    onActiveWidgetsChanged,
+    serviceToggleCallbacks,
+    onClearGeneralError: () => setGeneralServiceRefreshError(null),
+  });
+
+  const renderServiceToggle = (
+    label: string,
+    description: string,
+    field: "gpu_enabled" | "deadline_enabled" | "arxiv_enabled" | "quota_enabled"
+  ) => (
+    <div className="border-t border-[var(--dashboard-border)] pt-6 flex items-center justify-between gap-4">
+      <div className="space-y-1">
+        <div className={`text-xs font-bold ${appConfig.theme === "light" ? "text-slate-900" : "text-white"}`}>
+          {label}
+        </div>
+        <p className="text-[10px] text-slate-400">{description}</p>
+      </div>
+      <MasterSwitch
+        enabled={appConfig[field] !== false}
+        loading={checkServiceToggleBusy(field)}
+        disabled={checkServiceToggleBusy(field)}
+        onToggle={(val) => handleMasterServiceToggle(field, val)}
+      />
+    </div>
+  );
 
 
   const renderGeneralSection = () => (
@@ -463,6 +1196,35 @@ export function SettingsPanel({
           </button>
         </div>
 
+        {renderServiceToggle(
+          serviceToggleServiceLabel("gpu_enabled"),
+          "Enable background GPU polling and allow the GPU widget to run.",
+          "gpu_enabled"
+        )}
+        {renderServiceToggle(
+          serviceToggleServiceLabel("deadline_enabled"),
+          "Enable deadline tracking and allow the deadlines widget to run.",
+          "deadline_enabled"
+        )}
+        {renderServiceToggle(
+          serviceToggleServiceLabel("arxiv_enabled"),
+          "Enable arXiv paper fetching and allow the arXiv widget to run.",
+          "arxiv_enabled"
+        )}
+        {renderServiceToggle(
+          serviceToggleServiceLabel("quota_enabled"),
+          "Enable quota polling and allow the quota widget to run.",
+          "quota_enabled"
+        )}
+
+        <SettingsGeneralServiceToggleError
+          activeSection={activeSection}
+          error={generalServiceRefreshError}
+          theme={appConfig.theme}
+          dismissed={generalServiceErrorDismissed}
+          onDismiss={() => setGeneralServiceErrorDismissed(true)}
+        />
+
         <div className="border-t border-[var(--dashboard-border)] pt-6 flex items-center justify-between">
           <div className="space-y-1">
             <div className={`text-xs font-bold ${appConfig.theme === "light" ? "text-slate-900" : "text-white"}`}>
@@ -475,7 +1237,7 @@ export function SettingsPanel({
           <button
             onClick={async () => {
               try {
-                await invoke("open_log_dir");
+                await tauriInvoke("open_log_dir");
               } catch (e) {
                 console.error("Failed to open log folder:", e);
               }
@@ -489,15 +1251,29 @@ export function SettingsPanel({
     </section>
   );
 
-  const renderGpuSection = () => (
+  const renderGpuSection = () => {
+    const hasCachedGpuData = liveGpuData.some(
+      (s) => Array.isArray(s.gpu_list) && s.gpu_list.length > 0
+    );
+
+    return (
     <section className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className={`text-xs font-black uppercase tracking-wider ${appConfig.theme === "light" ? "text-slate-500" : "text-slate-400"}`}>
-          GPU Monitor
+          {LIVE_DATA_SECTION_LABELS.gpu}
         </h2>
         <div className="flex items-center gap-3">
           <button
-            onClick={() => handleRestorePosition("widget-gpu-default", "GPU Monitor")}
+            onClick={handleRefreshGpuSettings}
+            disabled={isRefreshingGpu}
+            className={sectionRefreshBtnClass(isRefreshingGpu)}
+            title="Refresh all GPU servers"
+          >
+            <RefreshCw size={12} className={isRefreshingGpu ? "animate-spin" : ""} />
+            Refresh All
+          </button>
+          <button
+            onClick={() => handleRestorePosition("gpu_enabled")}
             className={`flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
               appConfig.theme === "light"
                 ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300"
@@ -508,6 +1284,13 @@ export function SettingsPanel({
           </button>
         </div>
       </div>
+      <ServiceErrorBanners
+        refreshOnly
+        refreshError={gpuRefreshError}
+        onDismissRefresh={() => setGpuRefreshError(null)}
+        theme={appConfig.theme}
+        refreshCachedLabel={gpuRefreshCachedLabel(hasCachedGpuData)}
+      />
       <div className="space-y-4">
         <div
           className={`p-6 border border-[var(--dashboard-border)] rounded-2xl flex items-center justify-between ${
@@ -539,99 +1322,29 @@ export function SettingsPanel({
           </button>
         </div>
 
-        {(localGpu?.servers || []).map((s: any, i: number) => (
-          <div
-            key={i}
-            className={`p-6 border border-[var(--dashboard-border)] rounded-2xl grid grid-cols-4 gap-4 relative group ${
-              appConfig.theme === "light" ? "bg-white" : "bg-white/5"
-            }`}
-          >
-            <button
-              onClick={() => removeServer(i)}
-              className="absolute -top-2 -right-2 w-6 h-6 rounded-full bg-red-500 text-white opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center shadow-lg"
-            >
-              <X size={12} />
-            </button>
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Host / IP</label>
-              <input
-                type="text"
-                value={s.host || ""}
-                onChange={(e) => updateServer(i, "host", e.target.value)}
-                onBlur={() => onSaveGpu(localGpu)}
-                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
-                  appConfig.theme === "light"
-                    ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
-                    : "bg-black/40 border-white/10 text-white focus:bg-black/60"
-                }`}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Username</label>
-              <input
-                type="text"
-                value={s.user || ""}
-                onChange={(e) => updateServer(i, "user", e.target.value)}
-                onBlur={() => onSaveGpu(localGpu)}
-                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
-                  appConfig.theme === "light"
-                    ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
-                    : "bg-black/40 border-white/10 text-white focus:bg-black/60"
-                }`}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Password</label>
-              <input
-                type="password"
-                value={s.password || ""}
-                onChange={(e) => updateServer(i, "password", e.target.value)}
-                onBlur={() => onSaveGpu(localGpu)}
-                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
-                  appConfig.theme === "light"
-                    ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
-                    : "bg-black/40 border-white/10 text-white focus:bg-black/60"
-                }`}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Port</label>
-              <input
-                type="number"
-                value={s.port || 22}
-                onChange={(e) => updateServer(i, "port", parseInt(e.target.value))}
-                onBlur={() => onSaveGpu(localGpu)}
-                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
-                  appConfig.theme === "light"
-                    ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
-                    : "bg-black/40 border-white/10 text-white focus:bg-black/60"
-                }`}
-              />
-            </div>
-            <div className="col-span-4 flex items-center gap-4 pt-2">
-              <button
-                onClick={() => updateServer(i, "use_slurm", !s.use_slurm, true)}
-                className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
-                  s.use_slurm
-                    ? "bg-amber-500/20 text-amber-400 border border-amber-500/20 shadow-lg shadow-amber-500/10"
-                    : "bg-black/40 text-slate-500 border border-white/5 hover:border-white/20"
-                }`}
-              >
-                <div className={`w-2 h-2 rounded-full ${s.use_slurm ? "bg-amber-400 animate-pulse" : "bg-slate-600"}`} />
-                Slurm Cluster Mode
-              </button>
-              {s.use_slurm && (
-                <span className="text-[9px] text-amber-500/60 font-medium italic">
-                  Enables job-based monitoring via squeue & srun
-                </span>
-              )}
-            </div>
-          </div>
-        ))}
+        <Reorder.Group
+          axis="y"
+          values={localGpu?.servers || []}
+          onReorder={(newServers: ServerConfig[]) => {
+            const next = { ...localGpu, servers: newServers };
+            setLocalGpu(next);
+            onSaveGpu(next);
+          }}
+          className="space-y-3"
+        >
+          {(localGpu?.servers || []).map((s, i) => (
+            <GpuServerCard
+              key={s.id}
+              s={s}
+              idx={i}
+              appConfig={appConfig}
+              removeServer={removeServer}
+              updateServer={updateServer}
+              localGpu={localGpu}
+              onSaveGpu={onSaveGpu}
+            />
+          ))}
+        </Reorder.Group>
         <button
           onClick={addServer}
           className={`w-full py-4 border-2 border-dashed rounded-2xl flex items-center justify-center gap-2 font-bold uppercase tracking-widest text-xs transition-all ${
@@ -646,30 +1359,58 @@ export function SettingsPanel({
       <ThemeManagementSection
         themeConfig={themeConfig}
         onSaveThemes={onSaveThemes}
-        dashboardTheme={appConfig.theme}
+        dashboardTheme={appConfig.theme ?? "dark"}
         activeWidgets={activeWidgets}
-        widgetId="widget-gpu-default"
+        widgetId={serviceWidgetMeta("gpu_enabled").id}
       />
     </section>
-  );
+    );
+  };
 
   const renderDeadlinesSection = () => (
     <section className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className={`text-xs font-black uppercase tracking-wider ${appConfig.theme === "light" ? "text-slate-500" : "text-slate-400"}`}>
-          Paper Deadlines
+          {LIVE_DATA_SECTION_LABELS.deadlines}
         </h2>
-        <button
-          onClick={() => handleRestorePosition("widget-deadlines-default", "Paper Deadlines")}
-          className={`flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
-            appConfig.theme === "light"
-              ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300"
-              : "bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border-white/5"
-          }`}
-        >
-          <RotateCcw size={12} /> Restore Position
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleRefreshDeadlinesSettings}
+            disabled={isRefreshingDeadlines}
+            className={sectionRefreshBtnClass(isRefreshingDeadlines)}
+            title="Refresh paper deadlines"
+          >
+            <RefreshCw size={12} className={isRefreshingDeadlines ? "animate-spin" : ""} />
+            Refresh All
+          </button>
+          <button
+            onClick={() => handleRestorePosition("deadline_enabled")}
+            className={`flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
+              appConfig.theme === "light"
+                ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300"
+                : "bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border-white/5"
+            }`}
+          >
+            <RotateCcw size={12} /> Restore Position
+          </button>
+        </div>
       </div>
+      <ServiceErrorBanners
+        backendError={paperBackendError}
+        refreshError={deadlinesRefreshError}
+        onDismissBackend={() => setPaperBackendError(null)}
+        onDismissRefresh={() => setDeadlinesRefreshError(null)}
+        theme={appConfig.theme}
+        showBackend={appConfig.deadline_enabled !== false}
+        backendCachedLabel={cachedLabelWhen(
+          liveDeadlines.length > 0,
+          CACHED_LABELS.deadlines.backend
+        )}
+        refreshCachedLabel={cachedLabelWhen(
+          liveDeadlines.length > 0,
+          CACHED_LABELS.deadlines.refresh
+        )}
+      />
       <div
         className={`p-6 border border-[var(--dashboard-border)] rounded-2xl space-y-6 ${
           appConfig.theme === "light" ? "bg-white" : "bg-white/5"
@@ -781,9 +1522,9 @@ export function SettingsPanel({
       <ThemeManagementSection
         themeConfig={themeConfig}
         onSaveThemes={onSaveThemes}
-        dashboardTheme={appConfig.theme}
+        dashboardTheme={appConfig.theme ?? "dark"}
         activeWidgets={activeWidgets}
-        widgetId="widget-deadlines-default"
+        widgetId={serviceWidgetMeta("deadline_enabled").id}
       />
     </section>
   );
@@ -792,11 +1533,20 @@ export function SettingsPanel({
     <section className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className={`text-xs font-black uppercase tracking-wider ${appConfig.theme === "light" ? "text-slate-500" : "text-slate-400"}`}>
-          Arxiv Radar
+          {LIVE_DATA_SECTION_LABELS.arxiv}
         </h2>
         <div className="flex items-center gap-3">
           <button
-            onClick={() => handleRestorePosition("widget-arxiv-default", "Arxiv Radar")}
+            onClick={handleRefreshArxivSettings}
+            disabled={isRefreshingArxiv}
+            className={sectionRefreshBtnClass(isRefreshingArxiv)}
+            title="Refresh arxiv papers"
+          >
+            <RefreshCw size={12} className={isRefreshingArxiv ? "animate-spin" : ""} />
+            Refresh All
+          </button>
+          <button
+            onClick={() => handleRestorePosition("arxiv_enabled")}
             className={`flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
               appConfig.theme === "light"
                 ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300"
@@ -807,6 +1557,22 @@ export function SettingsPanel({
           </button>
         </div>
       </div>
+      <ServiceErrorBanners
+        backendError={arxivBackendError}
+        refreshError={arxivRefreshError}
+        onDismissBackend={() => setArxivBackendError(null)}
+        onDismissRefresh={() => setArxivRefreshError(null)}
+        theme={appConfig.theme}
+        showBackend={appConfig.arxiv_enabled !== false}
+        backendCachedLabel={cachedLabelWhen(
+          liveArxivPapers.length > 0,
+          CACHED_LABELS.arxiv.backend
+        )}
+        refreshCachedLabel={cachedLabelWhen(
+          liveArxivPapers.length > 0,
+          CACHED_LABELS.arxiv.refresh
+        )}
+      />
       <div
         className={`p-6 border border-[var(--dashboard-border)] rounded-2xl space-y-6 ${
           appConfig.theme === "light" ? "bg-white" : "bg-white/5"
@@ -913,22 +1679,60 @@ export function SettingsPanel({
       <ThemeManagementSection
         themeConfig={themeConfig}
         onSaveThemes={onSaveThemes}
-        dashboardTheme={appConfig.theme}
+        dashboardTheme={appConfig.theme ?? "dark"}
         activeWidgets={activeWidgets}
-        widgetId="widget-arxiv-default"
+        widgetId={serviceWidgetMeta("arxiv_enabled").id}
       />
     </section>
   );
 
-  const renderQuotaSection = () => (
+  const renderQuotaSection = () => {
+    const configuredAutoQuotaIds = new Set(
+      (localQuota?.items || [])
+        .filter((item) => item.provider !== "manual")
+        .map((item) => item.id)
+    );
+    const visibleLiveQuota = liveQuotaItems.filter((q) => configuredAutoQuotaIds.has(q.id));
+    const autoQuotaHardFailAll =
+      configuredAutoQuotaIds.size > 0 &&
+      visibleLiveQuota.length >= configuredAutoQuotaIds.size &&
+      visibleLiveQuota.every(
+        (q) => q.error_msg && !isStaleQuotaWarning(q.error_msg)
+      );
+    const showQuotaHealthWarning = quotaMonitorStatus?.all_hard_failed || autoQuotaHardFailAll;
+
+    const handleRefreshAllQuota = createSectionRefreshHandler({
+      isRefreshing: isRefreshingQuotaAll,
+      setIsRefreshing: setIsRefreshingQuotaAll,
+      clearError: () => setQuotaRefreshError(null),
+      setError: setQuotaRefreshError,
+      section: LIVE_DATA_SECTION.QUOTA,
+      onSuccess: (refreshed) => setLiveQuotaItems(refreshed),
+      logLabel: "Quota refresh all failed",
+    });
+
+    return (
     <section className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className={`text-xs font-black uppercase tracking-wider ${appConfig.theme === "light" ? "text-slate-500" : "text-slate-400"}`}>
-          Quota Monitor
+          {LIVE_DATA_SECTION_LABELS.quota}
         </h2>
         <div className="flex items-center gap-3">
           <button
-            onClick={() => handleRestorePosition("widget-quota-default", "Quota Monitor")}
+            onClick={handleRefreshAllQuota}
+            disabled={isRefreshingQuotaAll}
+            className={`flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
+              appConfig.theme === "light"
+                ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300 disabled:opacity-50"
+                : "bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border-white/5 disabled:opacity-50"
+            }`}
+            title="Refresh all quota providers"
+          >
+            <RefreshCw size={12} className={isRefreshingQuotaAll ? "animate-spin" : ""} />
+            Refresh All
+          </button>
+          <button
+            onClick={() => handleRestorePosition("quota_enabled")}
             className={`flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
               appConfig.theme === "light"
                 ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300"
@@ -939,6 +1743,35 @@ export function SettingsPanel({
           </button>
         </div>
       </div>
+      <ServiceErrorBanners
+        backendError={quotaBackendError}
+        refreshError={quotaRefreshError}
+        onDismissBackend={() => setQuotaBackendError(null)}
+        onDismissRefresh={() => setQuotaRefreshError(null)}
+        theme={appConfig.theme}
+        showBackend={appConfig.quota_enabled !== false}
+        backendCachedLabel={cachedLabelWhen(
+          visibleLiveQuota.length > 0,
+          CACHED_LABELS.quota.backend
+        )}
+        refreshCachedLabel={cachedLabelWhen(
+          visibleLiveQuota.length > 0,
+          CACHED_LABELS.quota.refresh
+        )}
+      />
+      {showQuotaHealthWarning && (
+        <div
+          className={`rounded-xl border px-4 py-3 text-[10px] leading-relaxed ${
+            appConfig.theme === "light"
+              ? "bg-amber-50 border-amber-200 text-amber-900"
+              : "bg-amber-500/10 border-amber-500/20 text-amber-300/90"
+          }`}
+        >
+          {quotaMonitorStatus?.all_hard_failed
+            ? `All quota providers failed. Monitor is backing off (${quotaMonitorStatus.backoff_secs}s). Check API keys, local IDE login, or network.`
+            : "All configured quota providers returned errors. Verify credentials and provider setup below."}
+        </div>
+      )}
       <div className="space-y-6">
         {/* Show Account Name Toggle */}
         <div className={`p-4 border border-[var(--dashboard-border)] rounded-2xl flex items-center justify-between ${
@@ -988,14 +1821,14 @@ export function SettingsPanel({
         <Reorder.Group
           axis="y"
           values={localQuota?.items || []}
-          onReorder={(newItems: any[]) => {
+          onReorder={(newItems: QuotaItemConfig[]) => {
             const next = { ...localQuota, items: newItems };
             setLocalQuota(next);
             onSaveQuota(next);
           }}
           className="space-y-3"
         >
-          {(localQuota?.items || []).map((q: any) => (
+          {(localQuota?.items || []).map((q) => (
             <QuotaItemCard
               key={q.id}
               q={q}
@@ -1006,6 +1839,7 @@ export function SettingsPanel({
               onUpdateField={updateQuotaItem}
               onSave={onSaveQuota}
               localQuota={localQuota}
+              liveItem={liveQuotaItems.find((item) => item.id === q.id)}
             />
           ))}
         </Reorder.Group>
@@ -1026,12 +1860,13 @@ export function SettingsPanel({
       <ThemeManagementSection
         themeConfig={themeConfig}
         onSaveThemes={onSaveThemes}
-        dashboardTheme={appConfig.theme}
+        dashboardTheme={appConfig.theme ?? "dark"}
         activeWidgets={activeWidgets}
-        widgetId="widget-quota-default"
+        widgetId={serviceWidgetMeta("quota_enabled").id}
       />
     </section>
-  );
+    );
+  };
 
   const renderAboutSection = () => (
     <section className="space-y-6">
@@ -1058,7 +1893,7 @@ export function SettingsPanel({
           </h3>
           <div className="flex items-center justify-center gap-2">
             <span className="px-3 py-1 rounded-full bg-blue-500/10 text-blue-500 text-[10px] font-black uppercase tracking-widest border border-blue-500/10">
-              v0.2.3 Stable
+              v0.2.4 Stable
             </span>
             <span className="px-3 py-1 rounded-full bg-purple-500/10 text-purple-500 text-[10px] font-black uppercase tracking-widest border border-purple-500/10">
               Research Edition
@@ -1074,12 +1909,62 @@ export function SettingsPanel({
             className="text-blue-500 hover:text-blue-400 underline transition-colors"
             onClick={async (e) => {
               e.preventDefault();
-              await invoke("open_link", { url: "https://github.com/starkmomo/widgitron" });
+              await tauriInvoke("open_link", { url: "https://github.com/starkmomo/widgitron" });
             }}
           >
             github.com/starkmomo/widgitron
           </a>.
         </p>
+
+        {configDirPath && (
+          <div
+            className={`w-full max-w-md p-4 border border-[var(--dashboard-border)] rounded-2xl text-left ${
+              appConfig.theme === "light" ? "bg-slate-50" : "bg-black/20"
+            }`}
+          >
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-[10px] font-black uppercase tracking-widest text-slate-500">
+                Config Directory
+              </div>
+              <button
+                onClick={async () => {
+                  try {
+                    await tauriInvoke("open_config_dir");
+                  } catch (e) {
+                    console.error("Failed to open config directory:", e);
+                  }
+                }}
+                className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-[9px] font-black uppercase tracking-widest transition-all shadow-lg shadow-blue-600/20"
+              >
+                Open
+              </button>
+            </div>
+            <code className="text-[10px] break-all text-slate-400 font-mono">{configDirPath}</code>
+            {corruptConfigFiles.length > 0 && (
+              <div
+                className={`mt-3 p-3 rounded-xl border text-[10px] leading-relaxed ${
+                  appConfig.theme === "light"
+                    ? "bg-amber-50 border-amber-200 text-amber-900"
+                    : "bg-amber-500/10 border-amber-500/20 text-amber-300/90"
+                }`}
+              >
+                <div className="font-black uppercase tracking-widest text-[9px] mb-1">
+                  Corrupt Config Backups
+                </div>
+                <p className="mb-2 opacity-90">
+                  Some config files could not be parsed and were renamed with a{" "}
+                  <code className="font-mono">.corrupt.json</code> suffix. Widgitron is using
+                  defaults until you fix or remove them.
+                </p>
+                <ul className="space-y-1 font-mono text-[9px] break-all">
+                  {corruptConfigFiles.map((name) => (
+                    <li key={name}>{name}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* OTA Update Card */}
         <div className={`w-full max-w-md p-6 border border-[var(--dashboard-border)] rounded-2xl text-left flex flex-col gap-4 ${
@@ -1104,9 +1989,18 @@ export function SettingsPanel({
           </div>
 
           {/* Status display */}
-          {updateError && (
-            <div className="p-3 bg-red-500/10 border border-red-500/20 text-red-400 text-[10px] rounded-xl italic font-medium leading-relaxed">
-              Error: {updateError}
+          {(updateError || updateCheckError) && (
+            <div className="p-3 bg-red-500/10 border border-red-500/20 text-red-400 text-[10px] rounded-xl font-medium leading-relaxed space-y-1">
+              <div>{updateError || updateCheckError}</div>
+              <div className="text-[9px] opacity-80">
+                Check your network connection or try again later. You can also download updates manually from GitHub Releases.
+              </div>
+            </div>
+          )}
+
+          {!updateError && !updateCheckError && updateInfo && !updateInfo.has_update && !isCheckingUpdate && (
+            <div className="text-[10px] text-slate-500 font-medium">
+              You are on the latest version ({updateInfo.current_version}).
             </div>
           )}
 
@@ -1254,10 +2148,10 @@ export function SettingsPanel({
             className="space-y-8"
           >
             {activeSection === "general" && renderGeneralSection()}
-            {activeSection === "quota" && renderQuotaSection()}
-            {activeSection === "gpu" && renderGpuSection()}
-            {activeSection === "deadlines" && renderDeadlinesSection()}
-            {activeSection === "arxiv" && renderArxivSection()}
+            {activeSection === LIVE_DATA_SECTION.QUOTA && renderQuotaSection()}
+            {activeSection === LIVE_DATA_SECTION.GPU && renderGpuSection()}
+            {activeSection === LIVE_DATA_SECTION.DEADLINES && renderDeadlinesSection()}
+            {activeSection === LIVE_DATA_SECTION.ARXIV && renderArxivSection()}
             {activeSection === "about" && renderAboutSection()}
           </motion.div>
         </AnimatePresence>

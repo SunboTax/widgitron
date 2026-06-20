@@ -1,57 +1,64 @@
 import { useState, useEffect, useRef } from "react";
 import { Gauge, RefreshCw, AlertCircle, Minus, Plus, Edit2, Globe, Cpu, User } from "lucide-react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { WidgetTheme, WidgetThemeConfig } from "../types/theme";
+import { useWidgetTheme } from "../hooks/useWidgetTheme";
 import { hexToRgba, adjustColorOpacity } from "../utils/color";
+import { isStaleQuotaWarning, quotaHasDisplayValue, orderQuotaByConfig } from "../utils/quotaDisplay";
+import { handleWidgetAppConfigUpdate } from "../utils/widgetLifecycle";
+import { listenQuotaMonitorStatus, type QuotaMonitorStatus } from "../utils/quotaMonitorStatus";
+import { listenServiceUpdateEvents } from "../utils/serviceUpdateEvents";
+import { LIVE_DATA_SECTION, refetchSectionLiveData } from "../utils/sectionLiveData";
+import { CACHED_LABELS, cachedLabelWhen } from "../utils/cachedLabels";
+import { ServiceErrorBanners } from "../components/ServiceErrorBanners";
+import type { QuotaItem } from "../types/config";
+import type { AntigravitySetupStatus } from "../types/tauri";
+import { tauriInvoke } from "../utils/tauriInvoke";
+import { tauriListen } from "../utils/tauriListen";
 
 const PROVIDER_LOGOS: Record<string, string> = {
   antigravity: "/icons/antigravity.svg",
   codex: "/icons/codex.svg",
   cursor: "/icons/cursor.svg",
   copilot: "/icons/vscode.svg",
+  "qoder-cn": "/icons/qoder-cn.svg",
+  pioneer: "/icons/pioneer.svg",
+  "claude-code": "/icons/claude-code.svg",
+  "minimax-cn": "/icons/codex.svg",
 };
 
-interface QuotaBar {
-  name: string;
-  value: number;
-  reset?: string | null;
-}
+function renderQuotaAlert(
+  q: QuotaItem,
+  expandedErrors: Record<string, boolean>,
+  toggleErrorExpand: (id: string) => void,
+) {
+  if (!q.error_msg) return null;
 
-interface QuotaItem {
-  id: string;
-  name: string;
-  provider: string;
-  api_key: string;
-  api_url?: string | null;
-  json_path?: string | null;
-  max_quota?: number | null;
-  current_value?: number | null;
-  error_msg?: string | null;
-  last_update?: string | null;
-  unit?: string | null;
-  account_label?: string | null;
+  const stale = isStaleQuotaWarning(q.error_msg) && quotaHasDisplayValue(q);
+  const className = stale
+    ? "flex items-start gap-1 text-[8px] text-amber-400 font-medium italic mt-1 bg-amber-500/5 p-1.5 rounded border border-amber-500/15 cursor-pointer hover:bg-amber-500/10 transition-colors"
+    : "flex items-start gap-1 text-[8px] text-red-400 font-medium italic mt-1 bg-red-500/5 p-1.5 rounded border border-red-500/10 cursor-pointer hover:bg-red-500/10 transition-colors";
 
-  // Multi-bar fields (Codex, Cursor, Antigravity)
-  primary_name?: string | null;
-  primary_reset?: string | null;
-  secondary_value?: number | null;
-  secondary_name?: string | null;
-  secondary_reset?: string | null;
-  tertiary_value?: number | null;
-  tertiary_name?: string | null;
-  tertiary_reset?: string | null;
-  bars?: QuotaBar[] | null;
-  plan_type?: string | null;
+  return (
+    <div onClick={() => toggleErrorExpand(q.id)} className={className}>
+      <AlertCircle size={10} className="flex-shrink-0 mt-0.5" />
+      <span className={expandedErrors[q.id] ? "break-all animate-fadeIn" : "truncate"}>
+        {q.error_msg}
+      </span>
+    </div>
+  );
 }
 
 export function QuotaWidgetContent() {
   const [quotas, setQuotas] = useState<QuotaItem[]>([]);
-  const [currentTheme, setCurrentTheme] = useState<WidgetTheme | null>(null);
+  const currentTheme = useWidgetTheme("quota");
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [quotaBackendError, setQuotaBackendError] = useState<string | null>(null);
+  const [quotaMonitorStatus, setQuotaMonitorStatus] = useState<QuotaMonitorStatus | null>(null);
   const [showAccountName, setShowAccountName] = useState(false);
   const [showPlanType, setShowPlanType] = useState(true);
+  const [configItems, setConfigItems] = useState<{ id: string }[]>([]);
+  const [serviceEnabled, setServiceEnabled] = useState(true);
+  const [dashboardTheme, setDashboardTheme] = useState<"light" | "dark">("dark");
   
   // Inline editing states for manual quotas
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -60,8 +67,7 @@ export function QuotaWidgetContent() {
 
   // Error message expansion states
   const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
-
-  const win = getCurrentWindow();
+  const [agStatus, setAgStatus] = useState<AntigravitySetupStatus | null>(null);
 
   // Helper: format display name based on showAccountName setting
   const displayName = (q: QuotaItem) => {
@@ -77,22 +83,16 @@ export function QuotaWidgetContent() {
 
     const loadData = async () => {
       try {
-        const qd = await invoke("get_quota_data");
+        const qd = await refetchSectionLiveData(LIVE_DATA_SECTION.QUOTA);
         if (!active) return;
-        setQuotas(qd as QuotaItem[]);
+        setQuotas(qd);
 
         // Load show_account_name setting from quota config
-        const qc = await invoke<any>("get_quota_config");
+        const qc = await tauriInvoke("get_quota_config");
         if (!active) return;
         setShowAccountName(qc?.show_account_name || false);
         setShowPlanType(qc?.show_plan_type !== false);
-
-        const config = (await invoke("get_theme_config")) as WidgetThemeConfig;
-        if (!active) return;
-        const themeId = config.assignments?.[win.label];
-        const theme =
-          config.themes.find((t) => t.id === themeId) || config.themes.find((t) => t.id === "theme-quota-default");
-        setCurrentTheme(theme || null);
+        setConfigItems(qc?.items || []);
       } catch (e) {
         console.error("Quota widget load failed", e);
       }
@@ -102,29 +102,55 @@ export function QuotaWidgetContent() {
 
     const setup = async () => {
       try {
-        const u1 = await listen<QuotaItem[]>("quota_update", (event) => {
-          if (!active) return;
-          setQuotas(event.payload);
-        });
+        const u1 = await listenServiceUpdateEvents(
+          () => active,
+          {
+            quota: {
+              clearRefresh: () => setRefreshError(null),
+              clearBackend: () => setQuotaBackendError(null),
+            },
+          },
+          { quotaSetter: setQuotas }
+        );
         unlisteners.push(u1);
 
-        const u2 = await listen("theme_update", (event: any) => {
-          if (!active) return;
-          const config = event.payload as WidgetThemeConfig;
-          const themeId = config.assignments?.[win.label];
-          const theme =
-            config.themes.find((t) => t.id === themeId) || config.themes.find((t) => t.id === "theme-quota-default");
-          setCurrentTheme(theme || null);
-        });
-        unlisteners.push(u2);
-
-        // Listen for quota config changes (show_account_name toggle, etc.)
-        const u3 = await listen("quota_config_update", (event: any) => {
+        const u3 = await tauriListen("quota_config_update", (event) => {
           if (!active) return;
           setShowAccountName(event.payload?.show_account_name || false);
           setShowPlanType(event.payload?.show_plan_type !== false);
+          setConfigItems(event.payload?.items || []);
         });
         unlisteners.push(u3);
+
+        const u4 = await listenQuotaMonitorStatus(
+          setQuotaMonitorStatus,
+          setQuotaBackendError,
+          () => active
+        );
+        unlisteners.push(u4);
+
+        const appConfig = await tauriInvoke("get_app_config");
+        let quotaEnabled = appConfig?.quota_enabled !== false;
+        if (active) {
+          setServiceEnabled(quotaEnabled);
+          setDashboardTheme(appConfig?.theme === "light" ? "light" : "dark");
+        }
+
+        const u5 = await tauriListen("app_config_update", async (event) => {
+          if (!active) return;
+          quotaEnabled = await handleWidgetAppConfigUpdate(event.payload, quotaEnabled, {
+            serviceField: "quota_enabled",
+            setServiceEnabled: setServiceEnabled,
+            setDashboardTheme: setDashboardTheme,
+            disableClears: {
+              clearData: () => setQuotas([]),
+              clearRefreshError: () => setRefreshError(null),
+              clearBackendError: () => setQuotaBackendError(null),
+              clearMonitorStatus: () => setQuotaMonitorStatus(null),
+            },
+          });
+        });
+        unlisteners.push(u5);
       } catch (e) {
         console.error("Failed to setup quota listeners", e);
       }
@@ -138,14 +164,54 @@ export function QuotaWidgetContent() {
     };
   }, []);
 
+  const tracksAntigravity = configItems.some((item) => {
+    const q = quotas.find((entry) => entry.id === item.id);
+    return q?.provider === "antigravity";
+  }) || quotas.some((q) => q.provider === "antigravity");
+
+  useEffect(() => {
+    if (!tracksAntigravity) {
+      setAgStatus(null);
+      return;
+    }
+    let active = true;
+    const refresh = () => {
+      tauriInvoke("get_antigravity_setup_status")
+        .then((status) => {
+          if (active) setAgStatus(status);
+        })
+        .catch(() => {
+          if (active) setAgStatus(null);
+        });
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 15000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [tracksAntigravity, configItems.length, quotas.length]);
+
+  const agReady =
+    agStatus?.language_server_running ||
+    (agStatus?.has_oauth_tokens && agStatus?.cloud_auth_ready);
+
   const handleRefresh = async () => {
-    if (isRefreshing) return;
+    if (isRefreshing || !serviceEnabled) return;
     setIsRefreshing(true);
+    setRefreshError(null);
     try {
-      const qd = await invoke("refresh_quota");
-      setQuotas(qd as QuotaItem[]);
+      const [qd, qc] = await Promise.all([
+        tauriInvoke("refresh_quota"),
+        tauriInvoke("get_quota_config"),
+      ]);
+      setQuotas(qd);
+      setConfigItems(qc?.items || []);
+      setShowAccountName(qc?.show_account_name || false);
+      setShowPlanType(qc?.show_plan_type !== false);
     } catch (e) {
       console.error("Manual refresh failed", e);
+      setRefreshError(String(e));
     } finally {
       setIsRefreshing(false);
     }
@@ -158,7 +224,7 @@ export function QuotaWidgetContent() {
       setQuotas((prev) =>
         prev.map((q) => (q.id === id ? { ...q, current_value: nextVal, last_update: "Just now" } : q))
       );
-      await invoke("update_manual_quota", { id, value: nextVal });
+      await tauriInvoke("update_manual_quota", { id, value: nextVal });
     } catch (e) {
       console.error("Failed to adjust manual quota", e);
     }
@@ -179,7 +245,7 @@ export function QuotaWidgetContent() {
       setQuotas((prev) =>
         prev.map((q) => (q.id === id ? { ...q, current_value: nextVal, last_update: "Just now" } : q))
       );
-      await invoke("update_manual_quota", { id, value: nextVal });
+      await tauriInvoke("update_manual_quota", { id, value: nextVal });
     } catch (e) {
       console.error("Failed to update manual quota directly", e);
     }
@@ -207,8 +273,22 @@ export function QuotaWidgetContent() {
   const mainText = getT("Main Text", "#ffffff");
   const subText = getT("Sub Text", "#94a3b8");
 
-  // Filtering logic - only show items we care about
-  const displayedQuotas = quotas;
+  // Only show monitors present in quota config, preserving user-defined order.
+  const displayedQuotas = orderQuotaByConfig(quotas, configItems);
+  const quotaHardErrorCount = displayedQuotas.filter(
+    (q) => q.error_msg && !isStaleQuotaWarning(q.error_msg)
+  ).length;
+  const quotaStaleCount = displayedQuotas.filter(
+    (q) => isStaleQuotaWarning(q.error_msg) && quotaHasDisplayValue(q)
+  ).length;
+  const quotaHeaderHint =
+    quotaMonitorStatus && quotaMonitorStatus.consecutive_failures > 0
+      ? `Backoff ${quotaMonitorStatus.backoff_secs}s`
+      : quotaHardErrorCount > 0
+      ? `${quotaHardErrorCount} error${quotaHardErrorCount > 1 ? "s" : ""}`
+      : quotaStaleCount > 0
+      ? `${quotaStaleCount} cached`
+      : null;
 
   const renderProviderIcon = (provider: string, isManual = false) => {
     if (isManual) {
@@ -240,10 +320,19 @@ export function QuotaWidgetContent() {
           <span className="text-xs font-black uppercase tracking-widest" style={{ color: subText }}>
             Quota Monitor
           </span>
+          {quotaHeaderHint && (
+            <span
+              className="text-[7px] font-black uppercase tracking-widest"
+              style={{ color: quotaHardErrorCount > 0 ? danger : warning }}
+            >
+              {quotaHeaderHint}
+            </span>
+          )}
         </div>
         <button
           onClick={handleRefresh}
-          className="p-1 hover:bg-white/10 rounded-md transition-colors cursor-pointer"
+          disabled={isRefreshing || !serviceEnabled}
+          className="p-1 hover:bg-white/10 rounded-md transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
           style={{ color: subText }}
           title="Refresh Quotas"
         >
@@ -251,17 +340,74 @@ export function QuotaWidgetContent() {
         </button>
       </div>
 
+      <ServiceErrorBanners
+        backendError={quotaBackendError}
+        refreshError={refreshError}
+        onDismissBackend={() => setQuotaBackendError(null)}
+        onDismissRefresh={() => setRefreshError(null)}
+        theme={dashboardTheme}
+        showBackend={serviceEnabled}
+        className="mb-2 space-y-2"
+        backendCachedLabel={cachedLabelWhen(
+          displayedQuotas.length > 0,
+          CACHED_LABELS.quota.backend
+        )}
+        refreshCachedLabel={cachedLabelWhen(
+          displayedQuotas.length > 0,
+          CACHED_LABELS.quota.refresh
+        )}
+      />
+
+      {tracksAntigravity && agStatus && !agReady && (
+        <div className="mb-2 px-2 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[8px] text-amber-300/90 leading-relaxed">
+          {agStatus.has_oauth_tokens && !agStatus.language_server_running ? (
+            agStatus.cloud_auth_ready ? (
+              "Antigravity IDE not running — launch it to refresh quota locally."
+            ) : (
+              <>
+                Antigravity IDE not running — launch it, or add{" "}
+                <code className="font-mono">client_secret</code> to{" "}
+                <span className="font-mono break-all">{agStatus.oauth_config_path}</span>
+              </>
+            )
+          ) : (
+            <>
+              Antigravity not ready — sign in via the IDE or configure OAuth at{" "}
+              <span className="font-mono break-all">{agStatus.oauth_config_path}</span>
+            </>
+          )}
+        </div>
+      )}
+
       {/* Quotas List */}
       <div className="flex-1 overflow-y-auto custom-scrollbar pr-1 w-full space-y-2 pb-2">
-        {displayedQuotas.length > 0 ? (
+        {!serviceEnabled ? (
+          <div
+            className="flex flex-col items-center justify-center text-center mt-10 px-4 py-8 rounded-xl border border-dashed"
+            style={{ borderColor: `${subText}33`, color: subText }}
+          >
+            <Gauge size={20} style={{ color: accent, opacity: 0.5 }} className="mb-3" />
+            <span className="text-[10px] font-black uppercase tracking-widest mb-1">
+              Service Disabled
+            </span>
+            <span className="text-[9px] opacity-70 leading-relaxed">
+              Enable Quota Monitor in the dashboard.
+            </span>
+          </div>
+        ) : displayedQuotas.length > 0 ? (
           displayedQuotas.map((q) => {
+            const hasValue = q.current_value !== null && q.current_value !== undefined;
             const usesQuotaBarLayout =
               q.provider === "codex" ||
               q.provider === "cursor" ||
               q.provider === "antigravity" ||
-              q.provider === "copilot";
+              q.provider === "copilot" ||
+              q.provider === "pioneer" ||
+              q.provider === "qoder-cn" ||
+              q.provider === "claude-code";
 
             const isMultiBar =
+              hasValue &&
               usesQuotaBarLayout &&
               ((q.bars && q.bars.length > 0) ||
                 q.provider === "copilot" ||
@@ -354,17 +500,7 @@ export function QuotaWidgetContent() {
                       );
                     })}
 
-                    {q.error_msg && (
-                      <div
-                        onClick={() => toggleErrorExpand(q.id)}
-                        className="flex items-start gap-1 text-[8px] text-red-400 font-medium italic mt-1 bg-red-500/5 p-1.5 rounded border border-red-500/10 cursor-pointer hover:bg-red-500/10 transition-colors"
-                      >
-                        <AlertCircle size={10} className="flex-shrink-0 mt-0.5" />
-                        <span className={expandedErrors[q.id] ? "break-all animate-fadeIn" : "truncate"}>
-                          {q.error_msg}
-                        </span>
-                      </div>
-                    )}
+                    {renderQuotaAlert(q, expandedErrors, toggleErrorExpand)}
                   </div>
 
                   {/* Glowing Background Blob */}
@@ -376,14 +512,16 @@ export function QuotaWidgetContent() {
               );
             }
 
-            const hasMax = q.max_quota !== undefined && q.max_quota !== null && q.max_quota > 0;
+            const hasMax = hasValue && q.max_quota !== undefined && q.max_quota !== null && q.max_quota > 0;
             const current = q.current_value ?? 0;
             const max = q.max_quota ?? 100;
             const percent = hasMax ? Math.min(100, Math.max(0, (current / max) * 100)) : 100;
 
             // Pick status color
             let statusColor = accent;
-            if (hasMax) {
+            if (!hasValue) {
+              statusColor = subText;
+            } else if (hasMax) {
               if (percent < 15) {
                 statusColor = danger;
               } else if (percent < 40) {
@@ -391,7 +529,7 @@ export function QuotaWidgetContent() {
               } else {
                 statusColor = success;
               }
-            } else if (q.provider !== "manual" && q.error_msg) {
+            } else if (q.provider !== "manual" && q.error_msg && !isStaleQuotaWarning(q.error_msg)) {
               statusColor = danger;
             }
 
@@ -459,9 +597,17 @@ export function QuotaWidgetContent() {
                           style={{ color: statusColor }}
                           title={isManual ? "Double click to edit value" : undefined}
                         >
-                          {current.toFixed(current % 1 === 0 ? 0 : 2)}
-                          {q.unit ? ` ${q.unit}` : ""}
-                          {hasMax && q.unit !== "%" && ` / ${max.toFixed(0)}`}
+                          {hasValue ? (
+                            <>
+                              {q.unit === "%"
+                                ? Math.round(current)
+                                : current.toFixed(current % 1 === 0 ? 0 : 2)}
+                              {q.unit === "%" ? "%" : q.unit ? ` ${q.unit}` : ""}
+                              {hasMax && q.unit !== "%" && ` / ${max.toFixed(0)}`}
+                            </>
+                          ) : (
+                            "-"
+                          )}
                         </span>
                       )}
 
@@ -526,17 +672,7 @@ export function QuotaWidgetContent() {
                   )}
 
 
-                  {q.error_msg && (
-                    <div
-                      onClick={() => toggleErrorExpand(q.id)}
-                      className="flex items-start gap-1 text-[8px] text-red-400 font-medium italic mt-1 bg-red-500/5 p-1.5 rounded border border-red-500/10 cursor-pointer hover:bg-red-500/10 transition-colors"
-                    >
-                      <AlertCircle size={10} className="flex-shrink-0 mt-0.5" />
-                      <span className={expandedErrors[q.id] ? "break-all animate-fadeIn" : "truncate"}>
-                        {q.error_msg}
-                      </span>
-                    </div>
-                  )}
+                  {renderQuotaAlert(q, expandedErrors, toggleErrorExpand)}
                 </div>
 
                 {/* Glowing Background Blob */}
@@ -548,8 +684,17 @@ export function QuotaWidgetContent() {
             );
           })
         ) : (
-          <div className="text-[10px] italic text-center mt-8" style={{ color: subText }}>
-            No agents configured. Check Settings.
+          <div
+            className="flex flex-col items-center justify-center text-center mt-10 px-4 py-8 rounded-xl border border-dashed"
+            style={{ borderColor: `${subText}33`, color: subText }}
+          >
+            <Gauge size={20} style={{ color: accent, opacity: 0.5 }} className="mb-3" />
+            <span className="text-[10px] font-black uppercase tracking-widest mb-1">
+              No Agents Configured
+            </span>
+            <span className="text-[9px] opacity-70 leading-relaxed">
+              Open the main window Settings → Quota Monitor to add providers.
+            </span>
           </div>
         )}
       </div>

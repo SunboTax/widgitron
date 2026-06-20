@@ -1,12 +1,20 @@
 import { useState, useEffect } from "react";
-import { Cpu, Activity } from "lucide-react";
+import { Cpu, Activity, RefreshCw } from "lucide-react";
 import { motion } from "framer-motion";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { WidgetTheme, WidgetThemeConfig } from "../types/theme";
+import { useWidgetTheme } from "../hooks/useWidgetTheme";
 import { hexToRgba } from "../utils/color";
+import { orderGpuServersByConfig, sortGpuJobGroups } from "../utils/gpuDisplay";
+import { handleWidgetAppConfigUpdate } from "../utils/widgetLifecycle";
+import { gpuStatHint } from "../utils/statHints";
+import { listenServiceUpdateEvents } from "../utils/serviceUpdateEvents";
+import { listenGpuDataSync } from "../utils/gpuDataSync";
+import { LIVE_DATA_SECTION, refetchSectionLiveData } from "../utils/sectionLiveData";
+import { gpuRefreshCachedLabel, messageShowsCached } from "../utils/cachedLabels";
 import { CopyButton } from "../components/CopyButton";
+import { ServiceErrorBanners } from "../components/ServiceErrorBanners";
+import type { GpuConfig, GpuInfo, ServerGpuData, SlurmStep } from "../types/config";
+import { tauriInvoke } from "../utils/tauriInvoke";
+import { tauriListen } from "../utils/tauriListen";
 
 function parseSlurmTime(timeStr: string): number {
   if (!timeStr) return 0;
@@ -60,11 +68,14 @@ function formatSlurmTime(totalSeconds: number): string {
 }
 
 export function GPUWidgetContent() {
-  const [serverData, setServerData] = useState<any[]>([]);
-  const [currentTheme, setCurrentTheme] = useState<WidgetTheme | null>(null);
+  const [serverData, setServerData] = useState<ServerGpuData[]>([]);
+  const currentTheme = useWidgetTheme("gpu");
   const [durations, setDurations] = useState<Record<string, number>>({});
-  const [gpuConfig, setGpuConfig] = useState<any>({ compact_mode: true });
-  const win = getCurrentWindow();
+  const [gpuConfig, setGpuConfig] = useState<GpuConfig>({ servers: [], compact_mode: true });
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [serviceEnabled, setServiceEnabled] = useState(true);
+  const [dashboardTheme, setDashboardTheme] = useState<"light" | "dark">("dark");
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -85,15 +96,15 @@ export function GPUWidgetContent() {
       const visibleJobs = new Set<string>();
 
       // 1. Gather all visible job IDs and step IDs
-      serverData.forEach((server: any) => {
-        server.gpu_list.forEach((gpu: any) => {
+      serverData.forEach((server) => {
+        server.gpu_list.forEach((gpu) => {
           if (gpu.job_id) {
             visibleJobs.add(gpu.job_id);
           }
         });
         if (server.slurm_steps) {
-          Object.values(server.slurm_steps).forEach((steps: any) => {
-            steps.forEach((step: any) => {
+          Object.values(server.slurm_steps).forEach((steps) => {
+            steps.forEach((step) => {
               visibleJobs.add(step.id);
             });
           });
@@ -101,9 +112,9 @@ export function GPUWidgetContent() {
       });
 
       // 2. Update durations from backend values if available
-      serverData.forEach((server: any) => {
+      serverData.forEach((server) => {
         if (server.slurm_times) {
-          Object.entries(server.slurm_times).forEach(([jobId, timeStr]: any) => {
+          Object.entries(server.slurm_times).forEach(([jobId, timeStr]) => {
             const backendSecs = parseSlurmTime(timeStr);
             const currentSecs = next[jobId];
             if (currentSecs === undefined || backendSecs > currentSecs || backendSecs < currentSecs - 45) {
@@ -112,8 +123,8 @@ export function GPUWidgetContent() {
           });
         }
         if (server.slurm_steps) {
-          Object.values(server.slurm_steps).forEach((steps: any) => {
-            steps.forEach((step: any) => {
+          Object.values(server.slurm_steps).forEach((steps) => {
+            steps.forEach((step) => {
               const backendSecs = parseSlurmTime(step.time);
               const currentSecs = next[step.id];
               if (currentSecs === undefined || backendSecs > currentSecs || backendSecs < currentSecs - 45) {
@@ -141,41 +152,31 @@ export function GPUWidgetContent() {
 
     const load = async () => {
       try {
-        const gc = await invoke("get_gpu_config");
+        const gc = await tauriInvoke("get_gpu_config");
         if (!active) return;
-        setGpuConfig(gc as any);
+        setGpuConfig(gc);
 
-        const gpuData = await invoke("get_gpu_data");
+        const gpuData = await refetchSectionLiveData(LIVE_DATA_SECTION.GPU);
         if (!active) return;
-        setServerData(gpuData as any[]);
+        setServerData(gpuData);
 
-        const config = (await invoke("get_theme_config")) as WidgetThemeConfig;
-        if (!active) return;
-        const themeId = config.assignments?.[win.label];
-        const theme =
-          config.themes.find((t) => t.id === themeId) || config.themes.find((t) => t.id === "theme-gpu-default");
-        setCurrentTheme(theme || null);
-
-        const u1 = await listen<any>("gpu_update", (event) => {
-          if (!active) return;
-          const item = event.payload;
-          setServerData((prev) => {
-            const index = prev.findIndex((s) => s.host === item.host);
-            if (index === -1) return [...prev, item];
-            const next = [...prev];
-            next[index] = item;
-            return next;
-          });
-        });
+        const u1 = await listenServiceUpdateEvents(
+          () => active,
+          { gpu: { clearRefresh: () => setRefreshError(null) } },
+          { gpuSetter: setServerData }
+        );
         if (!active) {
           u1();
         } else {
-          unlisteners.push(() => u1());
+          unlisteners.push(u1);
         }
 
-        const u4 = await listen<any>("gpu_config_update", (event) => {
+        const u4 = await tauriListen("gpu_config_update", (event) => {
           if (!active) return;
-          setGpuConfig(event.payload);
+          const nextConfig = event.payload;
+          setGpuConfig(nextConfig);
+          const hosts = new Set((nextConfig?.servers || []).map((s) => s.host));
+          setServerData((prev) => prev.filter((s) => hosts.has(s.host)));
         });
         if (!active) {
           u4();
@@ -183,28 +184,36 @@ export function GPUWidgetContent() {
           unlisteners.push(() => u4());
         }
 
-        const u2 = await listen("theme_update", (event: any) => {
-          if (!active) return;
-          const config = event.payload as WidgetThemeConfig;
-          const themeId = config.assignments?.[win.label];
-          const theme =
-            config.themes.find((t) => t.id === themeId) || config.themes.find((t) => t.id === "theme-gpu-default");
-          setCurrentTheme(theme || null);
-        });
-        if (!active) {
-          u2();
-        } else {
-          unlisteners.push(() => u2());
-        }
-
-        const u3 = await listen("gpu_clear", () => {
-          if (!active) return;
-          setServerData([]);
-        });
+        const u3 = await listenGpuDataSync(setServerData, () => active);
         if (!active) {
           u3();
         } else {
-          unlisteners.push(() => u3());
+          unlisteners.push(u3);
+        }
+
+        const appConfig = await tauriInvoke("get_app_config");
+        let gpuEnabled = appConfig?.gpu_enabled !== false;
+        if (active) {
+          setServiceEnabled(gpuEnabled);
+          setDashboardTheme(appConfig?.theme === "light" ? "light" : "dark");
+        }
+
+        const u6 = await tauriListen("app_config_update", async (event) => {
+          if (!active) return;
+          gpuEnabled = await handleWidgetAppConfigUpdate(event.payload, gpuEnabled, {
+            serviceField: "gpu_enabled",
+            setServiceEnabled: setServiceEnabled,
+            setDashboardTheme: setDashboardTheme,
+            disableClears: {
+              clearData: () => setServerData([]),
+              clearRefreshError: () => setRefreshError(null),
+            },
+          });
+        });
+        if (!active) {
+          u6();
+        } else {
+          unlisteners.push(() => u6());
         }
       } catch (e) {
         console.error("Widget init failed", e);
@@ -237,19 +246,91 @@ export function GPUWidgetContent() {
   const mainText = getT("Main Text", "#ffffff");
   const subText = getT("Sub Text", "#94a3b8");
 
+  const activeHosts = new Set((gpuConfig.servers || []).map((s) => s.host));
+  const orderedServerData = orderGpuServersByConfig(
+    serverData.filter((s) => activeHosts.has(s.host)),
+    gpuConfig.servers
+  );
+  const gpuOnlineCount = orderedServerData.filter((s) => s.is_online).length;
+  const gpuOfflineCount = orderedServerData.length - gpuOnlineCount;
+  const totalGpus = orderedServerData.reduce((acc, s) => acc + (s.gpu_list?.length ?? 0), 0);
+  const gpuStaleCount = orderedServerData.filter((s) => messageShowsCached(s.error)).length;
+  const configuredServerCount = (gpuConfig.servers || []).length;
+  const gpuStat = gpuStatHint({
+    refreshError,
+    totalGpus,
+    gpuStaleCount,
+    gpuServerCount: orderedServerData.length,
+    gpuServersOnline: gpuOnlineCount,
+    gpuOfflineCount,
+  });
+  const gpuHeaderHint = gpuStat.hint;
+
+  const handleRefresh = async () => {
+    if (isRefreshing || !serviceEnabled) return;
+    setIsRefreshing(true);
+    setRefreshError(null);
+    try {
+      const data = await tauriInvoke("refresh_gpu_data");
+      setServerData(data);
+    } catch (e) {
+      console.error("GPU widget refresh failed", e);
+      setRefreshError(String(e));
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
   return (
     <div className="h-full flex flex-col" style={{ color: mainText }}>
-      <div className="flex items-center gap-2 mb-4">
-        <Cpu size={16} style={{ color: accent }} />
-        <span className="text-xs font-black uppercase tracking-widest" style={{ color: subText }}>
-          GPU Monitor
-        </span>
+      <div className="flex items-center justify-between gap-2 mb-4">
+        <div className="flex items-center gap-2">
+          <Cpu size={16} style={{ color: accent }} />
+          <span className="text-xs font-black uppercase tracking-widest" style={{ color: subText }}>
+            GPU Monitor
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          {gpuHeaderHint && (
+            <span className="text-[8px] font-black uppercase tracking-widest" style={{ color: warning }}>
+              {gpuHeaderHint}
+            </span>
+          )}
+          <button
+            onClick={handleRefresh}
+            disabled={isRefreshing || !serviceEnabled}
+            className="p-1 hover:bg-white/10 rounded-md transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{ color: subText }}
+            title="Restart GPU workers"
+          >
+            <RefreshCw size={12} className={isRefreshing ? "animate-spin" : "hover:rotate-45 transition-transform"} />
+          </button>
+        </div>
       </div>
+      <ServiceErrorBanners
+        refreshOnly
+        refreshError={refreshError}
+        onDismissRefresh={() => setRefreshError(null)}
+        theme={dashboardTheme}
+        refreshCachedLabel={gpuRefreshCachedLabel(orderedServerData.length > 0)}
+        className="mb-2 space-y-2"
+      />
       <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-6">
-        {serverData.length > 0 ? (
-          serverData.map((server: any, idx: number) => {
-            const groups: Record<string, any[]> = {};
-            server.gpu_list.forEach((gpu: any) => {
+        {!serviceEnabled ? (
+          <div
+            className="flex flex-col items-center justify-center text-center py-10 px-4 rounded-xl border border-dashed"
+            style={{ borderColor: `${subText}33`, color: subText }}
+          >
+            <span className="text-[10px] font-black uppercase tracking-widest">Service Disabled</span>
+            <span className="text-[9px] opacity-70 mt-1">Enable GPU Monitor in the dashboard.</span>
+          </div>
+        ) : orderedServerData.length > 0 ? (
+          orderedServerData.map((server, idx) => {
+            const hasCachedGpus = Array.isArray(server.gpu_list) && server.gpu_list.length > 0;
+            const showStaleOffline = !server.is_online && hasCachedGpus;
+
+            const groups: Record<string, GpuInfo[]> = {};
+            server.gpu_list.forEach((gpu) => {
               const gid = gpu.job_id || "SYSTEM";
               if (!groups[gid]) groups[gid] = [];
               groups[gid].push(gpu);
@@ -270,6 +351,10 @@ export function GPUWidgetContent() {
                     <span className="text-[7px] font-black uppercase" style={{ color: success }}>
                       Online
                     </span>
+                  ) : showStaleOffline ? (
+                    <span className="text-[7px] font-black uppercase" style={{ color: warning }}>
+                      Offline · cached
+                    </span>
                   ) : (
                     <span className="text-[7px] font-black uppercase" style={{ color: danger }}>
                       Offline
@@ -278,13 +363,16 @@ export function GPUWidgetContent() {
                 </div>
 
                 {server.error && (
-                  <div className="text-[9px] font-medium italic px-2" style={{ color: danger }}>
+                  <div
+                    className="text-[9px] font-medium italic px-2"
+                    style={{ color: showStaleOffline ? warning : danger }}
+                  >
                     {server.error}
                   </div>
                 )}
 
                 <div className="space-y-3 pl-2">
-                  {Object.entries(groups).map(([jobId, gpus]) => (
+                  {sortGpuJobGroups(groups).map(([jobId, gpus]) => (
                     <div key={jobId} className="space-y-1.5">
                       {jobId !== "SYSTEM" && (
                         <div
@@ -382,12 +470,12 @@ export function GPUWidgetContent() {
 
                       {(() => {
                         const activeSteps = (server.slurm_steps?.[jobId] || []).filter(
-                          (step: any) => step.name !== "widgitron-gpu"
+                          (step: SlurmStep) => step.name !== "widgitron-gpu"
                         );
                         if (activeSteps.length === 0) return null;
                         return (
                           <div className="mt-2 space-y-0.5 max-h-24 overflow-y-auto custom-scrollbar">
-                            {activeSteps.map((step: any, sIdx: number) => {
+                            {activeSteps.map((step, sIdx) => {
                               const shortStepId = step.id.includes('.') ? '.' + step.id.split('.').slice(1).join('.') : step.id;
                               return (
                                 <div
@@ -414,6 +502,19 @@ export function GPUWidgetContent() {
               </div>
             );
           })
+        ) : configuredServerCount === 0 ? (
+          <div
+            className="flex flex-col items-center justify-center text-center mt-10 px-4 py-8 rounded-xl border border-dashed"
+            style={{ borderColor: `${subText}33`, color: subText }}
+          >
+            <Cpu size={20} style={{ color: accent, opacity: 0.5 }} className="mb-3" />
+            <span className="text-[10px] font-black uppercase tracking-widest mb-1">
+              No Servers Configured
+            </span>
+            <span className="text-[9px] opacity-70 leading-relaxed">
+              Open Settings → GPU Monitor to add SSH hosts.
+            </span>
+          </div>
         ) : (
           <div className="text-xs italic text-center mt-4" style={{ color: subText }}>
             Waiting for backend...

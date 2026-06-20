@@ -3,16 +3,26 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use crate::utils::get_config_path;
-use crate::models::{AppConfig, WidgetThemeConfig};
+use crate::models::{AppConfig, WidgetThemeConfig, WidgetVisibilityPayload};
 
 static CONFIG_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+fn config_lock() -> std::sync::MutexGuard<'static, ()> {
+    match CONFIG_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("Config mutex poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+}
 
 /// Read configuration of type T. If the file doesn't exist, returns default value.
 /// If parsing fails, logs error, renames file to <filename>.corrupt.json, and returns default value.
 pub fn read_config<T: DeserializeOwned + Default>(app: &AppHandle, filename: &str) -> T {
-    let _guard = CONFIG_LOCK.lock().unwrap();
+    let _guard = config_lock();
     let path = get_config_path(app, filename);
     if !path.exists() {
         return T::default();
@@ -43,7 +53,7 @@ pub fn read_config<T: DeserializeOwned + Default>(app: &AppHandle, filename: &st
 
 /// Write configuration of type T atomically.
 pub fn write_config<T: Serialize>(app: &AppHandle, filename: &str, config: &T) -> Result<(), String> {
-    let _guard = CONFIG_LOCK.lock().unwrap();
+    let _guard = config_lock();
     let path = get_config_path(app, filename);
     
     let content = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
@@ -68,7 +78,7 @@ pub fn write_config<T: Serialize>(app: &AppHandle, filename: &str, config: &T) -
 
 /// Specialized theme configuration loader that handles legacy format migration.
 pub fn read_theme_config(app: &AppHandle) -> WidgetThemeConfig {
-    let _guard = CONFIG_LOCK.lock().unwrap();
+    let _guard = config_lock();
     let path = get_config_path(app, "widget_themes.json");
     if !path.exists() {
         return WidgetThemeConfig::default();
@@ -114,15 +124,16 @@ pub fn read_theme_config(app: &AppHandle) -> WidgetThemeConfig {
                             let old_color = theme.get("text_color").cloned();
                             if let Some(color_val) = old_color {
                                 if color_val.is_string() {
-                                    let obj = theme.as_object_mut().unwrap();
-                                    obj.insert(
-                                        "text_colors".into(),
-                                        serde_json::json!([
-                                            { "name": "Main Text", "value": color_val, "opacity": 1.0 },
-                                            { "name": "Sub Text", "value": "#94a3b8", "opacity": 0.6 }
-                                        ]),
-                                    );
-                                    obj.remove("text_color");
+                                    if let Some(obj) = theme.as_object_mut() {
+                                        obj.insert(
+                                            "text_colors".into(),
+                                            serde_json::json!([
+                                                { "name": "Main Text", "value": color_val, "opacity": 1.0 },
+                                                { "name": "Sub Text", "value": "#94a3b8", "opacity": 0.6 }
+                                            ]),
+                                        );
+                                        obj.remove("text_color");
+                                    }
                                 }
                             }
                         }
@@ -147,12 +158,13 @@ pub fn read_theme_config(app: &AppHandle) -> WidgetThemeConfig {
                             }
                             
                             // Save migrated config atomically
-                            let parent = path.parent().unwrap();
-                            let temp_path = parent.join("widget_themes.json.tmp");
-                            if let Ok(content) = serde_json::to_string_pretty(&migrated) {
-                                if fs::write(&temp_path, &content).is_ok() {
-                                    let _ = fs::remove_file(&path);
-                                    let _ = fs::rename(&temp_path, &path);
+                            if let Some(parent) = path.parent() {
+                                let temp_path = parent.join("widget_themes.json.tmp");
+                                if let Ok(content) = serde_json::to_string_pretty(&migrated) {
+                                    if fs::write(&temp_path, &content).is_ok() {
+                                        let _ = fs::remove_file(&path);
+                                        let _ = fs::rename(&temp_path, &path);
+                                    }
                                 }
                             }
                             migrated
@@ -181,6 +193,40 @@ pub fn write_theme_config(app: &AppHandle, config: &WidgetThemeConfig) -> Result
     write_config(app, "widget_themes.json", config)
 }
 
+/// Seed default widget themes on first install when no bundled copy exists.
+pub fn seed_default_theme_config_if_missing(app: &AppHandle) {
+    let path = get_config_path(app, "widget_themes.json");
+    if path.exists() {
+        return;
+    }
+    let default = WidgetThemeConfig::default();
+    if let Err(e) = write_theme_config(app, &default) {
+        log::warn!("Failed to seed widget_themes.json: {}", e);
+    } else {
+        log::info!("Seeded default widget_themes.json");
+    }
+}
+
+/// List backup files created when a config JSON failed to parse.
+pub fn list_corrupt_config_files(app: &AppHandle) -> Vec<String> {
+    let dir = crate::utils::get_config_dir(app);
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if name.ends_with(".corrupt.json") {
+                files.push(name.to_string());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 /// Atomic helper to update widget visibility inside AppConfig.
 pub async fn update_widget_visibility_config(
     app: &AppHandle,
@@ -191,5 +237,13 @@ pub async fn update_widget_visibility_config(
     let mut active = config.active_widgets.unwrap_or_default();
     active.insert(id.to_string(), visible);
     config.active_widgets = Some(active);
-    write_config(app, "app_config.json", &config)
+    write_config(app, "app_config.json", &config)?;
+    let _ = app.emit(
+        "widget_visibility_changed",
+        WidgetVisibilityPayload {
+            id: id.to_string(),
+            visible,
+        },
+    );
+    Ok(())
 }

@@ -1,4 +1,4 @@
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, Loader2 } from "lucide-react";
 
 interface WidgetPreviewCardProps {
   title: string;
@@ -7,6 +7,8 @@ interface WidgetPreviewCardProps {
   trend: string;
   color: string; // kept for compatibility
   theme?: string;
+  loading?: boolean;
+  disabled?: boolean;
   onLaunch: () => void;
 }
 
@@ -17,14 +19,24 @@ export function WidgetPreviewCard({
   trend,
   color: _color,
   theme = "dark",
+  loading = false,
+  disabled = false,
   onLaunch
 }: WidgetPreviewCardProps) {
   const isLight = theme === "light";
   const isActive = status === "Active";
+  const isDisabled = disabled || loading;
+
+  const handleLaunch = () => {
+    if (isDisabled) return;
+    onLaunch();
+  };
 
   return (
     <div
-      className={`p-6 rounded-2xl border transition-all duration-300 group shadow-sm flex flex-col justify-between cursor-pointer ${
+      className={`p-6 rounded-2xl border transition-all duration-300 group shadow-sm flex flex-col justify-between ${
+        isDisabled ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
+      } ${
         isLight
           ? isActive
             ? "bg-blue-50/50 border-blue-200 hover:border-blue-300"
@@ -33,7 +45,7 @@ export function WidgetPreviewCard({
             ? "bg-blue-600/5 border-blue-500/30 hover:border-blue-400/40 shadow-[0_0_20px_rgba(59,130,246,0.05)]"
             : "bg-white/5 border-white/5 hover:bg-white/10 hover:border-white/15"
       }`}
-      onClick={onLaunch}
+      onClick={handleLaunch}
     >
       <div>
         <div className="flex items-center justify-between mb-3">
@@ -52,8 +64,12 @@ export function WidgetPreviewCard({
       
       <div className="flex items-center justify-between">
         <button
-          onClick={(e) => { e.stopPropagation(); onLaunch(); }}
-          className={`text-[10px] font-black tracking-wider uppercase px-4 py-2 rounded-xl transition-all cursor-pointer ${
+          type="button"
+          disabled={isDisabled}
+          onClick={(e) => { e.stopPropagation(); handleLaunch(); }}
+          className={`text-[10px] font-black tracking-wider uppercase px-4 py-2 rounded-xl transition-all flex items-center gap-2 ${
+            isDisabled ? "cursor-not-allowed" : "cursor-pointer"
+          } ${
             isLight
               ? isActive
                 ? "bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-600/10"
@@ -63,6 +79,7 @@ export function WidgetPreviewCard({
                 : "bg-white/10 text-slate-300 hover:bg-white/20 hover:text-white"
           }`}
         >
+          {loading && <Loader2 size={12} className="animate-spin" />}
           {trend}
         </button>
         <div
@@ -76,7 +93,11 @@ export function WidgetPreviewCard({
                 : "bg-white/5 text-slate-500 group-hover:bg-white/10 group-hover:text-slate-300"
           }`}
         >
-          <ChevronRight size={14} className="group-hover:translate-x-0.5 transition-transform" />
+          {loading ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <ChevronRight size={14} className="group-hover:translate-x-0.5 transition-transform" />
+          )}
         </div>
       </div>
     </div>

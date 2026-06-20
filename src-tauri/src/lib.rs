@@ -55,7 +55,9 @@ pub fn run() {
             commands::get_app_config,
             commands::save_app_config,
             commands::get_deadlines,
+            commands::refresh_paper_deadlines,
             commands::get_gpu_data,
+            commands::refresh_gpu_data,
             commands::show_main,
             commands::exit_app,
             commands::get_theme_config,
@@ -71,11 +73,15 @@ pub fn run() {
             commands::remove_arxiv_discarded_paper,
             commands::refresh_arxiv,
             commands::open_log_dir,
+            commands::open_config_dir,
+            commands::get_config_dir_path,
+            commands::get_corrupt_config_files,
             commands::save_quota_config,
             commands::get_quota_config,
             commands::get_quota_data,
             commands::refresh_quota,
             commands::update_manual_quota,
+            commands::get_antigravity_setup_status,
             commands::restore_widget_position,
             commands::log_frontend_error,
             ota::check_for_updates,
@@ -86,6 +92,10 @@ pub fn run() {
             let _ = logger::init(app.handle());
 
             let handle = app.handle().clone();
+            let config_dir = crate::utils::get_config_dir(&handle);
+            crate::utils::ensure_default_configs(&handle);
+            config_store::seed_default_theme_config_if_missing(&handle);
+            log::info!("Using config directory: {}", config_dir.display());
             
             // Global State
             // Pre-load cached quota data from disk for instant widget display
@@ -98,14 +108,20 @@ pub fn run() {
                 }
                 cfg.items
             };
+            let cached_deadlines: Vec<models::PaperDeadlineInfo> =
+                config_store::read_config(&handle, "paper_deadlines_cache.json");
+            let cached_arxiv: Vec<models::ArxivPaper> =
+                config_store::read_config(&handle, "arxiv_cache.json");
+            let cached_gpu = gpu::load_gpu_cache(&handle);
             let state = Arc::new(models::GlobalState {
-                deadlines: Arc::new(std::sync::Mutex::new(Vec::new())),
-                gpu_data: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                deadlines: Arc::new(std::sync::Mutex::new(cached_deadlines)),
+                gpu_data: Arc::new(std::sync::Mutex::new(cached_gpu)),
                 last_yaml: Arc::new(std::sync::Mutex::new(None)),
                 active_monitors: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 active_workers: Arc::new(std::sync::Mutex::new(HashMap::new())),
-                arxiv_papers: Arc::new(std::sync::Mutex::new(Vec::new())),
+                arxiv_papers: Arc::new(std::sync::Mutex::new(cached_arxiv)),
                 quota_data: Arc::new(std::sync::Mutex::new(cached_quota_items)),
+                quota_fetch_lock: Arc::new(tokio::sync::Mutex::new(())),
                 widget_toggle_lock: Arc::new(tokio::sync::Mutex::new(())),
             });
             app.manage(models::GlobalState {
@@ -116,8 +132,13 @@ pub fn run() {
                 active_workers: state.active_workers.clone(),
                 arxiv_papers: state.arxiv_papers.clone(),
                 quota_data: state.quota_data.clone(),
+                quota_fetch_lock: state.quota_fetch_lock.clone(),
                 widget_toggle_lock: state.widget_toggle_lock.clone(),
             });
+
+            // Emit preloaded cache to widgets that connect shortly after startup
+            // (removed: each monitor emits its own cache; avoids startup event storm)
+
             
             // Tray
             let mut tray_builder = TrayIconBuilder::new()
@@ -281,6 +302,9 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
             if matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)) {
                 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
                 let _ = window.app_handle().save_window_state(StateFlags::all());

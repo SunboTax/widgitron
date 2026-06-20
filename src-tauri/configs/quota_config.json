@@ -1,0 +1,31 @@
+{
+  "items": [
+    {
+      "id": "antigravity",
+      "name": "Antigravity",
+      "provider": "antigravity",
+      "api_key": "",
+      "max_quota": 100.0,
+      "unit": "Credits"
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor",
+      "provider": "cursor",
+      "api_key": "",
+      "max_quota": 100.0,
+      "unit": "%"
+    },
+    {
+      "id": "copilot",
+      "name": "Copilot",
+      "provider": "copilot",
+      "api_key": "",
+      "max_quota": 100.0,
+      "unit": "%"
+    }
+  ],
+  "update_interval": 300,
+  "show_account_name": false,
+  "show_plan_type": true
+}

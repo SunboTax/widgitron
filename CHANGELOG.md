@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.4] - 2026-06-20
+
+### Highlights
+- **Quota Monitor — more agent providers**: Added or expanded quota fetchers for **Qoder CN** (local IDE cache + OpenAPI), **Pioneer AI** (API key), **Claude Code** (local `~/.claude/settings.json` or MiniMax `sk-cp-` proxy token), and **MiniMax CN** (Bearer API key with optional JSON path). Existing providers remain: **Antigravity** (language server + cloud OAuth fallback), **Codex**, **Cursor**, **VS Code Copilot**, plus **OpenAI-compatible** custom endpoints.
+- **Startup performance**: Lighter widget window init, staggered backend monitors, OTA dedupe, and reduced duplicate IPC on launch.
+- **Type safety & IPC**: Typed `tauriInvoke` / `tauriListen` / `tauriEmit` helpers and shared event payload types.
+- **Quota UX**: Clearer Antigravity setup hints and softer offline/cached-data messages for Copilot and other providers.
+
 ## [0.2.3] - 2026-06-09
 
 ### Highlights

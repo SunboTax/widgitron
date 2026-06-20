@@ -5,6 +5,8 @@ use std::sync::Arc;
 // --- Config Models ---
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct ServerConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub host: String,
     pub port: Option<u16>,
     pub user: Option<String>,
@@ -97,6 +99,17 @@ pub struct AppConfig {
     pub active_widgets: Option<HashMap<String, bool>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WidgetVisibilityPayload {
+    pub id: String,
+    pub visible: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToggleWidgetResponse {
+    pub visible: bool,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -113,7 +126,7 @@ impl Default for AppConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct QuotaBar {
     pub name: String,
     pub value: f64,
@@ -126,6 +139,9 @@ pub struct QuotaItem {
     pub id: String,
     pub name: String,
     pub provider: String,
+    /// `"local"` (IDE / local login) or `"api_key"`. When unset, provider default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
     pub api_key: String,
     pub api_url: Option<String>,
     pub json_path: Option<String>,
@@ -185,17 +201,6 @@ impl Default for QuotaConfig {
                     ..Default::default()
                 },
                 QuotaItem {
-                    id: "codex".into(),
-                    name: "Codex".into(),
-                    provider: "codex".into(),
-                    api_key: "".into(),
-                    api_url: None,
-                    json_path: None,
-                    max_quota: Some(100.0),
-                    unit: Some("%".into()),
-                    ..Default::default()
-                },
-                QuotaItem {
                     id: "cursor".into(),
                     name: "Cursor".into(),
                     provider: "cursor".into(),
@@ -215,17 +220,6 @@ impl Default for QuotaConfig {
                     json_path: None,
                     max_quota: Some(100.0),
                     unit: Some("%".into()),
-                    ..Default::default()
-                },
-                QuotaItem {
-                    id: "minimax-cn".into(),
-                    name: "MiniMax CN API".into(),
-                    provider: "minimax-cn".into(),
-                    api_key: "".into(),
-                    api_url: Some("https://api.minimax.chat/v1/token_plan/remains".into()),
-                    json_path: Some("token_plan.remains".into()),
-                    max_quota: Some(50000.0),
-                    unit: Some("Tokens".into()),
                     ..Default::default()
                 },
             ],
@@ -549,13 +543,13 @@ impl Default for WidgetThemeConfig {
         };
 
         let mut assignments = HashMap::new();
-        assignments.insert("widget-gpu-default".into(), "theme-gpu-default".into());
+        assignments.insert("widget-gpu-default".into(), "theme-gpu-transparent".into());
         assignments.insert(
             "widget-deadlines-default".into(),
-            "theme-deadline-default".into(),
+            "theme-deadline-transparent".into(),
         );
-        assignments.insert("widget-arxiv-default".into(), "theme-arxiv-default".into());
-        assignments.insert("widget-quota-default".into(), "theme-quota-default".into());
+        assignments.insert("widget-arxiv-default".into(), "theme-arxiv-transparent".into());
+        assignments.insert("widget-quota-default".into(), "theme-quota-transparent".into());
 
         Self {
             themes: vec![
@@ -657,5 +651,6 @@ pub struct GlobalState {
     pub active_workers: Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub arxiv_papers: Arc<std::sync::Mutex<Vec<ArxivPaper>>>,
     pub quota_data: Arc<std::sync::Mutex<Vec<QuotaItem>>>,
+    pub quota_fetch_lock: Arc<tokio::sync::Mutex<()>>,
     pub widget_toggle_lock: Arc<tokio::sync::Mutex<()>>,
 }

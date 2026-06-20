@@ -5,9 +5,18 @@ interface StatCardProps {
   value: string;
   icon: React.ReactNode;
   theme?: string;
+  hint?: string;
+  hintTone?: "default" | "warning";
 }
 
-export function StatCard({ label, value, icon, theme = "dark" }: StatCardProps) {
+export function StatCard({
+  label,
+  value,
+  icon,
+  theme = "dark",
+  hint,
+  hintTone = "default",
+}: StatCardProps) {
   return (
     <div className="glass-card p-6 flex items-center gap-6 border-none">
       <div
@@ -22,6 +31,15 @@ export function StatCard({ label, value, icon, theme = "dark" }: StatCardProps) 
         <div className={`text-3xl font-black tracking-tighter ${theme === "light" ? "text-slate-900" : "text-white"}`}>
           {value}
         </div>
+        {hint && (
+          <div
+            className={`text-[9px] font-bold uppercase tracking-widest mt-1 ${
+              hintTone === "warning" ? "text-amber-400" : "text-slate-500"
+            }`}
+          >
+            {hint}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -170,6 +170,7 @@ pub async fn perform_arxiv_fetch(
         }
     }
     let _ = app.emit("arxiv_update", &papers);
+    let _ = app.emit("arxiv_error", "");
     
     Ok(papers)
 }
@@ -188,7 +189,7 @@ pub async fn start_arxiv_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
     }
 
     // Startup delay to let frontend initialize cleanly
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
 
     let mut is_startup = true;
     let mut backoff_secs = 60;
@@ -240,6 +241,21 @@ pub async fn start_arxiv_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
                 }
                 Err(e) => {
                     log::error!("Error fetching Arxiv: {}. Retrying in {}s.", e, backoff_secs);
+                    let _ = app.emit("arxiv_error", e.clone());
+                    let cached_papers = {
+                        if let Ok(state_papers) = state.arxiv_papers.lock() {
+                            if !state_papers.is_empty() {
+                                state_papers.clone()
+                            } else {
+                                config_store::read_config::<Vec<ArxivPaper>>(&app, "arxiv_cache.json")
+                            }
+                        } else {
+                            config_store::read_config::<Vec<ArxivPaper>>(&app, "arxiv_cache.json")
+                        }
+                    };
+                    if !cached_papers.is_empty() {
+                        let _ = app.emit("arxiv_update", &cached_papers);
+                    }
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     // Exponential backoff: double the sleep time up to 15 minutes (900s)
                     backoff_secs = std::cmp::min(backoff_secs * 2, 900);

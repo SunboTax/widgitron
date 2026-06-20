@@ -1,11 +1,17 @@
 use tauri::{AppHandle, Emitter};
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+static UPDATE_CHECK_CACHE: std::sync::OnceLock<Mutex<Option<(Instant, UpdateInfo)>>> =
+    std::sync::OnceLock::new();
+
+const UPDATE_CHECK_COOLDOWN: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Deserialize)]
 struct GithubAsset {
     name: String,
     browser_download_url: String,
-    size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +40,20 @@ struct ProgressPayload {
 
 #[tauri::command]
 pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
+    let cache = UPDATE_CHECK_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap();
+        if let Some((checked_at, info)) = guard.as_ref() {
+            if checked_at.elapsed() < UPDATE_CHECK_COOLDOWN {
+                log::info!(
+                    "Returning cached update check ({}s ago)",
+                    checked_at.elapsed().as_secs()
+                );
+                return Ok(info.clone());
+            }
+        }
+    }
+
     let current_version = app.package_info().version.to_string();
     log::info!("Checking for updates. Current version: {}", current_version);
     
@@ -89,14 +109,20 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
         }
     }
 
-    Ok(UpdateInfo {
+    let result = UpdateInfo {
         has_update,
         current_version,
         latest_version: latest_tag,
         release_notes: release.body,
         download_url,
         asset_name,
-    })
+    };
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), result.clone()));
+    }
+
+    Ok(result)
 }
 
 #[tauri::command]

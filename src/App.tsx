@@ -24,16 +24,37 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { APP_VERSION } from "./constants";
-import { invoke } from "@tauri-apps/api/core";
-import { listen, emit } from "@tauri-apps/api/event";
+import { isStaleQuotaWarning, quotaHasDisplayValue, orderQuotaByConfig } from "./utils/quotaDisplay";
+import { orderGpuServersByConfig, sortGpuJobGroups } from "./utils/gpuDisplay";
+import {
+  gpuStatHint as computeGpuStatHint,
+  quotaStatHint as computeQuotaStatHint,
+  serviceUpdateStatHint,
+} from "./utils/statHints";
+import { tauriInvoke } from "./utils/tauriInvoke";
+import { tauriListen } from "./utils/tauriListen";
+import { tauriEmit } from "./utils/tauriEmit";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 
 import { WidgetTheme, WidgetThemeConfig } from "./types/theme";
 import { hexToRgba } from "./utils/color";
+import { listenBackendServiceError } from "./utils/backendServiceError";
+import { listenQuotaMonitorStatus, type QuotaMonitorStatus } from "./utils/quotaMonitorStatus";
+import { listenServiceUpdateEvents } from "./utils/serviceUpdateEvents";
+import { listenGpuDataSync } from "./utils/gpuDataSync";
+import { isLiveDataSection, LIVE_DATA_SECTION, refetchSectionLiveData, refetchSectionLiveDataForSection, appTabLabel, LIVE_DATA_SECTION_LABELS, type AppTab } from "./utils/sectionLiveData";
+import { fetchArxivSavedPapers, fetchArxivDiscardedPapers, loadArxivArchiveLists } from "./utils/arxivArchive";
+import type { AppConfig, ArxivConfig, ArxivPaper, GpuConfig, GpuInfo, PaperConfig, PaperDeadlineInfo, QuotaBarDisplay, QuotaConfig, QuotaItem, ServerGpuData } from "./types/config";
+import type { QuotaUpdatePayload } from "./types/events";
+import type { UpdateInfo } from "./types/tauri";
+import { resolveWidgetTheme } from "./utils/widgetTheme";
+import { CACHED_LABELS, cachedLabelWhen, gpuRefreshCachedLabel, messageShowsCached } from "./utils/cachedLabels";
 import { SidebarLink } from "./components/SidebarLink";
 import { WindowButton } from "./components/WindowButton";
 import { MasterSwitch } from "./components/MasterSwitch";
+import { DashboardServiceToggleError, ToggleErrorBanner } from "./components/SettingsRefreshError";
+import { ServiceErrorBanners } from "./components/ServiceErrorBanners";
 import { StatCard } from "./components/StatCard";
 import { WidgetPreviewCard } from "./components/WidgetPreviewCard";
 import { CopyButton } from "./components/CopyButton";
@@ -43,14 +64,71 @@ import { DeadlineWidgetContent } from "./widgets/DeadlineWidgetContent";
 import { ArxivWidgetContent } from "./widgets/ArxivWidgetContent";
 import { QuotaWidgetContent } from "./widgets/QuotaWidgetContent";
 import { SettingsPanel } from "./settings/SettingsPanel";
+import {
+  applyServiceDisableClears,
+  buildServiceDisableHandlers,
+  applyWidgetVisibilityChange,
+  activeWidgetLabelsFromConfig,
+  buildServiceFieldToggleDeps,
+  buildServiceToggleCallbacks,
+  clearLiveDataSectionErrors,
+  createSectionRefreshHandler,
+  createSetServiceBusy,
+  createMasterServiceToggleHandler,
+  formatWidgetToggleError,
+  invokeToggleWidget,
+  isServiceToggleBusy,
+  serviceWidgetMeta,
+  SERVICE_FIELD_TO_TAB,
+  type ServiceDisableHandlers,
+  type ServiceField,
+  type ServiceToggleError,
+} from "./utils/widgetLifecycle";
+
+const WIDGET_DESKTOP_STAGGER_MS: Record<string, number> = {
+  "widget-gpu-default": 400,
+  "widget-deadlines-default": 900,
+  "widget-arxiv-default": 1400,
+  "widget-quota-default": 1900,
+};
 
 const appWindow = getCurrentWindow();
+
+const QUICK_LAUNCH_WIDGETS: {
+  field: ServiceField;
+  color: "cyan" | "blue" | "purple" | "pink";
+  detail: string;
+}[] = [
+  {
+    field: "quota_enabled",
+    color: "cyan",
+    detail: "Track AI agent & API limits on your desktop",
+  },
+  {
+    field: "gpu_enabled",
+    color: "blue",
+    detail: "Floating desktop monitoring for GPU clusters",
+  },
+  {
+    field: "deadline_enabled",
+    color: "purple",
+    detail: "Track conference deadlines on your desktop",
+  },
+  {
+    field: "arxiv_enabled",
+    color: "pink",
+    detail: "Swipe to discover latest research papers",
+  },
+];
 
 const PROVIDER_LOGOS: Record<string, string> = {
   antigravity: "/icons/antigravity.svg",
   codex: "/icons/codex.svg",
   cursor: "/icons/cursor.svg",
   copilot: "/icons/vscode.svg",
+  "qoder-cn": "/icons/qoder-cn.svg",
+  pioneer: "/icons/pioneer.svg",
+  "claude-code": "/icons/claude-code.svg",
 };
 
 const renderProviderIcon = (provider: string, isManual = false) => {
@@ -75,46 +153,144 @@ const renderProviderIcon = (provider: string, isManual = false) => {
 };
 
 function App() {
-  const [activeTab, setActiveTab] = useState("dashboard");
+  const [activeTab, setActiveTab] = useState<AppTab>("dashboard");
   const [isMaximized, setIsMaximized] = useState(false);
   const [windowLabel, setWindowLabel] = useState("");
   const [isLocked, setIsLocked] = useState(true);
   const [isPinned, setIsPinned] = useState(false);
-  const [gpuData, setGpuData] = useState<any[]>([]);
-  const [deadlines, setDeadlines] = useState<any[]>([]);
-  const [gpuConfig, setGpuConfig] = useState<any>({ servers: [] });
-  const [paperConfig, setPaperConfig] = useState<any>({});
-  const [arxivConfig, setArxivConfig] = useState<any>({});
-  const [arxivPapers, setArxivPapers] = useState<any[]>([]);
-  const [arxivSavedPapers, setArxivSavedPapers] = useState<any[]>([]);
-  const [arxivDiscardedPapers, setArxivDiscardedPapers] = useState<any[]>([]);
+  const [gpuData, setGpuData] = useState<ServerGpuData[]>([]);
+  const [deadlines, setDeadlines] = useState<PaperDeadlineInfo[]>([]);
+  const [gpuConfig, setGpuConfig] = useState<GpuConfig>({ servers: [] });
+  const [paperConfig, setPaperConfig] = useState<PaperConfig>({});
+  const [arxivConfig, setArxivConfig] = useState<ArxivConfig>({});
+  const [arxivPapers, setArxivPapers] = useState<ArxivPaper[]>([]);
+  const [arxivSavedPapers, setArxivSavedPapers] = useState<ArxivPaper[]>([]);
+  const [arxivDiscardedPapers, setArxivDiscardedPapers] = useState<ArxivPaper[]>([]);
   const [arxivView, setArxivView] = useState<"new" | "saved" | "discarded">("new");
   const [isRefreshingArxiv, setIsRefreshingArxiv] = useState(false);
+  const [arxivRefreshError, setArxivRefreshError] = useState<string | null>(null);
   const [arxivError, setArxivError] = useState<string | null>(null);
-  const [quotaData, setQuotaData] = useState<any[]>([]);
-  const [quotaConfig, setQuotaConfig] = useState<any>({ items: [] });
+  const [paperError, setPaperError] = useState<string | null>(null);
+  const [paperRefreshError, setPaperRefreshError] = useState<string | null>(null);
+  const [quotaData, setQuotaData] = useState<QuotaItem[]>([]);
+  const [quotaConfig, setQuotaConfig] = useState<QuotaConfig>({ items: [] });
   const [isRefreshingQuota, setIsRefreshingQuota] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState<any>(null);
+  const [isRefreshingDeadlines, setIsRefreshingDeadlines] = useState(false);
+  const [isRefreshingGpu, setIsRefreshingGpu] = useState(false);
+  const [gpuRefreshError, setGpuRefreshError] = useState<string | null>(null);
+  const [quotaRefreshError, setQuotaRefreshError] = useState<string | null>(null);
+  const [quotaBackendError, setQuotaBackendError] = useState<string | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateCheckError, setUpdateCheckError] = useState<string | null>(null);
+  const [quotaMonitorStatus, setQuotaMonitorStatus] = useState<QuotaMonitorStatus | null>(null);
 
-  const handleRefreshArxiv = async () => {
-    if (isRefreshingArxiv) return;
-    setIsRefreshingArxiv(true);
-    setArxivError(null);
-    try {
-      const papers = await invoke<any[]>("refresh_arxiv");
-      setArxivPapers(papers);
-    } catch (e) {
-      console.error("Failed to refresh Arxiv:", e);
-      setArxivError(String(e));
-    } finally {
-      setIsRefreshingArxiv(false);
-    }
-  };
+  const configuredGpuHosts = new Set((gpuConfig.servers || []).map((s) => s.host));
+  const visibleGpuData = orderGpuServersByConfig(
+    gpuData.filter((s) => configuredGpuHosts.has(s.host)),
+    gpuConfig.servers
+  );
 
-  const [appConfig, setAppConfig] = useState<any>(() => {
+  const visibleQuotaData = orderQuotaByConfig(quotaData, quotaConfig?.items);
+
+  const totalGpus = visibleGpuData.reduce((acc, s) => acc + (s.gpu_list?.length ?? 0), 0);
+  const gpuServerCount = visibleGpuData.length;
+  const gpuServersOnline = visibleGpuData.filter((s) => s.is_online).length;
+  const gpuOfflineCount = gpuServerCount - gpuServersOnline;
+  const gpuStaleCount = visibleGpuData.filter((s) => messageShowsCached(s.error)).length;
+  const gpuStat = computeGpuStatHint({
+    refreshError: gpuRefreshError,
+    totalGpus,
+    gpuStaleCount,
+    gpuServerCount,
+    gpuServersOnline,
+    gpuOfflineCount,
+  });
+  const gpuStatHint = gpuStat.hint;
+  const gpuStatHintTone = gpuStat.tone;
+
+  const quotaHardErrorCount = visibleQuotaData.filter(
+    (q) => q.error_msg && !isStaleQuotaWarning(q.error_msg)
+  ).length;
+  const quotaStaleCount = visibleQuotaData.filter(
+    (q) => isStaleQuotaWarning(q.error_msg) && quotaHasDisplayValue(q)
+  ).length;
+  const monitoredAgentCount = (quotaConfig?.items?.length ?? visibleQuotaData.length).toString();
+  const quotaBackoffActive = (quotaMonitorStatus?.consecutive_failures ?? 0) > 0;
+  const quotaStat = computeQuotaStatHint({
+    refreshError: quotaRefreshError,
+    visibleQuotaCount: visibleQuotaData.length,
+    quotaHardErrorCount,
+    quotaBackoffActive,
+    backoffSecs: quotaMonitorStatus?.backoff_secs ?? 0,
+    quotaStaleCount,
+  });
+  const quotaStatHint = quotaStat.hint;
+  const quotaStatHintTone = quotaStat.tone;
+
+  const arxivStat = serviceUpdateStatHint(
+    arxivRefreshError,
+    arxivError,
+    arxivPapers.length > 0
+  );
+  const arxivStatHint = arxivStat.hint;
+  const arxivStatHintTone = arxivStat.tone;
+
+  const paperStat = serviceUpdateStatHint(
+    paperRefreshError,
+    paperError,
+    deadlines.length > 0
+  );
+  const paperStatHint = paperStat.hint;
+  const paperStatHintTone = paperStat.tone;
+
+  const handleRefreshArxiv = createSectionRefreshHandler({
+    isRefreshing: isRefreshingArxiv,
+    setIsRefreshing: setIsRefreshingArxiv,
+    clearError: () => setArxivRefreshError(null),
+    setError: setArxivRefreshError,
+    section: LIVE_DATA_SECTION.ARXIV,
+    onSuccess: (papers) => {
+      setArxivPapers(papers as ArxivPaper[]);
+    },
+    logLabel: "Failed to refresh Arxiv",
+  });
+
+  const handleRefreshDeadlines = createSectionRefreshHandler({
+    isRefreshing: isRefreshingDeadlines,
+    setIsRefreshing: setIsRefreshingDeadlines,
+    clearError: () => setPaperRefreshError(null),
+    setError: setPaperRefreshError,
+    section: LIVE_DATA_SECTION.DEADLINES,
+    onSuccess: (items) => {
+      setDeadlines(items);
+    },
+    logLabel: "Failed to refresh deadlines",
+  });
+
+  const handleRefreshGpu = createSectionRefreshHandler({
+    isRefreshing: isRefreshingGpu,
+    setIsRefreshing: setIsRefreshingGpu,
+    clearError: () => setGpuRefreshError(null),
+    setError: setGpuRefreshError,
+    section: LIVE_DATA_SECTION.GPU,
+    onSuccess: (data) => setGpuData(data),
+    logLabel: "Failed to refresh GPU data",
+  });
+
+  const handleRefreshQuota = createSectionRefreshHandler({
+    isRefreshing: isRefreshingQuota,
+    setIsRefreshing: setIsRefreshingQuota,
+    clearError: () => setQuotaRefreshError(null),
+    setError: setQuotaRefreshError,
+    section: LIVE_DATA_SECTION.QUOTA,
+    onSuccess: (refreshed) => setQuotaData(refreshed),
+    logLabel: "Failed to refresh quota",
+  });
+
+  const [appConfig, setAppConfig] = useState<AppConfig>(() => {
     try {
       const saved = localStorage.getItem("widgitron-theme") || "dark";
-      return { theme: saved };
+      return { theme: saved === "light" ? "light" : "dark" };
     } catch (e) {
       return { theme: "dark" };
     }
@@ -123,20 +299,171 @@ function App() {
   const [activeWidgets, setActiveWidgets] = useState<string[]>([]);
   const [themeConfig, setThemeConfig] = useState<WidgetThemeConfig>({ themes: [], assignments: {} });
   const [currentTheme, setCurrentTheme] = useState<WidgetTheme | null>(null);
-  const pendingToggles = useRef<Set<string>>(new Set());
-  const saveQuotaTimeoutRef = useRef<any>(null);
+  const [pendingToggles, setPendingToggles] = useState<Set<string>>(new Set());
+  const [toggleWidgetError, setToggleWidgetError] = useState<string | null>(null);
+  const [serviceToggleBusy, setServiceToggleBusy] = useState<Partial<Record<ServiceField, boolean>>>({});
+  const [generalServiceRefreshError, setGeneralServiceRefreshError] = useState<ServiceToggleError | null>(null);
+  const [serviceToggleErrorDismissed, setServiceToggleErrorDismissed] = useState(false);
+  const prevActiveTabRef = useRef(activeTab);
+
+  useEffect(() => {
+    const prevTab = prevActiveTabRef.current;
+    if (prevTab !== activeTab) {
+      if (
+        serviceToggleErrorDismissed &&
+        generalServiceRefreshError &&
+        SERVICE_FIELD_TO_TAB[generalServiceRefreshError.field] === prevTab
+      ) {
+        setGeneralServiceRefreshError(null);
+      }
+      if (prevTab === "dashboard") {
+        setToggleWidgetError(null);
+      }
+      if (isLiveDataSection(prevTab)) {
+        clearLiveDataSectionErrors(prevTab, {
+          gpu: { clearRefresh: () => setGpuRefreshError(null) },
+          deadlines: {
+            clearRefresh: () => setPaperRefreshError(null),
+            clearBackend: () => setPaperError(null),
+          },
+          arxiv: {
+            clearRefresh: () => setArxivRefreshError(null),
+            clearBackend: () => setArxivError(null),
+          },
+          quota: {
+            clearRefresh: () => setQuotaRefreshError(null),
+            clearBackend: () => setQuotaBackendError(null),
+          },
+        });
+      }
+      setServiceToggleErrorDismissed(false);
+      prevActiveTabRef.current = activeTab;
+    }
+  }, [activeTab, serviceToggleErrorDismissed, generalServiceRefreshError]);
+
+  useEffect(() => {
+    if (!isLiveDataSection(activeTab)) return;
+
+    const setters = {
+      [LIVE_DATA_SECTION.GPU]: setGpuData,
+      [LIVE_DATA_SECTION.DEADLINES]: setDeadlines,
+      [LIVE_DATA_SECTION.ARXIV]: setArxivPapers,
+      [LIVE_DATA_SECTION.QUOTA]: setQuotaData,
+    };
+    refetchSectionLiveDataForSection(activeTab, setters);
+  }, [activeTab]);
+
+  const onActiveWidgetsChanged = (labels: string[]) => {
+    setActiveWidgets(labels);
+  };
+
+  const serviceDisableHandlers: ServiceDisableHandlers = buildServiceDisableHandlers({
+    gpu_enabled: {
+      clearData: () => setGpuData([]),
+      clearRefreshError: () => setGpuRefreshError(null),
+    },
+    deadline_enabled: {
+      clearData: () => setDeadlines([]),
+      clearRefreshError: () => setPaperRefreshError(null),
+      clearBackendError: () => setPaperError(null),
+    },
+    arxiv_enabled: {
+      clearData: () => setArxivPapers([]),
+      clearRefreshError: () => setArxivRefreshError(null),
+      clearBackendError: () => setArxivError(null),
+    },
+    quota_enabled: {
+      clearData: () => setQuotaData([]),
+      clearRefreshError: () => setQuotaRefreshError(null),
+      clearBackendError: () => setQuotaBackendError(null),
+      clearMonitorStatus: () => setQuotaMonitorStatus(null),
+    },
+  });
+
+  const setServiceBusy = createSetServiceBusy(setServiceToggleBusy);
+
+  const serviceToggleCallbacks = buildServiceToggleCallbacks({
+    setServiceBusy,
+    onGeneralServiceError: setGeneralServiceRefreshError,
+    fields: {
+      gpu_enabled: buildServiceFieldToggleDeps(
+        () => setGpuRefreshError(null),
+        setGpuRefreshError,
+        setGpuData
+      ),
+      deadline_enabled: buildServiceFieldToggleDeps(
+        () => setPaperRefreshError(null),
+        setPaperRefreshError,
+        setDeadlines
+      ),
+      arxiv_enabled: buildServiceFieldToggleDeps(
+        () => setArxivRefreshError(null),
+        setArxivRefreshError,
+        setArxivPapers
+      ),
+      quota_enabled: buildServiceFieldToggleDeps(
+        () => setQuotaRefreshError(null),
+        setQuotaRefreshError,
+        setQuotaData
+      ),
+    },
+  });
+
+  const checkServiceToggleBusy = (field: ServiceField) =>
+    isServiceToggleBusy(field, serviceToggleBusy);
 
   useEffect(() => {
     const win = appWindow;
     setWindowLabel(win.label);
 
-    let interval: any;
     let unlisteners: (() => void)[] = [];
     let active = true;
 
     const init = async () => {
       try {
-        console.log("Initializing window:", win.label);
+        const label = win.label;
+        console.log("Initializing window:", label);
+
+        if (label === "tray-menu") {
+          return;
+        }
+
+        if (label.startsWith("widget-")) {
+          const [ac, tc] = await Promise.all([
+            tauriInvoke("get_app_config"),
+            tauriInvoke("get_theme_config"),
+          ]);
+          if (!active) return;
+
+          setAppConfig(ac);
+          setThemeConfig(tc);
+          setCurrentTheme(resolveWidgetTheme(tc, label));
+
+          const pinned = ac.always_on_top?.[label] ?? false;
+          setIsPinned(pinned);
+
+          const stagger = WIDGET_DESKTOP_STAGGER_MS[label] ?? 500;
+          setTimeout(async () => {
+            if (!active) return;
+            if (pinned) {
+              await win.setAlwaysOnTop(true);
+              await tauriInvoke("set_desktop_mode", { label, enabled: false });
+            } else {
+              await win.setAlwaysOnTop(false);
+              await tauriInvoke("set_desktop_mode", { label, enabled: true });
+            }
+          }, stagger);
+
+          const uTheme = await tauriListen("theme_update", (event) => {
+            if (!active) return;
+            const config = event.payload;
+            setThemeConfig(config);
+            setCurrentTheme(resolveWidgetTheme(config, label));
+          });
+          unlisteners.push(() => uTheme());
+          return;
+        }
+
         const [
           gc,
           pc,
@@ -149,19 +476,19 @@ function App() {
           initialQuotas,
           tc,
           autostartEnabled
-        ] = (await Promise.all([
-          invoke("get_gpu_config"),
-          invoke("get_paper_config"),
-          invoke("get_arxiv_config"),
-          invoke("get_app_config"),
-          invoke("get_deadlines"),
-          invoke("get_gpu_data"),
-          invoke("get_arxiv_papers"),
-          invoke("get_quota_config"),
-          invoke("get_quota_data"),
-          invoke("get_theme_config"),
-          isEnabled()
-        ])) as [any, any, any, any, any, any, any, any, any, WidgetThemeConfig, boolean];
+        ] = await Promise.all([
+          tauriInvoke("get_gpu_config"),
+          tauriInvoke("get_paper_config"),
+          tauriInvoke("get_arxiv_config"),
+          tauriInvoke("get_app_config"),
+          refetchSectionLiveData(LIVE_DATA_SECTION.DEADLINES),
+          refetchSectionLiveData(LIVE_DATA_SECTION.GPU),
+          refetchSectionLiveData(LIVE_DATA_SECTION.ARXIV),
+          tauriInvoke("get_quota_config"),
+          refetchSectionLiveData(LIVE_DATA_SECTION.QUOTA),
+          tauriInvoke("get_theme_config"),
+          isEnabled(),
+        ]);
 
         if (!active) return;
 
@@ -174,69 +501,36 @@ function App() {
         setGpuData(initialGpuData);
         setArxivPapers(initialArxiv);
         setQuotaConfig(qc);
-        setQuotaData(initialQuotas as any[]);
+        setQuotaData(initialQuotas);
         setIsAutostart(autostartEnabled);
         setThemeConfig(tc);
 
-        const label = win.label;
-        if (label.startsWith("widget-")) {
-          const tid = tc.assignments?.[label];
-          let defaultId = "theme-gpu-default";
-          if (label.includes("deadlines")) defaultId = "theme-deadline-default";
-          if (label.includes("arxiv")) defaultId = "theme-arxiv-default";
-          if (label.includes("quota")) defaultId = "theme-quota-default";
-
-          const theme = tc.themes.find((t) => t.id === tid) || tc.themes.find((t) => t.id === defaultId);
-          setCurrentTheme(theme || null);
-
-          let pinned = false;
-          if (ac.always_on_top?.[label] !== undefined) {
-            pinned = ac.always_on_top[label];
-          }
-
-          setIsPinned(pinned);
-
-          // Wait a bit for the window to be ready before Win32 manipulations
-          setTimeout(async () => {
-            if (!active) return;
-            if (pinned) {
-              await win.setAlwaysOnTop(true);
-              await invoke("set_desktop_mode", { label, enabled: false });
-            } else {
-              await win.setAlwaysOnTop(false);
-              await invoke("set_desktop_mode", { label, enabled: true });
-            }
-          }, 500);
-        }
-
         if (win.label === "main") {
-          const windows = await getAllWebviewWindows();
-          if (!active) return;
-          const initialActive = [];
-          for (const w of windows) {
-            if (w.label.startsWith("widget-") && (await w.isVisible())) {
-              initialActive.push(w.label);
-            }
-          }
-          if (!active) return;
-          setActiveWidgets(initialActive);
-
-          interval = setInterval(async () => {
-            try {
-              const wins = await getAllWebviewWindows();
-              if (!active) return;
-              const activeW = [];
-              for (const w of wins) {
-                if (w.label.startsWith("widget-") && (await w.isVisible())) {
-                  activeW.push(w.label);
-                }
+          const labelsFromConfig = activeWidgetLabelsFromConfig(ac);
+          if (labelsFromConfig !== null) {
+            setActiveWidgets(labelsFromConfig);
+          } else {
+            const windows = await getAllWebviewWindows();
+            if (!active) return;
+            const initialActive = [];
+            for (const w of windows) {
+              if (w.label.startsWith("widget-") && (await w.isVisible())) {
+                initialActive.push(w.label);
               }
-              if (!active) return;
-              setActiveWidgets(activeW);
-            } catch (e) {
-              console.error("Failed to query active windows in interval", e);
             }
-          }, 2000);
+            if (!active) return;
+            setActiveWidgets(initialActive);
+          }
+
+          const uWidgetVis = await tauriListen(
+            "widget_visibility_changed",
+            (event) => {
+              if (!active) return;
+              const { id, visible } = event.payload;
+              setActiveWidgets((prev) => applyWidgetVisibilityChange(prev, id, visible));
+            }
+          );
+          unlisteners.push(() => uWidgetVis());
         }
 
         const u1 = await win.onResized(async () => {
@@ -254,58 +548,93 @@ function App() {
           unlisteners.push(() => u1());
         }
 
-        const u2 = await listen<any>("gpu_update", (event) => {
-          if (!active) return;
-          const item = event.payload;
-          setGpuData((prev) => {
-            const index = prev.findIndex((s) => s.host === item.host);
-            if (index === -1) return [...prev, item];
-            const next = [...prev];
-            next[index] = item;
-            return next;
-          });
-        });
+        const u2 = await listenServiceUpdateEvents(
+          () => active,
+          {
+            gpu: { clearRefresh: () => setGpuRefreshError(null) },
+            paper: {
+              clearRefresh: () => setPaperRefreshError(null),
+              clearBackend: () => setPaperError(null),
+            },
+            arxiv: {
+              clearRefresh: () => setArxivRefreshError(null),
+              clearBackend: () => setArxivError(null),
+            },
+            quota: {
+              clearRefresh: () => setQuotaRefreshError(null),
+              clearBackend: () => setQuotaBackendError(null),
+            },
+          },
+          {
+            gpuSetter: setGpuData,
+            paperSetter: setDeadlines,
+            arxivSetter: setArxivPapers,
+            quotaSetter: setQuotaData,
+          }
+        );
         if (!active) {
           u2();
         } else {
-          unlisteners.push(() => u2());
+          unlisteners.push(u2);
         }
 
-        const u3 = await listen<any[]>("paper_update", (event) => {
-          if (!active) return;
-          setDeadlines(event.payload);
-        });
+        const u3b = await listenBackendServiceError(
+          "paper_error",
+          setPaperError,
+          () => active
+        );
         if (!active) {
-          u3();
+          u3b();
         } else {
-          unlisteners.push(() => u3());
+          unlisteners.push(() => u3b());
         }
 
-        const u4 = await listen("gpu_clear", () => {
-          if (!active) return;
-          setGpuData([]);
-        });
+        const u4 = await listenGpuDataSync(setGpuData, () => active);
         if (!active) {
           u4();
         } else {
-          unlisteners.push(() => u4());
+          unlisteners.push(u4);
         }
 
-        const u5 = await listen("theme_update", (event: any) => {
+        const u4c = await tauriListen("quota_config_update", (event) => {
           if (!active) return;
-          const config = event.payload as WidgetThemeConfig;
+          setQuotaConfig(event.payload);
+        });
+        if (!active) {
+          u4c();
+        } else {
+          unlisteners.push(() => u4c());
+        }
+
+        const u4d = await tauriListen("app_config_update", (event) => {
+          if (!active) return;
+          const next = event.payload;
+          setAppConfig((prev) => {
+            applyServiceDisableClears(prev, next, serviceDisableHandlers);
+            if (next?.theme) {
+              localStorage.setItem("widgitron-theme", next.theme);
+            }
+            return next;
+          });
+          if (win.label === "main") {
+            const labels = activeWidgetLabelsFromConfig(next);
+            if (labels !== null) {
+              setActiveWidgets(labels);
+            }
+          }
+        });
+        if (!active) {
+          u4d();
+        } else {
+          unlisteners.push(() => u4d());
+        }
+
+        const u5 = await tauriListen("theme_update", (event) => {
+          if (!active) return;
+          const config = event.payload;
           setThemeConfig(config);
-          if (label.startsWith("widget-")) {
-            const tid = config.assignments?.[label];
-            const defaultId = label.includes("gpu")
-              ? "theme-gpu-default"
-              : label.includes("deadlines")
-              ? "theme-deadline-default"
-              : label.includes("arxiv")
-              ? "theme-arxiv-default"
-              : "theme-quota-default";
-            const theme = config.themes.find((t) => t.id === tid) || config.themes.find((t) => t.id === defaultId);
-            setCurrentTheme(theme || null);
+          if (win.label.startsWith("widget-")) {
+            setCurrentTheme(resolveWidgetTheme(config, win.label));
           }
         });
         if (!active) {
@@ -314,19 +643,20 @@ function App() {
           unlisteners.push(() => u5());
         }
 
-        const u6 = await listen<any[]>("arxiv_update", (event) => {
-          if (!active) return;
-          setArxivPapers(event.payload);
-        });
+        const u6b = await listenBackendServiceError(
+          "arxiv_error",
+          setArxivError,
+          () => active
+        );
         if (!active) {
-          u6();
+          u6b();
         } else {
-          unlisteners.push(() => u6());
+          unlisteners.push(() => u6b());
         }
 
-        const u8 = await listen("arxiv_saved_update", async () => {
+        const u8 = await tauriListen("arxiv_saved_update", async () => {
           try {
-            const saved = await invoke<any[]>("get_arxiv_saved_papers");
+            const saved = await fetchArxivSavedPapers();
             if (!active) return;
             setArxivSavedPapers(saved);
           } catch (e) {
@@ -339,9 +669,9 @@ function App() {
           unlisteners.push(() => u8());
         }
 
-        const u9 = await listen("arxiv_discarded_update", async () => {
+        const u9 = await tauriListen("arxiv_discarded_update", async () => {
           try {
-            const discarded = await invoke<any[]>("get_arxiv_discarded_papers");
+            const discarded = await fetchArxivDiscardedPapers();
             if (!active) return;
             setArxivDiscardedPapers(discarded);
           } catch (e) {
@@ -354,40 +684,39 @@ function App() {
           unlisteners.push(() => u9());
         }
 
-        const u10 = await listen<any[]>("quota_update", (event) => {
-          if (!active) return;
-          setQuotaData(event.payload);
-        });
+
+        const u10b = await listenQuotaMonitorStatus(
+          setQuotaMonitorStatus,
+          setQuotaBackendError,
+          () => active
+        );
         if (!active) {
-          u10();
+          u10b();
         } else {
-          unlisteners.push(() => u10());
+          unlisteners.push(() => u10b());
         }
 
-        // Initial fetch
-        invoke<any>("get_arxiv_config").then((res) => {
-          if (active) setArxivConfig(res);
-        }).catch(console.error);
-        invoke<any[]>("get_arxiv_saved_papers").then((res) => {
-          if (active) setArxivSavedPapers(res);
-        }).catch(console.error);
-        invoke<any[]>("get_arxiv_discarded_papers").then((res) => {
-          if (active) setArxivDiscardedPapers(res);
-        }).catch(console.error);
-        invoke<any[]>("get_arxiv_papers").then((res) => {
-          if (active) setArxivPapers(res);
-        }).catch(console.error);
+        loadArxivArchiveLists(() => active, setArxivSavedPapers, setArxivDiscardedPapers);
 
         // Check for updates on startup & every 12 hours in background
         const runUpdateCheck = () => {
-          invoke<any>("check_for_updates").then((res) => {
-            if (active) setUpdateInfo(res);
-          }).catch((err) => {
-            console.error("Failed to check for updates:", err);
-          });
+          tauriInvoke("check_for_updates")
+            .then((res) => {
+              if (active) {
+                setUpdateInfo(res);
+                setUpdateCheckError(null);
+              }
+            })
+            .catch((err) => {
+              console.error("Failed to check for updates:", err);
+              if (active) {
+                setUpdateCheckError(String(err));
+              }
+            });
         };
 
-        runUpdateCheck();
+        const startupOtaDelay = setTimeout(runUpdateCheck, 8000);
+        unlisteners.push(() => clearTimeout(startupOtaDelay));
 
         const updateInterval = setInterval(runUpdateCheck, 12 * 60 * 60 * 1000);
         unlisteners.push(() => clearInterval(updateInterval));
@@ -424,81 +753,84 @@ function App() {
 
     return () => {
       active = false;
-      if (interval) clearInterval(interval);
       unlisteners.forEach((f) => f());
-      if (saveQuotaTimeoutRef.current) {
-        clearTimeout(saveQuotaTimeoutRef.current);
-      }
     };
   }, []);
 
-  const saveGpuConfig = async (newConfig: any) => {
+  const saveGpuConfig = async (newConfig: GpuConfig) => {
     try {
-      await invoke("save_gpu_config", { config: newConfig });
+      await tauriInvoke("save_gpu_config", { config: newConfig });
       setGpuConfig(newConfig);
-      await emit("gpu_config_update", newConfig);
+      const hosts = new Set((newConfig.servers || []).map((s) => s.host));
+      setGpuData((prev) => prev.filter((s) => hosts.has(s.host)));
     } catch (e) {
       console.error("Save failed", e);
     }
   };
 
-  const savePaperConfig = async (newConfig: any) => {
+  const savePaperConfig = async (newConfig: PaperConfig) => {
     try {
-      await invoke("save_paper_config", { config: newConfig });
+      await tauriInvoke("save_paper_config", { config: newConfig });
       setPaperConfig(newConfig);
-      await emit("paper_config_update", newConfig);
     } catch (e) {
       console.error("Save failed", e);
     }
   };
 
   const togglePinConference = async (title: string) => {
-    const nextPinned = (paperConfig.pinned_titles || []).includes(title)
-      ? paperConfig.pinned_titles.filter((t: string) => t !== title)
-      : [...(paperConfig.pinned_titles || []), title];
+    const pinned = paperConfig.pinned_titles || [];
+    const nextPinned = pinned.includes(title)
+      ? pinned.filter((t) => t !== title)
+      : [...pinned, title];
     const nextConfig = { ...paperConfig, pinned_titles: nextPinned };
     await savePaperConfig(nextConfig);
   };
 
-  const onSaveApp = async (config: any) => {
+  const onSaveApp = async (config: AppConfig) => {
     setAppConfig(config);
     if (config.theme) localStorage.setItem("widgitron-theme", config.theme);
-    await invoke("save_app_config", { config });
+    await tauriInvoke("save_app_config", { config });
   };
 
-  const saveArxivConfig = async (newConfig: any) => {
+  const handleMasterServiceToggle = createMasterServiceToggleHandler({
+    appConfig,
+    onSaveApp,
+    serviceDisableHandlers,
+    onActiveWidgetsChanged,
+    serviceToggleCallbacks,
+    onClearGeneralError: () => setGeneralServiceRefreshError(null),
+  });
+
+  const saveArxivConfig = async (newConfig: ArxivConfig) => {
     try {
-      await invoke("save_arxiv_config", { config: newConfig });
+      await tauriInvoke("save_arxiv_config", { config: newConfig });
       setArxivConfig(newConfig);
-      await emit("arxiv_config_update", newConfig);
     } catch (e) {
       console.error("Save Arxiv config failed", e);
     }
   };
 
-  const saveQuotaConfig = (newConfig: any) => {
-    // Update UI state immediately for instant responsiveness
+  const saveQuotaConfig = async (newConfig: QuotaConfig) => {
     setQuotaConfig(newConfig);
 
-    const newItems: any[] = newConfig?.items || [];
-    const cachedMap = new Map(quotaData.map((q: any) => [q.id, q]));
-    const merged = newItems.map((item: any) => {
+    const newItems = newConfig.items || [];
+    const cachedMap = new Map(quotaData.map((q) => [q.id, q]));
+    const merged: QuotaItem[] = newItems.map((item) => {
       const cached = cachedMap.get(item.id);
       if (cached && cached.provider === item.provider) {
-        // Keep cached display data, update config fields
         return {
           ...cached,
           name: item.name,
-          max_quota: item.max_quota,
-          unit: item.unit,
-          api_key: item.api_key,
+          auth_mode: item.auth_mode,
+          api_key: item.api_key ?? cached.api_key,
           api_url: item.api_url,
-          json_path: item.json_path
+          json_path: item.json_path,
+          max_quota: item.max_quota ?? cached.max_quota,
         };
       }
-      // New item or provider changed: placeholder until next fetch
       return {
         ...item,
+        api_key: item.api_key ?? "",
         current_value: null,
         error_msg: null,
         last_update: null,
@@ -509,32 +841,24 @@ function App() {
         secondary_name: null,
         secondary_reset: null,
         bars: null,
-        plan_type: null
+        plan_type: null,
       };
     });
-    
+
     setQuotaData(merged);
-    emit("quota_update", merged);
+    tauriEmit("quota_update", merged satisfies QuotaUpdatePayload);
+    tauriEmit("quota_config_update", newConfig);
 
-    // Notify widgets instantly (e.g. show_account_name toggle)
-    emit("quota_config_update", newConfig);
-
-    // Debounce saving to disk & fetching
-    if (saveQuotaTimeoutRef.current) {
-      clearTimeout(saveQuotaTimeoutRef.current);
+    try {
+      await tauriInvoke("save_quota_config", { config: newConfig });
+    } catch (e) {
+      console.error("Save quota config failed", e);
     }
-    saveQuotaTimeoutRef.current = setTimeout(() => {
-      invoke("save_quota_config", { config: newConfig }).catch((e: any) => {
-        console.error("Save quota config failed", e);
-      });
-    }, 500);
   };
 
   const onSaveThemes = async (config: WidgetThemeConfig) => {
     setThemeConfig(config);
-    await invoke("save_theme_config", { config });
-    // Emit event to widgets to sync themes
-    await emit("theme_update", config);
+    await tauriInvoke("save_theme_config", { config });
   };
 
   const toggleMaximize = async () => {
@@ -546,23 +870,23 @@ function App() {
   };
 
   const handleToggleWidget = async (id: string, title: string) => {
-    if (pendingToggles.current.has(id)) return;
-    pendingToggles.current.add(id);
-    
-    // We can keep the optimistic update so the UI still feels snappy,
-    // but the pending set will prevent rapid fire.
-    // Wait, polling interval might revert the UI if the backend hasn't updated yet.
-    // Let's do the optimistic update, then wait for invoke, then verify actual state.
-    try {
-      setActiveWidgets((prev) => (prev.includes(id) ? prev.filter((w) => w !== id) : [...prev, id]));
-      await invoke("toggle_widget", { id, title });
+    if (pendingToggles.has(id)) return;
+    setPendingToggles((prev) => new Set(prev).add(id));
+    setToggleWidgetError(null);
 
-      // Optionally double check Window state if we want to be foolproof, 
-      // but polling loop will eventually catch it.
+    try {
+      const newVisible = await invokeToggleWidget(id, title);
+      setActiveWidgets((prev) => applyWidgetVisibilityChange(prev, id, newVisible));
     } catch (e) {
+      const message = String(e);
       console.error("Toggle failed", e);
+      setToggleWidgetError(formatWidgetToggleError(message));
     } finally {
-      pendingToggles.current.delete(id);
+      setPendingToggles((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
     }
   };
 
@@ -575,11 +899,11 @@ function App() {
     if (windowLabel.startsWith("widget-")) {
       if (!nextLocked) {
         // Unlocking: Exit desktop mode
-        await invoke("set_desktop_mode", { label: windowLabel, enabled: false });
+        await tauriInvoke("set_desktop_mode", { label: windowLabel, enabled: false });
       } else {
         // Locking: If not pinned, re-embed
         if (!isPinned) {
-          await invoke("set_desktop_mode", { label: windowLabel, enabled: true });
+          await tauriInvoke("set_desktop_mode", { label: windowLabel, enabled: true });
         }
       }
     }
@@ -595,12 +919,12 @@ function App() {
 
       if (next) {
         // Turning ON Always on Top: Disable Desktop Mode FIRST, then set top
-        await invoke("set_desktop_mode", { label: targetLabel, enabled: false });
+        await tauriInvoke("set_desktop_mode", { label: targetLabel, enabled: false });
         await targetWin?.setAlwaysOnTop(true);
       } else {
         // Turning OFF Always on Top: Enable Desktop Mode (Embedded)
         await targetWin?.setAlwaysOnTop(false);
-        await invoke("set_desktop_mode", { label: targetLabel, enabled: true });
+        await tauriInvoke("set_desktop_mode", { label: targetLabel, enabled: true });
       }
 
       if (targetLabel === windowLabel) {
@@ -621,7 +945,7 @@ function App() {
       if (windowLabel === "main") {
         await win.hide();
       } else if (windowLabel.startsWith("widget-")) {
-        await invoke("close_widget", { id: windowLabel });
+        await tauriInvoke("close_widget", { id: windowLabel });
       } else {
         await win.close();
       }
@@ -647,7 +971,7 @@ function App() {
     return (
       <div className="h-screen w-screen flex flex-col bg-white border border-slate-200 rounded-lg overflow-hidden shadow-xl p-1 select-none">
         <button
-          onClick={() => invoke("show_main")}
+          onClick={() => tauriInvoke("show_main")}
           className="w-full flex items-center gap-3 px-3 py-2 rounded-md hover:bg-slate-100 text-slate-700 transition-colors group"
         >
           <LayoutDashboard
@@ -657,7 +981,7 @@ function App() {
           <span className="text-[11px] font-bold">Dashboard</span>
         </button>
         <button
-          onClick={() => invoke("exit_app")}
+          onClick={() => tauriInvoke("exit_app")}
           className="w-full flex items-center gap-3 px-3 py-2 rounded-md hover:bg-red-50 text-slate-700 hover:text-red-600 transition-colors group"
         >
           <X size={14} className="text-slate-500 group-hover:text-red-500 transition-colors" />
@@ -771,30 +1095,30 @@ function App() {
           />
           <SidebarLink
             icon={<Gauge size={20} />}
-            label="Quota Monitor"
-            active={activeTab === "quota"}
-            onClick={() => setActiveTab("quota")}
+            label={LIVE_DATA_SECTION_LABELS.quota}
+            active={activeTab === LIVE_DATA_SECTION.QUOTA}
+            onClick={() => setActiveTab(LIVE_DATA_SECTION.QUOTA)}
             theme={appConfig.theme}
           />
           <SidebarLink
             icon={<Cpu size={20} />}
-            label="GPU Monitor"
-            active={activeTab === "gpu"}
-            onClick={() => setActiveTab("gpu")}
+            label={LIVE_DATA_SECTION_LABELS.gpu}
+            active={activeTab === LIVE_DATA_SECTION.GPU}
+            onClick={() => setActiveTab(LIVE_DATA_SECTION.GPU)}
             theme={appConfig.theme}
           />
           <SidebarLink
             icon={<Calendar size={20} />}
-            label="Paper Deadlines"
-            active={activeTab === "deadlines"}
-            onClick={() => setActiveTab("deadlines")}
+            label={LIVE_DATA_SECTION_LABELS.deadlines}
+            active={activeTab === LIVE_DATA_SECTION.DEADLINES}
+            onClick={() => setActiveTab(LIVE_DATA_SECTION.DEADLINES)}
             theme={appConfig.theme}
           />
           <SidebarLink
             icon={<Activity size={20} />}
-            label="Arxiv Radar"
-            active={activeTab === "arxiv"}
-            onClick={() => setActiveTab("arxiv")}
+            label={LIVE_DATA_SECTION_LABELS.arxiv}
+            active={activeTab === LIVE_DATA_SECTION.ARXIV}
+            onClick={() => setActiveTab(LIVE_DATA_SECTION.ARXIV)}
             theme={appConfig.theme}
           />
           <div
@@ -820,17 +1144,7 @@ function App() {
           data-tauri-drag-region="true"
         >
           <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 pointer-events-none">
-            {activeTab === "dashboard"
-              ? "Overview"
-              : activeTab === "gpu"
-              ? "GPU Monitor"
-              : activeTab === "deadlines"
-              ? "Paper Deadlines"
-              : activeTab === "arxiv"
-              ? "Arxiv Radar"
-              : activeTab === "quota"
-              ? "Quota Monitor"
-              : activeTab}
+            {appTabLabel(activeTab)}
           </div>
           <div className="flex items-center gap-0.5 z-[60] pointer-events-auto">
             <WindowButton
@@ -858,6 +1172,13 @@ function App() {
           }`}
           data-no-drag="true"
         >
+          <DashboardServiceToggleError
+            activeTab={activeTab}
+            error={generalServiceRefreshError}
+            theme={appConfig.theme}
+            dismissed={serviceToggleErrorDismissed}
+            onDismiss={() => setServiceToggleErrorDismissed(true)}
+          />
           <AnimatePresence mode="wait">
             {activeTab === "dashboard" && (
               <motion.div
@@ -867,30 +1188,43 @@ function App() {
                 exit={{ opacity: 0, x: -20 }}
                 className="space-y-8"
               >
+                <ToggleErrorBanner
+                  message={toggleWidgetError}
+                  onDismiss={() => setToggleWidgetError(null)}
+                  theme={appConfig.theme}
+                />
                 <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6">
                   <StatCard
                     label="Total GPUs"
-                    value={gpuData.reduce((acc, s) => acc + s.gpu_list.length, 0).toString()}
+                    value={totalGpus.toString()}
                     icon={<Cpu className="text-purple-400" />}
                     theme={appConfig.theme}
+                    hint={gpuStatHint}
+                    hintTone={gpuStatHintTone}
                   />
                   <StatCard
                     label="Active Deadlines"
                     value={deadlines.length.toString()}
                     icon={<Calendar className="text-emerald-400" />}
                     theme={appConfig.theme}
+                    hint={paperStatHint}
+                    hintTone={paperStatHintTone}
                   />
                   <StatCard
                     label="Arxiv Radar"
                     value={arxivPapers.length.toString()}
                     icon={<Activity className="text-pink-400" />}
                     theme={appConfig.theme}
+                    hint={arxivStatHint}
+                    hintTone={arxivStatHintTone}
                   />
                   <StatCard
                     label="Monitored Agents"
-                    value={quotaData.length.toString()}
+                    value={monitoredAgentCount}
                     icon={<Gauge className="text-cyan-400" />}
                     theme={appConfig.theme}
+                    hint={quotaStatHint}
+                    hintTone={quotaStatHintTone}
                   />
                 </div>
 
@@ -903,56 +1237,30 @@ function App() {
                     Quick Launch Widgets
                   </h2>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {appConfig.quota_enabled !== false && (
-                      <WidgetPreviewCard
-                        title="Quota Monitor Widget"
-                        status={activeWidgets.includes("widget-quota-default") ? "Active" : "Ready"}
-                        detail="Track AI agent & API limits on your desktop"
-                        trend={activeWidgets.includes("widget-quota-default") ? "Hide Widget" : "Show Widget"}
-                        color="cyan"
-                        theme={appConfig.theme}
-                        onLaunch={() => handleToggleWidget("widget-quota-default", "Quota Monitor")}
-                      />
-                    )}
-                    {appConfig.gpu_enabled !== false && (
-                      <WidgetPreviewCard
-                        title="GPU Monitor Widget"
-                        status={activeWidgets.includes("widget-gpu-default") ? "Active" : "Ready"}
-                        detail="Floating desktop monitoring for GPU clusters"
-                        trend={activeWidgets.includes("widget-gpu-default") ? "Hide Widget" : "Show Widget"}
-                        color="blue"
-                        theme={appConfig.theme}
-                        onLaunch={() => handleToggleWidget("widget-gpu-default", "GPU Monitor")}
-                      />
-                    )}
-                    {appConfig.deadline_enabled !== false && (
-                      <WidgetPreviewCard
-                        title="Paper Deadlines Widget"
-                        status={activeWidgets.includes("widget-deadlines-default") ? "Active" : "Ready"}
-                        detail="Track conference deadlines on your desktop"
-                        trend={activeWidgets.includes("widget-deadlines-default") ? "Hide Widget" : "Show Widget"}
-                        color="purple"
-                        theme={appConfig.theme}
-                        onLaunch={() => handleToggleWidget("widget-deadlines-default", "Paper Deadlines")}
-                      />
-                    )}
-                    {appConfig.arxiv_enabled !== false && (
-                      <WidgetPreviewCard
-                        title="Arxiv Radar Widget"
-                        status={activeWidgets.includes("widget-arxiv-default") ? "Active" : "Ready"}
-                        detail="Swipe to discover latest research papers"
-                        trend={activeWidgets.includes("widget-arxiv-default") ? "Hide Widget" : "Show Widget"}
-                        color="pink"
-                        theme={appConfig.theme}
-                        onLaunch={() => handleToggleWidget("widget-arxiv-default", "Arxiv Radar")}
-                      />
-                    )}
+                    {QUICK_LAUNCH_WIDGETS.map(({ field, color, detail }) => {
+                      if (appConfig[field] === false) return null;
+                      const { id, title } = serviceWidgetMeta(field);
+                      return (
+                        <WidgetPreviewCard
+                          key={id}
+                          title={`${title} Widget`}
+                          status={activeWidgets.includes(id) ? "Active" : "Ready"}
+                          detail={detail}
+                          trend={activeWidgets.includes(id) ? "Hide Widget" : "Show Widget"}
+                          color={color}
+                          theme={appConfig.theme}
+                          loading={pendingToggles.has(id)}
+                          disabled={pendingToggles.has(id)}
+                          onLaunch={() => handleToggleWidget(id, title)}
+                        />
+                      );
+                    })}
                   </div>
                 </div>
               </motion.div>
             )}
 
-            {activeTab === "gpu" && (
+            {activeTab === LIVE_DATA_SECTION.GPU && (
               <motion.div
                 key="gpu"
                 initial={{ opacity: 0, x: 20 }}
@@ -968,42 +1276,60 @@ function App() {
                     GPU Monitor Status
                   </h2>
                   <div className="flex items-center gap-3">
+                    {appConfig.gpu_enabled !== false && (
+                      <button
+                        onClick={handleRefreshGpu}
+                        disabled={isRefreshingGpu}
+                        className={`p-2 rounded-xl border transition-all ${
+                          appConfig.theme === "light"
+                            ? "border-slate-200 hover:bg-slate-100 text-slate-600"
+                            : "border-white/10 hover:bg-white/5 text-slate-400"
+                        }`}
+                        title="Restart GPU workers"
+                      >
+                        <RefreshCw size={14} className={isRefreshingGpu ? "animate-spin" : ""} />
+                      </button>
+                    )}
                     <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">
                       {appConfig.gpu_enabled !== false ? "Service Enabled" : "Service Disabled"}
                     </span>
                     <MasterSwitch
                       enabled={appConfig.gpu_enabled !== false}
-                      onToggle={async (val) => {
-                        try {
-                          const next = { ...appConfig, gpu_enabled: val };
-                          setAppConfig(next);
-                          await invoke("save_app_config", { config: next });
-                          if (!val) {
-                            setGpuData([]);
-                            await invoke("close_widget", { id: "widget-gpu-default" });
-                          } else {
-                            await invoke("create_widget", { id: "widget-gpu-default", title: "GPU Monitor" });
-                          }
-                        } catch (e) {
-                          console.error("GPU Master Switch failed", e);
-                        }
-                      }}
+                      loading={checkServiceToggleBusy("gpu_enabled")}
+                      disabled={checkServiceToggleBusy("gpu_enabled")}
+                      onToggle={(val) => handleMasterServiceToggle("gpu_enabled", val)}
                     />
                   </div>
                 </div>
+                <ServiceErrorBanners
+                  refreshOnly
+                  refreshError={gpuRefreshError}
+                  onDismissRefresh={() => setGpuRefreshError(null)}
+                  theme={appConfig.theme}
+                  refreshCachedLabel={gpuRefreshCachedLabel(visibleGpuData.length > 0)}
+                />
                 <div className="space-y-6">
-                  {gpuData.length === 0 ? (
+                  {visibleGpuData.length === 0 ? (
                     <div className="p-12 text-center bg-black/5 rounded-3xl border border-dashed border-white/10 text-slate-500 font-bold uppercase tracking-widest text-xs">
                       No active data. Configure servers in Settings.
                     </div>
                   ) : (
-                    gpuData.map((server, idx) => (
+                    visibleGpuData.map((server, idx) => {
+                      const hasCachedGpus =
+                        Array.isArray(server.gpu_list) && server.gpu_list.length > 0;
+                      const showStaleOffline = !server.is_online && hasCachedGpus;
+
+                      return (
                       <div key={idx} className="glass-card p-6">
                         <div className="flex items-center justify-between mb-6">
                           <div className="flex items-center gap-3">
                             <div
                               className={`w-3 h-3 rounded-full ${
-                                server.is_online ? "bg-emerald-500 shadow-[0_0_10px_#10b981]" : "bg-red-500"
+                                server.is_online
+                                  ? "bg-emerald-500 shadow-[0_0_10px_#10b981]"
+                                  : showStaleOffline
+                                  ? "bg-amber-500 shadow-[0_0_10px_#f59e0b]"
+                                  : "bg-red-500"
                               }`}
                             />
                             <span
@@ -1013,6 +1339,11 @@ function App() {
                             >
                               {server.host}
                             </span>
+                            {showStaleOffline && (
+                              <span className="text-[10px] font-black uppercase tracking-widest text-amber-400">
+                                Offline · cached
+                              </span>
+                            )}
                           </div>
                           <span className="text-xs font-black text-slate-500 uppercase tracking-widest">
                             {server.gpu_list.length} GPUs Detected
@@ -1020,14 +1351,14 @@ function App() {
                         </div>
                         <div className="space-y-8">
                           {(() => {
-                            const groups: Record<string, any[]> = {};
-                            server.gpu_list.forEach((gpu: any) => {
+                            const groups: Record<string, GpuInfo[]> = {};
+                            server.gpu_list.forEach((gpu) => {
                               const gid = gpu.job_id || "SYSTEM";
                               if (!groups[gid]) groups[gid] = [];
                               groups[gid].push(gpu);
                             });
 
-                            return Object.entries(groups).map(([jobId, gpus]) => (
+                            return sortGpuJobGroups(groups).map(([jobId, gpus]) => (
                               <div key={jobId} className="space-y-4">
                                 {jobId !== "SYSTEM" && (
                                   <div className="flex items-center gap-2 text-xs font-black text-blue-400 uppercase tracking-[0.2em] mb-2 px-1">
@@ -1122,18 +1453,23 @@ function App() {
                           })()}
                         </div>
                         {server.error && (
-                          <p className="mt-4 text-[10px] text-red-400/60 italic font-medium break-all">
+                          <p
+                            className={`mt-4 text-[10px] italic font-medium break-all ${
+                              showStaleOffline ? "text-amber-400/80" : "text-red-400/60"
+                            }`}
+                          >
                             {server.error}
                           </p>
                         )}
                       </div>
-                    ))
+                    );
+                    })
                   )}
                 </div>
               </motion.div>
             )}
 
-            {activeTab === "deadlines" && (
+            {activeTab === LIVE_DATA_SECTION.DEADLINES && (
               <motion.div
                 key="deadlines"
                 initial={{ opacity: 0, x: 20 }}
@@ -1149,29 +1485,47 @@ function App() {
                     Paper Deadlines
                   </h2>
                   <div className="flex items-center gap-3">
+                    {appConfig.deadline_enabled !== false && (
+                      <button
+                        onClick={handleRefreshDeadlines}
+                        disabled={isRefreshingDeadlines}
+                        className={`p-2 rounded-xl border transition-all ${
+                          appConfig.theme === "light"
+                            ? "border-slate-200 hover:bg-slate-100 text-slate-600"
+                            : "border-white/10 hover:bg-white/5 text-slate-400"
+                        }`}
+                        title="Refresh Deadlines"
+                      >
+                        <RefreshCw size={14} className={isRefreshingDeadlines ? "animate-spin" : ""} />
+                      </button>
+                    )}
                     <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">
                       {appConfig.deadline_enabled !== false ? "Service Enabled" : "Service Disabled"}
                     </span>
                     <MasterSwitch
                       enabled={appConfig.deadline_enabled !== false}
-                      onToggle={async (val) => {
-                        try {
-                          const next = { ...appConfig, deadline_enabled: val };
-                          setAppConfig(next);
-                          await invoke("save_app_config", { config: next });
-                          if (!val) {
-                            setDeadlines([]);
-                            await invoke("close_widget", { id: "widget-deadlines-default" });
-                          } else {
-                            await invoke("create_widget", { id: "widget-deadlines-default", title: "Deadlines" });
-                          }
-                        } catch (e) {
-                          console.error("Deadline Master Switch failed", e);
-                        }
-                      }}
+                      loading={checkServiceToggleBusy("deadline_enabled")}
+                      disabled={checkServiceToggleBusy("deadline_enabled")}
+                      onToggle={(val) => handleMasterServiceToggle("deadline_enabled", val)}
                     />
                   </div>
                 </div>
+                <ServiceErrorBanners
+                  backendError={paperError}
+                  refreshError={paperRefreshError}
+                  onDismissBackend={() => setPaperError(null)}
+                  onDismissRefresh={() => setPaperRefreshError(null)}
+                  theme={appConfig.theme}
+                  showBackend={appConfig.deadline_enabled !== false}
+                  backendCachedLabel={cachedLabelWhen(
+                    deadlines.length > 0,
+                    CACHED_LABELS.deadlines.backend
+                  )}
+                  refreshCachedLabel={cachedLabelWhen(
+                    deadlines.length > 0,
+                    CACHED_LABELS.deadlines.refresh
+                  )}
+                />
                 <div className="space-y-4">
                   {deadlines.length === 0 ? (
                     <div className="p-12 text-center bg-black/5 rounded-3xl border border-dashed border-white/10 text-slate-500 font-bold uppercase tracking-widest text-xs">
@@ -1262,27 +1616,13 @@ function App() {
               </motion.div>
             )}
 
-            {activeTab === "arxiv" && (
+            {activeTab === LIVE_DATA_SECTION.ARXIV && (
               <motion.div
                 key="arxiv"
                 initial={{ opacity: 0, x: 20 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: -20 }}
               >
-                {arxivError && (
-                  <div className="mb-6 p-4 rounded-2xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold flex items-center justify-between shadow-lg backdrop-blur-md">
-                    <span className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                      ArXiv API Error: {arxivError}
-                    </span>
-                    <button
-                      onClick={() => setArxivError(null)}
-                      className="p-1 rounded-lg hover:bg-white/10 text-red-400/60 hover:text-red-400 transition-colors"
-                    >
-                      <X size={14} />
-                    </button>
-                  </div>
-                )}
                 <div className="flex items-center justify-between mb-8">
                   <div className="flex items-center gap-6">
                     <h2
@@ -1355,24 +1695,28 @@ function App() {
                     </span>
                     <MasterSwitch
                       enabled={appConfig.arxiv_enabled !== false}
-                      onToggle={async (val) => {
-                        try {
-                          const next = { ...appConfig, arxiv_enabled: val };
-                          setAppConfig(next);
-                          await invoke("save_app_config", { config: next });
-                          if (!val) {
-                            setArxivPapers([]);
-                            await invoke("close_widget", { id: "widget-arxiv-default" });
-                          } else {
-                            await invoke("create_widget", { id: "widget-arxiv-default", title: "Arxiv Radar" });
-                          }
-                        } catch (e) {
-                          console.error("Arxiv Master Switch failed", e);
-                        }
-                      }}
+                      loading={checkServiceToggleBusy("arxiv_enabled")}
+                      disabled={checkServiceToggleBusy("arxiv_enabled")}
+                      onToggle={(val) => handleMasterServiceToggle("arxiv_enabled", val)}
                     />
                   </div>
                 </div>
+                <ServiceErrorBanners
+                  backendError={arxivError}
+                  refreshError={arxivRefreshError}
+                  onDismissBackend={() => setArxivError(null)}
+                  onDismissRefresh={() => setArxivRefreshError(null)}
+                  theme={appConfig.theme}
+                  showBackend={appConfig.arxiv_enabled !== false}
+                  backendCachedLabel={cachedLabelWhen(
+                    arxivPapers.length > 0,
+                    CACHED_LABELS.arxiv.backend
+                  )}
+                  refreshCachedLabel={cachedLabelWhen(
+                    arxivPapers.length > 0,
+                    CACHED_LABELS.arxiv.refresh
+                  )}
+                />
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {(arxivView === "new" ? arxivPapers : arxivView === "saved" ? arxivSavedPapers : arxivDiscardedPapers)
                     .length === 0 ? (
@@ -1420,7 +1764,7 @@ function App() {
                             <div className="flex items-center gap-2">
                               {arxivView === "saved" && (
                                 <button
-                                  onClick={() => invoke("remove_arxiv_saved_paper", { id: paper.id })}
+                                  onClick={() => tauriInvoke("remove_arxiv_saved_paper", { id: paper.id })}
                                   className="p-2 rounded-xl bg-red-500/10 text-red-400 hover:bg-red-50 hover:text-white transition-all"
                                   title="Remove from saved"
                                 >
@@ -1429,7 +1773,7 @@ function App() {
                               )}
                               {arxivView === "discarded" && (
                                 <button
-                                  onClick={() => invoke("remove_arxiv_discarded_paper", { id: paper.id })}
+                                  onClick={() => tauriInvoke("remove_arxiv_discarded_paper", { id: paper.id })}
                                   className="p-2 rounded-xl bg-red-500/10 text-red-400 hover:bg-red-50 hover:text-white transition-all"
                                   title="Delete permanently"
                                 >
@@ -1437,7 +1781,7 @@ function App() {
                                 </button>
                               )}
                               <button
-                                onClick={() => invoke("open_link", { url: paper.link })}
+                                onClick={() => tauriInvoke("open_link", { url: paper.link })}
                                 className="p-2 rounded-xl bg-white/5 text-slate-400 hover:text-white transition-colors"
                               >
                                 <ExternalLink size={14} />
@@ -1452,7 +1796,7 @@ function App() {
               </motion.div>
             )}
 
-            {activeTab === "quota" && (
+            {activeTab === LIVE_DATA_SECTION.QUOTA && (
               <motion.div
                 key="quota"
                 initial={{ opacity: 0, x: 20 }}
@@ -1468,66 +1812,66 @@ function App() {
                     Agent & API Quotas
                   </h2>
                   <div className="flex items-center gap-3">
-                    <button
-                      onClick={async () => {
-                        setIsRefreshingQuota(true);
-                        try {
-                          await invoke("refresh_quota");
-                        } catch (e) {
-                          console.error(e);
-                        } finally {
-                          setIsRefreshingQuota(false);
-                        }
-                      }}
-                      disabled={isRefreshingQuota}
-                      className={`p-2 rounded-xl border border-[var(--dashboard-border)] ${
-                        appConfig.theme === "light"
-                          ? "bg-white hover:bg-slate-50 text-slate-700 shadow-sm"
-                          : "bg-white/5 hover:bg-white/10 text-white/80 hover:text-white"
-                      } disabled:opacity-50 transition-all flex items-center justify-center`}
-                      title="Refresh quotas"
-                    >
-                      <RefreshCw size={14} className={isRefreshingQuota ? "animate-spin" : ""} />
-                    </button>
+                    {appConfig.quota_enabled !== false && (
+                      <button
+                        onClick={handleRefreshQuota}
+                        disabled={isRefreshingQuota}
+                        className={`p-2 rounded-xl border border-[var(--dashboard-border)] ${
+                          appConfig.theme === "light"
+                            ? "bg-white hover:bg-slate-50 text-slate-700 shadow-sm"
+                            : "bg-white/5 hover:bg-white/10 text-white/80 hover:text-white"
+                        } disabled:opacity-50 transition-all flex items-center justify-center`}
+                        title="Refresh quotas"
+                      >
+                        <RefreshCw size={14} className={isRefreshingQuota ? "animate-spin" : ""} />
+                      </button>
+                    )}
                     <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">
                       {appConfig.quota_enabled !== false ? "Service Enabled" : "Service Disabled"}
                     </span>
                     <MasterSwitch
                       enabled={appConfig.quota_enabled !== false}
-                      onToggle={async (val) => {
-                        try {
-                          const next = { ...appConfig, quota_enabled: val };
-                          setAppConfig(next);
-                          await invoke("save_app_config", { config: next });
-                          if (!val) {
-                            setQuotaData([]);
-                            await invoke("close_widget", { id: "widget-quota-default" });
-                          } else {
-                            await invoke("create_widget", { id: "widget-quota-default", title: "Quota Monitor" });
-                          }
-                        } catch (e) {
-                          console.error("Quota Master Switch failed", e);
-                        }
-                      }}
+                      loading={checkServiceToggleBusy("quota_enabled")}
+                      disabled={checkServiceToggleBusy("quota_enabled")}
+                      onToggle={(val) => handleMasterServiceToggle("quota_enabled", val)}
                     />
                   </div>
                 </div>
+                <ServiceErrorBanners
+                  backendError={quotaBackendError}
+                  refreshError={quotaRefreshError}
+                  onDismissBackend={() => setQuotaBackendError(null)}
+                  onDismissRefresh={() => setQuotaRefreshError(null)}
+                  theme={appConfig.theme}
+                  showBackend={appConfig.quota_enabled !== false}
+                  backendCachedLabel={cachedLabelWhen(
+                    visibleQuotaData.length > 0,
+                    CACHED_LABELS.quota.backend
+                  )}
+                  refreshCachedLabel={cachedLabelWhen(
+                    visibleQuotaData.length > 0,
+                    CACHED_LABELS.quota.refresh
+                  )}
+                />
                 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {quotaData.length === 0 ? (
+                  {visibleQuotaData.length === 0 ? (
                     <div className="col-span-full p-12 text-center bg-black/5 rounded-3xl border border-dashed border-white/10 text-slate-500 font-bold uppercase tracking-widest text-xs">
                       No agents configured. Go to Settings to add one.
                     </div>
                   ) : (
-                    quotaData.map((q) => {
-                      const hasMax = q.max_quota !== undefined && q.max_quota !== null && q.max_quota > 0;
+                    visibleQuotaData.map((q) => {
+                      const hasValue = q.current_value !== null && q.current_value !== undefined;
+                      const hasMax = hasValue && q.max_quota !== undefined && q.max_quota !== null && q.max_quota > 0;
                       const current = q.current_value ?? 0;
                       const max = q.max_quota ?? 100;
                       const percent = hasMax ? Math.min(100, Math.max(0, (current / max) * 100)) : 100;
                       
                       let barColor = "bg-cyan-500";
                       let textColor = "text-cyan-400";
-                      if (hasMax) {
+                      if (!hasValue) {
+                        textColor = appConfig.theme === "light" ? "text-slate-400" : "text-slate-500";
+                      } else if (hasMax) {
                         if (percent < 15) {
                           barColor = "bg-red-500";
                           textColor = "text-red-400";
@@ -1544,18 +1888,22 @@ function App() {
                         q.provider === "codex" ||
                         q.provider === "cursor" ||
                         q.provider === "antigravity" ||
-                        q.provider === "copilot";
+                        q.provider === "copilot" ||
+                        q.provider === "pioneer" ||
+                        q.provider === "qoder-cn" ||
+                        q.provider === "claude-code";
 
                       const isMultiBar =
+                        hasValue &&
                         usesQuotaBarLayout &&
                         ((q.bars && q.bars.length > 0) ||
                           q.provider === "copilot" ||
                           (q.secondary_value !== undefined && q.secondary_value !== null) ||
                           (q.tertiary_value !== undefined && q.tertiary_value !== null));
 
-                      const bars =
+                      const bars: QuotaBarDisplay[] =
                         q.bars && q.bars.length > 0
-                          ? q.bars.map((bar: any) => ({
+                          ? q.bars.map((bar) => ({
                               val: bar.value,
                               name: bar.name,
                               reset: bar.reset,
@@ -1597,16 +1945,24 @@ function App() {
                               </div>
                               {!isMultiBar && (
                                 <span className={`text-sm font-black ${textColor}`}>
-                                  {current.toFixed(current % 1 === 0 ? 0 : 2)}
-                                  {q.unit ? ` ${q.unit}` : ""}
-                                  {hasMax && q.unit !== "%" && ` / ${max}`}
+                                  {hasValue ? (
+                                    <>
+                                      {q.unit === "%"
+                                        ? Math.round(current)
+                                        : current.toFixed(current % 1 === 0 ? 0 : 2)}
+                                      {q.unit === "%" ? "%" : q.unit ? ` ${q.unit}` : ""}
+                                      {hasMax && q.unit !== "%" && ` / ${max}`}
+                                    </>
+                                  ) : (
+                                    "-"
+                                  )}
                                 </span>
                               )}
                             </div>
 
                             {isMultiBar ? (
                               <div className="space-y-3">
-                                {bars.map((bar: any, i: number) => {
+                                {bars.map((bar, i) => {
                                   const pct = bar.val;
                                   let colorClass = "bg-emerald-500";
                                   let textClass = "text-emerald-400";
@@ -1667,7 +2023,11 @@ function App() {
                             </div>
                             
                             {q.error_msg && (
-                              <div className="mt-2 text-xs text-red-400 bg-red-500/5 p-3 rounded-xl border border-red-500/10 italic">
+                              <div className={`mt-2 text-xs italic p-3 rounded-xl border ${
+                                isStaleQuotaWarning(q.error_msg) && quotaHasDisplayValue(q)
+                                  ? "text-amber-400 bg-amber-500/5 border-amber-500/15"
+                                  : "text-red-400 bg-red-500/5 border-red-500/10"
+                              }`}>
                                 {q.error_msg}
                               </div>
                             )}
@@ -1703,6 +2063,9 @@ function App() {
                 activeWidgets={activeWidgets}
                 updateInfo={updateInfo}
                 setUpdateInfo={setUpdateInfo}
+                updateCheckError={updateCheckError}
+                setUpdateCheckError={setUpdateCheckError}
+                onActiveWidgetsChanged={onActiveWidgetsChanged}
               />
             )}
           </AnimatePresence>
