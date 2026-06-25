@@ -20,29 +20,37 @@ macro_rules! eprintln {
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::Manager;
 use tauri::tray::TrayIconBuilder;
+use tauri::Manager;
 
-mod models;
-mod utils;
-mod config_store;
-mod desktop;
-mod gpu;
-mod deadlines;
+mod antigravity;
 mod arxiv;
 mod commands;
+mod config_store;
+mod deadlines;
+mod desktop;
+mod gpu;
 mod logger;
-mod quota;
-mod vscode_secrets;
-mod antigravity;
+mod models;
 mod ota;
+mod quota;
+mod utils;
+mod vscode_secrets;
+mod widget_layout;
 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--minimized"])))
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_filter(|label| label == "main")
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             commands::create_widget,
             commands::close_widget,
@@ -96,11 +104,11 @@ pub fn run() {
             crate::utils::ensure_default_configs(&handle);
             config_store::seed_default_theme_config_if_missing(&handle);
             log::info!("Using config directory: {}", config_dir.display());
-            
+
             // Global State
             // Pre-load cached quota data from disk for instant widget display
             let cached_quota_items: Vec<models::QuotaItem> = {
-                let mut cfg: models::QuotaConfig = config_store::read_config(&handle, "quota_config.json");
+                let mut cfg = quota::read_quota_config(&handle);
                 for item in &mut cfg.items {
                     if item.provider == "antigravity" {
                         quota::group_antigravity_bars(item);
@@ -116,6 +124,7 @@ pub fn run() {
             let state = Arc::new(models::GlobalState {
                 deadlines: Arc::new(std::sync::Mutex::new(cached_deadlines)),
                 gpu_data: Arc::new(std::sync::Mutex::new(cached_gpu)),
+                gpu_last_emitted: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 last_yaml: Arc::new(std::sync::Mutex::new(None)),
                 active_monitors: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 active_workers: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -127,6 +136,7 @@ pub fn run() {
             app.manage(models::GlobalState {
                 deadlines: state.deadlines.clone(),
                 gpu_data: state.gpu_data.clone(),
+                gpu_last_emitted: state.gpu_last_emitted.clone(),
                 last_yaml: state.last_yaml.clone(),
                 active_monitors: state.active_monitors.clone(),
                 active_workers: state.active_workers.clone(),
@@ -135,39 +145,49 @@ pub fn run() {
                 quota_fetch_lock: state.quota_fetch_lock.clone(),
                 widget_toggle_lock: state.widget_toggle_lock.clone(),
             });
+            app.manage(widget_layout::WidgetLayoutSaveState::default());
+            widget_layout::spawn_monitor_watchdog(handle.clone());
 
             // Emit preloaded cache to widgets that connect shortly after startup
             // (removed: each monitor emits its own cache; avoids startup event storm)
 
-            
             // Tray
             let mut tray_builder = TrayIconBuilder::new()
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {
-                    use tauri::tray::{TrayIconEvent, MouseButton};
+                    use tauri::tray::{MouseButton, TrayIconEvent};
                     match event {
-                        TrayIconEvent::Click { button: MouseButton::Right, .. } => {
-                            if let Some(window) = tray.app_handle().get_webview_window("tray-menu") {
+                        TrayIconEvent::Click {
+                            button: MouseButton::Right,
+                            ..
+                        } => {
+                            if let Some(window) = tray.app_handle().get_webview_window("tray-menu")
+                            {
                                 // Get cursor position to place the menu
-                                use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
                                 use windows::Win32::Foundation::POINT;
+                                use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
                                 let mut pt = POINT::default();
-                                unsafe { let _ = GetCursorPos(&mut pt); }
-                                
+                                unsafe {
+                                    let _ = GetCursorPos(&mut pt);
+                                }
+
                                 // Find the scale factor of the monitor containing the cursor position
                                 let mut scale_factor = 1.0;
                                 let mut monitor_pos = tauri::PhysicalPosition::<i32>::new(0, 0);
                                 let mut monitor_size = tauri::PhysicalSize::<u32>::new(1920, 1080);
                                 let mut found_monitor = false;
-                                
+
                                 if let Ok(monitors) = tray.app_handle().available_monitors() {
                                     for m in &monitors {
                                         let pos = m.position();
                                         let size = m.size();
                                         let x = pt.x;
                                         let y = pt.y;
-                                        if x >= pos.x && x < pos.x + size.width as i32 &&
-                                           y >= pos.y && y < pos.y + size.height as i32 {
+                                        if x >= pos.x
+                                            && x < pos.x + size.width as i32
+                                            && y >= pos.y
+                                            && y < pos.y + size.height as i32
+                                        {
                                             scale_factor = m.scale_factor();
                                             monitor_pos = *pos;
                                             monitor_size = *size;
@@ -175,7 +195,7 @@ pub fn run() {
                                             break;
                                         }
                                     }
-                                    
+
                                     // Fallback to primary monitor if cursor is outside all monitors
                                     if !found_monitor {
                                         if let Ok(Some(m)) = tray.app_handle().primary_monitor() {
@@ -200,32 +220,45 @@ pub fn run() {
 
                                 // Adjust Y so the window doesn't overflow the bottom or top of the monitor
                                 let mut y = pt.y - physical_height;
-                                if y + physical_height > monitor_pos.y + monitor_size.height as i32 {
-                                    y = monitor_pos.y + monitor_size.height as i32 - physical_height;
+                                if y + physical_height > monitor_pos.y + monitor_size.height as i32
+                                {
+                                    y = monitor_pos.y + monitor_size.height as i32
+                                        - physical_height;
                                 }
                                 if y < monitor_pos.y {
                                     y = monitor_pos.y;
                                 }
 
                                 // Apply size first so Windows/Tauri knows the dimensions before placing it
-                                let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(physical_width as u32, physical_height as u32)));
-                                
+                                let _ = window.set_size(tauri::Size::Physical(
+                                    tauri::PhysicalSize::new(
+                                        physical_width as u32,
+                                        physical_height as u32,
+                                    ),
+                                ));
+
                                 // Set position
                                 let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-                                
+
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
-                        },
-                        TrayIconEvent::Click { button: MouseButton::Left, .. } => {
-                             // Left click can also toggle or do nothing, keeping it clean
-                        },
-                        TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
+                        }
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            ..
+                        } => {
+                            // Left click can also toggle or do nothing, keeping it clean
+                        }
+                        TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        } => {
                             if let Some(window) = tray.app_handle().get_webview_window("main") {
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
-                        },
+                        }
                         _ => {}
                     }
                 });
@@ -260,7 +293,8 @@ pub fn run() {
             });
 
             // Auto-start Widgets (respecting Master Switch)
-            let app_config = config_store::read_config::<models::AppConfig>(&handle, "app_config.json");
+            let app_config =
+                config_store::read_config::<models::AppConfig>(&handle, "app_config.json");
 
             // Ensure Main Window is visible (or hidden based on config)
             if let Some(main_win) = handle.get_webview_window("main") {
@@ -271,25 +305,58 @@ pub fn run() {
                     let _ = main_win.hide();
                 }
             }
-            
+
             let handle_gpu = handle.clone();
             let handle_deadline = handle.clone();
             let handle_arxiv = handle.clone();
             let handle_quota = handle.clone();
-            
+
             tauri::async_runtime::spawn(async move {
                 let active_map = app_config.active_widgets.unwrap_or_default();
-                if app_config.gpu_enabled.unwrap_or(true) && *active_map.get("widget-gpu-default").unwrap_or(&true) {
-                    let _ = commands::create_widget_impl(handle_gpu, "widget-gpu-default".into(), "GPU Monitor".into()).await;
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+                if app_config.gpu_enabled.unwrap_or(true)
+                    && *active_map.get("widget-gpu-default").unwrap_or(&true)
+                {
+                    let _ = commands::create_widget_impl_background(
+                        handle_gpu,
+                        "widget-gpu-default".into(),
+                        "GPU Monitor".into(),
+                    )
+                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                if app_config.deadline_enabled.unwrap_or(true) && *active_map.get("widget-deadlines-default").unwrap_or(&true) {
-                    let _ = commands::create_widget_impl(handle_deadline, "widget-deadlines-default".into(), "Deadlines".into()).await;
+                if app_config.deadline_enabled.unwrap_or(true)
+                    && *active_map.get("widget-deadlines-default").unwrap_or(&true)
+                {
+                    let _ = commands::create_widget_impl_background(
+                        handle_deadline,
+                        "widget-deadlines-default".into(),
+                        "Deadlines".into(),
+                    )
+                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                if app_config.arxiv_enabled.unwrap_or(true) && *active_map.get("widget-arxiv-default").unwrap_or(&true) {
-                    let _ = commands::create_widget_impl(handle_arxiv, "widget-arxiv-default".into(), "Arxiv Radar".into()).await;
+                if app_config.arxiv_enabled.unwrap_or(true)
+                    && *active_map.get("widget-arxiv-default").unwrap_or(&true)
+                {
+                    let _ = commands::create_widget_impl_background(
+                        handle_arxiv,
+                        "widget-arxiv-default".into(),
+                        "Arxiv Radar".into(),
+                    )
+                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                if app_config.quota_enabled.unwrap_or(true) && *active_map.get("widget-quota-default").unwrap_or(&true) {
-                    let _ = commands::create_widget_impl(handle_quota, "widget-quota-default".into(), "Quota Monitor".into()).await;
+                if app_config.quota_enabled.unwrap_or(true)
+                    && *active_map.get("widget-quota-default").unwrap_or(&true)
+                {
+                    let _ = commands::create_widget_impl_background(
+                        handle_quota,
+                        "widget-quota-default".into(),
+                        "Quota Monitor".into(),
+                    )
+                    .await;
                 }
             });
 
@@ -302,12 +369,33 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() != "main" {
-                return;
-            }
-            if matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)) {
+            let label = window.label().to_string();
+            if label == "main"
+                && matches!(
+                    event,
+                    tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+                )
+            {
                 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
                 let _ = window.app_handle().save_window_state(StateFlags::all());
+                return;
+            }
+
+            if !widget_layout::is_tracked_widget(&label) {
+                return;
+            }
+
+            match event {
+                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
+                    widget_layout::schedule_layout_persist(
+                        window.app_handle().clone(),
+                        label,
+                    );
+                }
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    let _ = widget_layout::persist_layout_now(&window.app_handle(), &label);
+                }
+                _ => {}
             }
         })
         .run(tauri::generate_context!())

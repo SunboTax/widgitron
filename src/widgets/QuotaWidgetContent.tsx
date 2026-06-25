@@ -22,7 +22,6 @@ const PROVIDER_LOGOS: Record<string, string> = {
   "qoder-cn": "/icons/qoder-cn.svg",
   pioneer: "/icons/pioneer.svg",
   "claude-code": "/icons/claude-code.svg",
-  "minimax-cn": "/icons/codex.svg",
 };
 
 function renderQuotaAlert(

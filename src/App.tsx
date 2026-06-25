@@ -33,9 +33,8 @@ import {
 } from "./utils/statHints";
 import { tauriInvoke } from "./utils/tauriInvoke";
 import { tauriListen } from "./utils/tauriListen";
-import { tauriEmit } from "./utils/tauriEmit";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
-import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 import { WidgetTheme, WidgetThemeConfig } from "./types/theme";
 import { hexToRgba } from "./utils/color";
@@ -43,10 +42,9 @@ import { listenBackendServiceError } from "./utils/backendServiceError";
 import { listenQuotaMonitorStatus, type QuotaMonitorStatus } from "./utils/quotaMonitorStatus";
 import { listenServiceUpdateEvents } from "./utils/serviceUpdateEvents";
 import { listenGpuDataSync } from "./utils/gpuDataSync";
-import { isLiveDataSection, LIVE_DATA_SECTION, refetchSectionLiveData, refetchSectionLiveDataForSection, appTabLabel, LIVE_DATA_SECTION_LABELS, type AppTab } from "./utils/sectionLiveData";
+import { isLiveDataSection, LIVE_DATA_SECTION, refetchSectionLiveDataForSection, appTabLabel, LIVE_DATA_SECTION_LABELS, type AppTab } from "./utils/sectionLiveData";
 import { fetchArxivSavedPapers, fetchArxivDiscardedPapers, loadArxivArchiveLists } from "./utils/arxivArchive";
 import type { AppConfig, ArxivConfig, ArxivPaper, GpuConfig, GpuInfo, PaperConfig, PaperDeadlineInfo, QuotaBarDisplay, QuotaConfig, QuotaItem, ServerGpuData } from "./types/config";
-import type { QuotaUpdatePayload } from "./types/events";
 import type { UpdateInfo } from "./types/tauri";
 import { resolveWidgetTheme } from "./utils/widgetTheme";
 import { CACHED_LABELS, cachedLabelWhen, gpuRefreshCachedLabel, messageShowsCached } from "./utils/cachedLabels";
@@ -422,7 +420,6 @@ function App() {
     const init = async () => {
       try {
         const label = win.label;
-        console.log("Initializing window:", label);
 
         if (label === "tray-menu") {
           return;
@@ -464,28 +461,12 @@ function App() {
           return;
         }
 
-        const [
-          gc,
-          pc,
-          arc,
-          ac,
-          initialDeadlines,
-          initialGpuData,
-          initialArxiv,
-          qc,
-          initialQuotas,
-          tc,
-          autostartEnabled
-        ] = await Promise.all([
+        const [gc, pc, arc, ac, qc, tc, autostartEnabled] = await Promise.all([
           tauriInvoke("get_gpu_config"),
           tauriInvoke("get_paper_config"),
           tauriInvoke("get_arxiv_config"),
           tauriInvoke("get_app_config"),
-          refetchSectionLiveData(LIVE_DATA_SECTION.DEADLINES),
-          refetchSectionLiveData(LIVE_DATA_SECTION.GPU),
-          refetchSectionLiveData(LIVE_DATA_SECTION.ARXIV),
           tauriInvoke("get_quota_config"),
-          refetchSectionLiveData(LIVE_DATA_SECTION.QUOTA),
           tauriInvoke("get_theme_config"),
           isEnabled(),
         ]);
@@ -497,29 +478,36 @@ function App() {
         setArxivConfig(arc);
         setAppConfig(ac);
         if (ac.theme) localStorage.setItem("widgitron-theme", ac.theme);
-        setDeadlines(initialDeadlines);
-        setGpuData(initialGpuData);
-        setArxivPapers(initialArxiv);
         setQuotaConfig(qc);
-        setQuotaData(initialQuotas);
         setIsAutostart(autostartEnabled);
         setThemeConfig(tc);
+
+        const sectionSetters = {
+          [LIVE_DATA_SECTION.GPU]: setGpuData,
+          [LIVE_DATA_SECTION.DEADLINES]: setDeadlines,
+          [LIVE_DATA_SECTION.ARXIV]: setArxivPapers,
+          [LIVE_DATA_SECTION.QUOTA]: setQuotaData,
+        };
+        for (const section of [
+          LIVE_DATA_SECTION.DEADLINES,
+          LIVE_DATA_SECTION.GPU,
+          LIVE_DATA_SECTION.ARXIV,
+          LIVE_DATA_SECTION.QUOTA,
+        ] as const) {
+          refetchSectionLiveDataForSection(section, sectionSetters);
+        }
 
         if (win.label === "main") {
           const labelsFromConfig = activeWidgetLabelsFromConfig(ac);
           if (labelsFromConfig !== null) {
             setActiveWidgets(labelsFromConfig);
           } else {
-            const windows = await getAllWebviewWindows();
-            if (!active) return;
-            const initialActive = [];
-            for (const w of windows) {
-              if (w.label.startsWith("widget-") && (await w.isVisible())) {
-                initialActive.push(w.label);
-              }
-            }
-            if (!active) return;
-            setActiveWidgets(initialActive);
+            setActiveWidgets([
+              ...(ac.gpu_enabled !== false ? [serviceWidgetMeta("gpu_enabled").id] : []),
+              ...(ac.deadline_enabled !== false ? [serviceWidgetMeta("deadline_enabled").id] : []),
+              ...(ac.arxiv_enabled !== false ? [serviceWidgetMeta("arxiv_enabled").id] : []),
+              ...(ac.quota_enabled !== false ? [serviceWidgetMeta("quota_enabled").id] : []),
+            ]);
           }
 
           const uWidgetVis = await tauriListen(
@@ -812,42 +800,6 @@ function App() {
 
   const saveQuotaConfig = async (newConfig: QuotaConfig) => {
     setQuotaConfig(newConfig);
-
-    const newItems = newConfig.items || [];
-    const cachedMap = new Map(quotaData.map((q) => [q.id, q]));
-    const merged: QuotaItem[] = newItems.map((item) => {
-      const cached = cachedMap.get(item.id);
-      if (cached && cached.provider === item.provider) {
-        return {
-          ...cached,
-          name: item.name,
-          auth_mode: item.auth_mode,
-          api_key: item.api_key ?? cached.api_key,
-          api_url: item.api_url,
-          json_path: item.json_path,
-          max_quota: item.max_quota ?? cached.max_quota,
-        };
-      }
-      return {
-        ...item,
-        api_key: item.api_key ?? "",
-        current_value: null,
-        error_msg: null,
-        last_update: null,
-        account_label: null,
-        primary_name: null,
-        primary_reset: null,
-        secondary_value: null,
-        secondary_name: null,
-        secondary_reset: null,
-        bars: null,
-        plan_type: null,
-      };
-    });
-
-    setQuotaData(merged);
-    tauriEmit("quota_update", merged satisfies QuotaUpdatePayload);
-    tauriEmit("quota_config_update", newConfig);
 
     try {
       await tauriInvoke("save_quota_config", { config: newConfig });
@@ -1402,10 +1354,9 @@ function App() {
                                               appConfig.theme === "light" ? "bg-slate-200" : "bg-white/5"
                                             } h-1.5 rounded-full overflow-hidden mt-1`}
                                           >
-                                            <motion.div
-                                              initial={{ width: 0 }}
-                                              animate={{ width: `${gpu.util}%` }}
-                                              className={`h-full rounded-full ${gpu.util > 80 ? "bg-red-500" : "bg-blue-500"}`}
+                                            <div
+                                              className={`h-full rounded-full transition-[width] duration-300 ${gpu.util > 80 ? "bg-red-500" : "bg-blue-500"}`}
+                                              style={{ width: `${gpu.util}%` }}
                                             />
                                           </div>
                                         </div>
@@ -2065,7 +2016,6 @@ function App() {
                 setUpdateInfo={setUpdateInfo}
                 updateCheckError={updateCheckError}
                 setUpdateCheckError={setUpdateCheckError}
-                onActiveWidgetsChanged={onActiveWidgetsChanged}
               />
             )}
           </AnimatePresence>

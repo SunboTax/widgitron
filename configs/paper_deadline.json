@@ -7,6 +7,10 @@
     "B",
     "C"
   ],
+  "filter_by_core": [
+    "A*",
+    "A"
+  ],
   "filter_by_sub": [
     "AI",
     "CG",

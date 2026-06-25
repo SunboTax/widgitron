@@ -10,26 +10,21 @@ import type {
   PaperConfig,
   PaperDeadlineInfo,
   QuotaConfig,
-  QuotaItem,
   QuotaItemConfig,
   ServerConfig,
   ServerGpuData,
 } from "../types/config";
-import type { UpdateInfo, AntigravitySetupStatus } from "../types/tauri";
+import type { UpdateInfo } from "../types/tauri";
 import { tauriInvoke } from "../utils/tauriInvoke";
 import { tauriListen } from "../utils/tauriListen";
 import { MasterSwitch } from "../components/MasterSwitch";
-import { SettingsGeneralServiceToggleError } from "../components/SettingsRefreshError";
 import { ThemeManagementSection } from "./ThemeManagementSection";
-import { isStaleQuotaWarning } from "../utils/quotaDisplay";
 import { listenBackendServiceError } from "../utils/backendServiceError";
-import { listenQuotaMonitorStatus, type QuotaMonitorStatus } from "../utils/quotaMonitorStatus";
 import { listenServiceUpdateEvents } from "../utils/serviceUpdateEvents";
 import { listenGpuDataSync } from "../utils/gpuDataSync";
 import {
   isLiveDataSection,
   LIVE_DATA_SECTION,
-  refetchAllSectionLiveData,
   refetchSectionLiveDataForSection,
   LIVE_DATA_SECTION_LABELS,
   SETTINGS_SECTION_LABELS,
@@ -38,17 +33,10 @@ import {
 import { CACHED_LABELS, cachedLabelWhen, gpuRefreshCachedLabel } from "../utils/cachedLabels";
 import { ServiceErrorBanners } from "../components/ServiceErrorBanners";
 import {
-  buildServiceFieldToggleDeps,
-  buildServiceToggleCallbacks,
   clearLiveDataSectionErrors,
-  createMasterServiceToggleHandler,
   createSectionRefreshHandler,
-  createSetServiceBusy,
-  isServiceToggleBusy,
-  serviceToggleServiceLabel,
   serviceWidgetMeta,
   type ServiceField,
-  type ServiceToggleError,
 } from "../utils/widgetLifecycle";
 
 const PROVIDER_LOGOS: Record<string, string> = {
@@ -59,7 +47,6 @@ const PROVIDER_LOGOS: Record<string, string> = {
   "qoder-cn": "/icons/qoder-cn.svg",
   pioneer: "/icons/pioneer.svg",
   "claude-code": "/icons/claude-code.svg",
-  "minimax-cn": "/icons/codex.svg",
 };
 
 const PROVIDER_OPTIONS = [
@@ -70,9 +57,9 @@ const PROVIDER_OPTIONS = [
   { value: "qoder-cn", label: "Qoder CN" },
   { value: "pioneer", label: "Pioneer AI" },
   { value: "claude-code", label: "Claude Code" },
-  { value: "minimax-cn", label: "MiniMax CN" },
-  { value: "openai-compatible", label: "OpenAI Compatible" },
 ];
+
+const REMOVED_QUOTA_PROVIDERS = new Set(["minimax-cn", "openai-compatible"]);
 
 type AuthMode = "local" | "api_key";
 
@@ -87,7 +74,6 @@ const PROVIDER_AUTH: Record<
   "qoder-cn": { local: true, apiKey: true, defaultMode: "local" },
   pioneer: { local: false, apiKey: true, defaultMode: "api_key" },
   "claude-code": { local: true, apiKey: true, defaultMode: "local" },
-  "minimax-cn": { local: false, apiKey: true, defaultMode: "api_key" },
 };
 
 function getEffectiveAuthMode(q: { provider: string; auth_mode?: string | null }): AuthMode {
@@ -96,11 +82,19 @@ function getEffectiveAuthMode(q: { provider: string; auth_mode?: string | null }
 }
 
 function apiKeyPlaceholder(provider: string): string {
-  if (provider === "claude-code") return "sk-cp-... (MiniMax proxy token)";
+  if (provider === "claude-code") return "sk-cp-... token";
   if (provider === "qoder-cn") return "pt-... PAT (optional if signed in to Qoder CN IDE)";
   if (provider === "pioneer") return "pio-... from pioneer.ai Settings";
-  if (provider === "minimax-cn") return "MiniMax API key (Bearer token)";
   return "Your API key";
+}
+
+function stripUnsupportedQuotaProviders(config: QuotaConfig): QuotaConfig {
+  return {
+    ...config,
+    items: (config?.items || []).filter(
+      (item) => !REMOVED_QUOTA_PROVIDERS.has(item.provider)
+    ),
+  };
 }
 
 function AuthModeSwitch({
@@ -159,7 +153,7 @@ function AuthModeSwitch({
 
 function QuotaItemCard({
   q, appConfig, openProviderId,
-  onToggleProvider, onRemove, onUpdateField, onSave, localQuota, liveItem,
+  onToggleProvider, onRemove, onUpdateField, onSave, localQuota,
 }: {
   q: QuotaItemConfig;
   appConfig: AppConfig;
@@ -174,7 +168,6 @@ function QuotaItemCard({
   ) => void;
   onSave: (config: QuotaConfig) => void;
   localQuota: QuotaConfig;
-  liveItem?: QuotaItem;
 }) {
   const controls = useDragControls();
   const isOpen = openProviderId === q.id;
@@ -182,39 +175,6 @@ function QuotaItemCard({
   const authCaps = PROVIDER_AUTH[q.provider] ?? { local: true, apiKey: true, defaultMode: "local" as AuthMode };
   const authMode = getEffectiveAuthMode(q);
   const isCustomProvider = !PROVIDER_AUTH[q.provider];
-  const isAntigravity = q.provider === "antigravity";
-  const [agStatus, setAgStatus] = useState<AntigravitySetupStatus | null>(null);
-
-  useEffect(() => {
-    if (!isAntigravity) {
-      setAgStatus(null);
-      return;
-    }
-    let active = true;
-    const refresh = () => {
-      tauriInvoke("get_antigravity_setup_status")
-        .then((status) => {
-          if (active) setAgStatus(status);
-        })
-        .catch(() => {
-          if (active) setAgStatus(null);
-        });
-    };
-    refresh();
-    const interval = window.setInterval(refresh, 15000);
-    return () => {
-      active = false;
-      window.clearInterval(interval);
-    };
-  }, [isAntigravity]);
-
-  const agReady =
-    agStatus?.language_server_running ||
-    (agStatus?.has_oauth_tokens && agStatus?.cloud_auth_ready);
-
-  const liveError = liveItem?.error_msg ?? undefined;
-  const liveStale = isStaleQuotaWarning(liveError);
-  const showLiveStatus = q.provider !== "manual" && (liveError || liveItem?.last_update);
 
   return (
     <Reorder.Item
@@ -317,7 +277,7 @@ function QuotaItemCard({
           </div>
         </div>
       )}
-      {isAntigravity && (
+      {/*
         <div className="px-4 pb-4">
           <div
             className={`rounded-xl border px-3 py-2.5 text-[10px] leading-relaxed ${
@@ -378,18 +338,9 @@ function QuotaItemCard({
             )}
           </div>
         </div>
-      )}
+      */}
       {isCustomProvider && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 px-4 pb-4">
-          {q.provider === "openai-compatible" && (
-            <div className={`md:col-span-3 rounded-xl border px-3 py-2 text-[10px] leading-relaxed ${
-              appConfig.theme === "light"
-                ? "bg-slate-50 border-slate-200 text-slate-600"
-                : "bg-white/5 border-white/10 text-slate-400"
-            }`}>
-              Point at any OpenAI-style usage endpoint. Set JSON Path to the dot-separated field that holds the remaining quota value (e.g. <code className="font-mono">data.remaining</code>).
-            </div>
-          )}
           <div className="space-y-1.5 md:col-span-2">
             <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">API URL</label>
             <input type="text" value={q.api_url || ""} onChange={(e) => onUpdateField(q.id, "api_url", e.target.value)} onBlur={() => onSave(localQuota)}
@@ -413,7 +364,7 @@ function QuotaItemCard({
           </div>
         </div>
       )}
-      {showLiveStatus && (
+      {/*
         <div className="px-4 pb-4">
           {liveError ? (
             <div
@@ -441,7 +392,7 @@ function QuotaItemCard({
             </div>
           )}
         </div>
-      )}
+      */}
     </Reorder.Item>
   );
 }
@@ -601,7 +552,6 @@ interface SettingsPanelProps {
   setUpdateInfo: (info: UpdateInfo | null) => void;
   updateCheckError?: string | null;
   setUpdateCheckError?: (err: string | null) => void;
-  onActiveWidgetsChanged?: (labels: string[]) => void;
 }
 
 export function SettingsPanel({
@@ -624,12 +574,13 @@ export function SettingsPanel({
   setUpdateInfo,
   updateCheckError,
   setUpdateCheckError,
-  onActiveWidgetsChanged,
 }: SettingsPanelProps) {
   const [localGpu, setLocalGpu] = useState<GpuConfig>(() => sanitizeGpuConfig(gpuConfig));
   const [localPaper, setLocalPaper] = useState<PaperConfig>(paperConfig);
   const [localArxiv, setLocalArxiv] = useState<ArxivConfig>(arxivConfig);
-  const [localQuota, setLocalQuota] = useState<QuotaConfig>(quotaConfig);
+  const [localQuota, setLocalQuota] = useState<QuotaConfig>(() =>
+    stripUnsupportedQuotaProviders(quotaConfig)
+  );
   const [activeSection, setActiveSection] = useState<SettingsSection>("general");
   const [openProviderId, setOpenProviderId] = useState<string | null>(null);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
@@ -637,14 +588,9 @@ export function SettingsPanel({
   const [downloadState, setDownloadState] = useState<"idle" | "downloading" | "completed" | "error">("idle");
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [configDirPath, setConfigDirPath] = useState("");
-  const [quotaMonitorStatus, setQuotaMonitorStatus] = useState<QuotaMonitorStatus | null>(null);
-  const [quotaBackendError, setQuotaBackendError] = useState<string | null>(null);
-  const [liveQuotaItems, setLiveQuotaItems] = useState<QuotaItem[]>([]);
   const [liveDeadlines, setLiveDeadlines] = useState<PaperDeadlineInfo[]>([]);
   const [liveArxivPapers, setLiveArxivPapers] = useState<ArxivPaper[]>([]);
   const [liveGpuData, setLiveGpuData] = useState<ServerGpuData[]>([]);
-  const [isRefreshingQuotaAll, setIsRefreshingQuotaAll] = useState(false);
-  const [quotaRefreshError, setQuotaRefreshError] = useState<string | null>(null);
   const [isRefreshingGpu, setIsRefreshingGpu] = useState(false);
   const [isRefreshingDeadlines, setIsRefreshingDeadlines] = useState(false);
   const [isRefreshingArxiv, setIsRefreshingArxiv] = useState(false);
@@ -653,22 +599,12 @@ export function SettingsPanel({
   const [paperBackendError, setPaperBackendError] = useState<string | null>(null);
   const [arxivRefreshError, setArxivRefreshError] = useState<string | null>(null);
   const [arxivBackendError, setArxivBackendError] = useState<string | null>(null);
-  const [generalServiceRefreshError, setGeneralServiceRefreshError] = useState<ServiceToggleError | null>(null);
-  const [generalServiceErrorDismissed, setGeneralServiceErrorDismissed] = useState(false);
   const prevActiveSectionRef = useRef(activeSection);
-  const [serviceToggleBusy, setServiceToggleBusy] = useState<Partial<Record<ServiceField, boolean>>>({});
   const [corruptConfigFiles, setCorruptConfigFiles] = useState<string[]>([]);
 
   useEffect(() => {
     const prevSection = prevActiveSectionRef.current;
     if (prevSection !== activeSection) {
-      if (
-        generalServiceErrorDismissed &&
-        generalServiceRefreshError &&
-        prevSection === "general"
-      ) {
-        setGeneralServiceRefreshError(null);
-      }
       if (isLiveDataSection(prevSection)) {
         clearLiveDataSectionErrors(prevSection, {
           gpu: { clearRefresh: () => setGpuRefreshError(null) },
@@ -680,13 +616,8 @@ export function SettingsPanel({
             clearRefresh: () => setArxivRefreshError(null),
             clearBackend: () => setArxivBackendError(null),
           },
-          quota: {
-            clearRefresh: () => setQuotaRefreshError(null),
-            clearBackend: () => setQuotaBackendError(null),
-          },
         });
       }
-      setGeneralServiceErrorDismissed(false);
       prevActiveSectionRef.current = activeSection;
 
       if (isLiveDataSection(activeSection)) {
@@ -694,31 +625,30 @@ export function SettingsPanel({
           [LIVE_DATA_SECTION.GPU]: setLiveGpuData,
           [LIVE_DATA_SECTION.DEADLINES]: setLiveDeadlines,
           [LIVE_DATA_SECTION.ARXIV]: setLiveArxivPapers,
-          [LIVE_DATA_SECTION.QUOTA]: setLiveQuotaItems,
         };
         refetchSectionLiveDataForSection(activeSection, setters);
       }
     }
-  }, [activeSection, generalServiceErrorDismissed, generalServiceRefreshError]);
+  }, [activeSection]);
 
   useEffect(() => {
     let active = true;
     const unsubs: (() => void)[] = [];
 
-    refetchAllSectionLiveData({
-      [LIVE_DATA_SECTION.GPU]: (data) => {
-        if (active) setLiveGpuData(data);
-      },
-      [LIVE_DATA_SECTION.DEADLINES]: (data) => {
-        if (active) setLiveDeadlines(data);
-      },
-      [LIVE_DATA_SECTION.ARXIV]: (data) => {
-        if (active) setLiveArxivPapers(data);
-      },
-      [LIVE_DATA_SECTION.QUOTA]: (data) => {
-        if (active) setLiveQuotaItems(data);
-      },
-    });
+    if (isLiveDataSection(activeSection)) {
+      const setters = {
+        [LIVE_DATA_SECTION.GPU]: (data: ServerGpuData[]) => {
+          if (active) setLiveGpuData(data);
+        },
+        [LIVE_DATA_SECTION.DEADLINES]: (data: PaperDeadlineInfo[]) => {
+          if (active) setLiveDeadlines(data);
+        },
+        [LIVE_DATA_SECTION.ARXIV]: (data: ArxivPaper[]) => {
+          if (active) setLiveArxivPapers(data);
+        },
+      };
+      refetchSectionLiveDataForSection(activeSection, setters);
+    }
 
     const setup = async () => {
       const u1 = await listenServiceUpdateEvents(
@@ -733,16 +663,11 @@ export function SettingsPanel({
             clearRefresh: () => setArxivRefreshError(null),
             clearBackend: () => setArxivBackendError(null),
           },
-          quota: {
-            clearRefresh: () => setQuotaRefreshError(null),
-            clearBackend: () => setQuotaBackendError(null),
-          },
         },
         {
           gpuSetter: setLiveGpuData,
           paperSetter: setLiveDeadlines,
           arxivSetter: setLiveArxivPapers,
-          quotaSetter: setLiveQuotaItems,
         }
       );
       unsubs.push(u1);
@@ -760,13 +685,6 @@ export function SettingsPanel({
         () => active
       );
       unsubs.push(u1f);
-
-      const u2 = await listenQuotaMonitorStatus(
-        setQuotaMonitorStatus,
-        setQuotaBackendError,
-        () => active
-      );
-      unsubs.push(u2);
 
       const u3 = await listenGpuDataSync(setLiveGpuData, () => active);
       unsubs.push(u3);
@@ -871,9 +789,10 @@ export function SettingsPanel({
   useEffect(() => {
     if (quotaConfig !== initialQuotaRef.current) {
       if (!quotaInitialized.current) {
+        const sanitized = stripUnsupportedQuotaProviders(quotaConfig);
         const normalized: QuotaConfig = {
-          ...quotaConfig,
-          items: (quotaConfig?.items || []).map((item) => ({
+          ...sanitized,
+          items: (sanitized?.items || []).map((item) => ({
             ...item,
             auth_mode:
               item.auth_mode ??
@@ -981,18 +900,15 @@ export function SettingsPanel({
     if (field === "provider" && typeof val === "string") {
       const found = PROVIDER_OPTIONS.find((p) => p.value === val);
       if (found) {
-        const isOpenAiCompatible = val === "openai-compatible";
         updatedItem = {
           ...updatedItem,
           name: found.label,
-          auth_mode: isOpenAiCompatible
-            ? "api_key"
-            : PROVIDER_AUTH[val]?.defaultMode ?? "local",
+          auth_mode: PROVIDER_AUTH[val]?.defaultMode ?? "local",
           api_key: "",
-          api_url: isOpenAiCompatible ? "" : "",
-          json_path: isOpenAiCompatible ? "" : "",
+          api_url: "",
+          json_path: "",
           max_quota: updatedItem.max_quota || 100,
-          unit: updatedItem.unit || (isOpenAiCompatible ? "tokens" : "%"),
+          unit: updatedItem.unit || "%",
         };
       }
     }
@@ -1049,65 +965,6 @@ export function SettingsPanel({
     onSuccess: (data) => setLiveArxivPapers(data),
     logLabel: "Arxiv refresh failed",
   });
-
-  const setServiceBusy = createSetServiceBusy(setServiceToggleBusy);
-
-  const serviceToggleCallbacks = buildServiceToggleCallbacks({
-    setServiceBusy,
-    onGeneralServiceError: setGeneralServiceRefreshError,
-    fields: {
-      gpu_enabled: buildServiceFieldToggleDeps(
-        () => setGpuRefreshError(null),
-        setGpuRefreshError
-      ),
-      deadline_enabled: buildServiceFieldToggleDeps(
-        () => setDeadlinesRefreshError(null),
-        setDeadlinesRefreshError
-      ),
-      arxiv_enabled: buildServiceFieldToggleDeps(
-        () => setArxivRefreshError(null),
-        setArxivRefreshError
-      ),
-      quota_enabled: buildServiceFieldToggleDeps(
-        () => setQuotaRefreshError(null),
-        setQuotaRefreshError,
-        setLiveQuotaItems
-      ),
-    },
-  });
-
-  const checkServiceToggleBusy = (field: ServiceField) =>
-    isServiceToggleBusy(field, serviceToggleBusy);
-
-  const handleMasterServiceToggle = createMasterServiceToggleHandler({
-    appConfig,
-    onSaveApp,
-    onActiveWidgetsChanged,
-    serviceToggleCallbacks,
-    onClearGeneralError: () => setGeneralServiceRefreshError(null),
-  });
-
-  const renderServiceToggle = (
-    label: string,
-    description: string,
-    field: "gpu_enabled" | "deadline_enabled" | "arxiv_enabled" | "quota_enabled"
-  ) => (
-    <div className="border-t border-[var(--dashboard-border)] pt-6 flex items-center justify-between gap-4">
-      <div className="space-y-1">
-        <div className={`text-xs font-bold ${appConfig.theme === "light" ? "text-slate-900" : "text-white"}`}>
-          {label}
-        </div>
-        <p className="text-[10px] text-slate-400">{description}</p>
-      </div>
-      <MasterSwitch
-        enabled={appConfig[field] !== false}
-        loading={checkServiceToggleBusy(field)}
-        disabled={checkServiceToggleBusy(field)}
-        onToggle={(val) => handleMasterServiceToggle(field, val)}
-      />
-    </div>
-  );
-
 
   const renderGeneralSection = () => (
     <section className="space-y-6">
@@ -1195,35 +1052,6 @@ export function SettingsPanel({
             {appConfig.hide_on_startup ? "Yes" : "No"}
           </button>
         </div>
-
-        {renderServiceToggle(
-          serviceToggleServiceLabel("gpu_enabled"),
-          "Enable background GPU polling and allow the GPU widget to run.",
-          "gpu_enabled"
-        )}
-        {renderServiceToggle(
-          serviceToggleServiceLabel("deadline_enabled"),
-          "Enable deadline tracking and allow the deadlines widget to run.",
-          "deadline_enabled"
-        )}
-        {renderServiceToggle(
-          serviceToggleServiceLabel("arxiv_enabled"),
-          "Enable arXiv paper fetching and allow the arXiv widget to run.",
-          "arxiv_enabled"
-        )}
-        {renderServiceToggle(
-          serviceToggleServiceLabel("quota_enabled"),
-          "Enable quota polling and allow the quota widget to run.",
-          "quota_enabled"
-        )}
-
-        <SettingsGeneralServiceToggleError
-          activeSection={activeSection}
-          error={generalServiceRefreshError}
-          theme={appConfig.theme}
-          dismissed={generalServiceErrorDismissed}
-          onDismiss={() => setGeneralServiceErrorDismissed(true)}
-        />
 
         <div className="border-t border-[var(--dashboard-border)] pt-6 flex items-center justify-between">
           <div className="space-y-1">
@@ -1687,91 +1515,23 @@ export function SettingsPanel({
   );
 
   const renderQuotaSection = () => {
-    const configuredAutoQuotaIds = new Set(
-      (localQuota?.items || [])
-        .filter((item) => item.provider !== "manual")
-        .map((item) => item.id)
-    );
-    const visibleLiveQuota = liveQuotaItems.filter((q) => configuredAutoQuotaIds.has(q.id));
-    const autoQuotaHardFailAll =
-      configuredAutoQuotaIds.size > 0 &&
-      visibleLiveQuota.length >= configuredAutoQuotaIds.size &&
-      visibleLiveQuota.every(
-        (q) => q.error_msg && !isStaleQuotaWarning(q.error_msg)
-      );
-    const showQuotaHealthWarning = quotaMonitorStatus?.all_hard_failed || autoQuotaHardFailAll;
-
-    const handleRefreshAllQuota = createSectionRefreshHandler({
-      isRefreshing: isRefreshingQuotaAll,
-      setIsRefreshing: setIsRefreshingQuotaAll,
-      clearError: () => setQuotaRefreshError(null),
-      setError: setQuotaRefreshError,
-      section: LIVE_DATA_SECTION.QUOTA,
-      onSuccess: (refreshed) => setLiveQuotaItems(refreshed),
-      logLabel: "Quota refresh all failed",
-    });
-
     return (
     <section className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className={`text-xs font-black uppercase tracking-wider ${appConfig.theme === "light" ? "text-slate-500" : "text-slate-400"}`}>
           {LIVE_DATA_SECTION_LABELS.quota}
         </h2>
-        <div className="flex items-center gap-3">
-          <button
-            onClick={handleRefreshAllQuota}
-            disabled={isRefreshingQuotaAll}
-            className={`flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
-              appConfig.theme === "light"
-                ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300 disabled:opacity-50"
-                : "bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border-white/5 disabled:opacity-50"
-            }`}
-            title="Refresh all quota providers"
-          >
-            <RefreshCw size={12} className={isRefreshingQuotaAll ? "animate-spin" : ""} />
-            Refresh All
-          </button>
-          <button
-            onClick={() => handleRestorePosition("quota_enabled")}
-            className={`flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
-              appConfig.theme === "light"
-                ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300"
-                : "bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border-white/5"
-            }`}
-          >
-            <RotateCcw size={12} /> Restore Position
-          </button>
-        </div>
-      </div>
-      <ServiceErrorBanners
-        backendError={quotaBackendError}
-        refreshError={quotaRefreshError}
-        onDismissBackend={() => setQuotaBackendError(null)}
-        onDismissRefresh={() => setQuotaRefreshError(null)}
-        theme={appConfig.theme}
-        showBackend={appConfig.quota_enabled !== false}
-        backendCachedLabel={cachedLabelWhen(
-          visibleLiveQuota.length > 0,
-          CACHED_LABELS.quota.backend
-        )}
-        refreshCachedLabel={cachedLabelWhen(
-          visibleLiveQuota.length > 0,
-          CACHED_LABELS.quota.refresh
-        )}
-      />
-      {showQuotaHealthWarning && (
-        <div
-          className={`rounded-xl border px-4 py-3 text-[10px] leading-relaxed ${
+        <button
+          onClick={() => handleRestorePosition("quota_enabled")}
+          className={`flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${
             appConfig.theme === "light"
-              ? "bg-amber-50 border-amber-200 text-amber-900"
-              : "bg-amber-500/10 border-amber-500/20 text-amber-300/90"
+              ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:border-slate-300"
+              : "bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border-white/5"
           }`}
         >
-          {quotaMonitorStatus?.all_hard_failed
-            ? `All quota providers failed. Monitor is backing off (${quotaMonitorStatus.backoff_secs}s). Check API keys, local IDE login, or network.`
-            : "All configured quota providers returned errors. Verify credentials and provider setup below."}
-        </div>
-      )}
+          <RotateCcw size={12} /> Restore Position
+        </button>
+      </div>
       <div className="space-y-6">
         {/* Show Account Name Toggle */}
         <div className={`p-4 border border-[var(--dashboard-border)] rounded-2xl flex items-center justify-between ${
@@ -1839,7 +1599,6 @@ export function SettingsPanel({
               onUpdateField={updateQuotaItem}
               onSave={onSaveQuota}
               localQuota={localQuota}
-              liveItem={liveQuotaItems.find((item) => item.id === q.id)}
             />
           ))}
         </Reorder.Group>

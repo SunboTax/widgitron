@@ -49,10 +49,10 @@ impl Default for PaperConfig {
             update_interval: Some(3600),
             max_deadlines: Some(50),
             show_past_deadlines: Some(false),
-            filter_by_rank: None,
+            filter_by_rank: Some(vec!["A".into(), "B".into(), "C".into()]),
             filter_by_sub: None,
             pinned_titles: None,
-            filter_by_core: None,
+            filter_by_core: Some(vec!["A*".into(), "A".into()]),
         }
     }
 }
@@ -152,7 +152,7 @@ pub struct QuotaItem {
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_label: Option<String>,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,48 +188,13 @@ pub struct QuotaConfig {
 impl Default for QuotaConfig {
     fn default() -> Self {
         Self {
-            items: vec![
-                QuotaItem {
-                    id: "antigravity".into(),
-                    name: "Antigravity".into(),
-                    provider: "antigravity".into(),
-                    api_key: "".into(),
-                    api_url: None,
-                    json_path: None,
-                    max_quota: Some(100.0),
-                    unit: Some("Credits".into()),
-                    ..Default::default()
-                },
-                QuotaItem {
-                    id: "cursor".into(),
-                    name: "Cursor".into(),
-                    provider: "cursor".into(),
-                    api_key: "".into(),
-                    api_url: None,
-                    json_path: None,
-                    max_quota: Some(100.0),
-                    unit: Some("%".into()),
-                    ..Default::default()
-                },
-                QuotaItem {
-                    id: "copilot".into(),
-                    name: "Copilot".into(),
-                    provider: "copilot".into(),
-                    api_key: "".into(),
-                    api_url: None,
-                    json_path: None,
-                    max_quota: Some(100.0),
-                    unit: Some("%".into()),
-                    ..Default::default()
-                },
-            ],
+            items: vec![],
             update_interval: Some(300),
             show_account_name: Some(false),
             show_plan_type: Some(true),
         }
     }
 }
-
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ColorConfig {
@@ -548,8 +513,14 @@ impl Default for WidgetThemeConfig {
             "widget-deadlines-default".into(),
             "theme-deadline-transparent".into(),
         );
-        assignments.insert("widget-arxiv-default".into(), "theme-arxiv-transparent".into());
-        assignments.insert("widget-quota-default".into(), "theme-quota-transparent".into());
+        assignments.insert(
+            "widget-arxiv-default".into(),
+            "theme-arxiv-transparent".into(),
+        );
+        assignments.insert(
+            "widget-quota-default".into(),
+            "theme-quota-transparent".into(),
+        );
 
         Self {
             themes: vec![
@@ -568,7 +539,7 @@ impl Default for WidgetThemeConfig {
 }
 
 // --- Payload Models ---
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct GpuInfo {
     pub name: String,
     pub mem_used: f32,
@@ -580,7 +551,7 @@ pub struct GpuInfo {
     pub node: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct SlurmStep {
     pub id: String,
     pub name: String,
@@ -588,7 +559,7 @@ pub struct SlurmStep {
     pub command: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ServerGpuData {
     pub host: String,
     pub is_online: bool,
@@ -599,7 +570,6 @@ pub struct ServerGpuData {
     pub slurm_nodelists: Option<HashMap<String, String>>,
     pub slurm_times: Option<HashMap<String, String>>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PaperDeadlineInfo {
@@ -646,6 +616,7 @@ pub struct YamlConfItem {
 pub struct GlobalState {
     pub deadlines: Arc<std::sync::Mutex<Vec<PaperDeadlineInfo>>>,
     pub gpu_data: Arc<std::sync::Mutex<HashMap<String, ServerGpuData>>>,
+    pub gpu_last_emitted: Arc<std::sync::Mutex<HashMap<String, ServerGpuData>>>,
     pub last_yaml: Arc<std::sync::Mutex<Option<String>>>,
     pub active_monitors: Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub active_workers: Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,

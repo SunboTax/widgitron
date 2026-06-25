@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { Cpu, Activity, RefreshCw } from "lucide-react";
-import { motion } from "framer-motion";
 import { useWidgetTheme } from "../hooks/useWidgetTheme";
 import { hexToRgba } from "../utils/color";
 import { orderGpuServersByConfig, sortGpuJobGroups } from "../utils/gpuDisplay";
@@ -76,24 +75,39 @@ export function GPUWidgetContent() {
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [serviceEnabled, setServiceEnabled] = useState(true);
   const [dashboardTheme, setDashboardTheme] = useState<"light" | "dark">("dark");
+  const hasTrackedDurations = serverData.some(
+    (server) =>
+      Object.keys(server.slurm_times || {}).length > 0 ||
+      Object.values(server.slurm_steps || {}).some((steps) => steps.length > 0)
+  );
 
   useEffect(() => {
+    if (!hasTrackedDurations) return;
     const timer = setInterval(() => {
       setDurations((prev) => {
+        const keys = Object.keys(prev);
+        if (keys.length === 0) return prev;
         const next = { ...prev };
-        Object.keys(next).forEach((key) => {
+        keys.forEach((key) => {
           next[key] = next[key] + 1;
         });
         return next;
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [hasTrackedDurations]);
 
   useEffect(() => {
     setDurations((prev) => {
-      const next = { ...prev };
+      let next = prev;
+      let changed = false;
       const visibleJobs = new Set<string>();
+      const ensureNext = () => {
+        if (next === prev) {
+          next = { ...prev };
+        }
+        return next;
+      };
 
       // 1. Gather all visible job IDs and step IDs
       serverData.forEach((server) => {
@@ -118,7 +132,8 @@ export function GPUWidgetContent() {
             const backendSecs = parseSlurmTime(timeStr);
             const currentSecs = next[jobId];
             if (currentSecs === undefined || backendSecs > currentSecs || backendSecs < currentSecs - 45) {
-              next[jobId] = backendSecs;
+              ensureNext()[jobId] = backendSecs;
+              changed = true;
             }
           });
         }
@@ -128,7 +143,8 @@ export function GPUWidgetContent() {
               const backendSecs = parseSlurmTime(step.time);
               const currentSecs = next[step.id];
               if (currentSecs === undefined || backendSecs > currentSecs || backendSecs < currentSecs - 45) {
-                next[step.id] = backendSecs;
+                ensureNext()[step.id] = backendSecs;
+                changed = true;
               }
             });
           });
@@ -138,11 +154,12 @@ export function GPUWidgetContent() {
       // 3. Clean up keys that are no longer visible
       Object.keys(next).forEach((key) => {
         if (!visibleJobs.has(key)) {
-          delete next[key];
+          delete ensureNext()[key];
+          changed = true;
         }
       });
 
-      return next;
+      return changed ? next : prev;
     });
   }, [serverData]);
 
@@ -417,12 +434,9 @@ export function GPUWidgetContent() {
                                     title={`GPU #${i}: ${gpu.util}% (${gpu.name})`}
                                   >
                                     {/* Progress Background Overlay */}
-                                    <motion.div
-                                      initial={{ width: 0 }}
-                                      animate={{ width: `${gpu.util}%` }}
-                                      transition={{ duration: 0.3 }}
-                                      className="absolute left-0 top-0 bottom-0 z-0 pointer-events-none opacity-20"
-                                      style={{ backgroundColor: usageColor }}
+                                    <div
+                                      className="absolute left-0 top-0 bottom-0 z-0 pointer-events-none opacity-20 transition-[width] duration-300"
+                                      style={{ width: `${gpu.util}%`, backgroundColor: usageColor }}
                                     />
                                     {/* Text Overlay */}
                                     <div className="relative z-10 flex flex-col items-center justify-center text-center leading-normal">
@@ -447,11 +461,9 @@ export function GPUWidgetContent() {
                                     <span style={{ color: usageColor }}>{gpu.util}%</span>
                                   </div>
                                   <div className="h-1 w-full bg-black/40 rounded-full overflow-hidden">
-                                    <motion.div
-                                      initial={{ width: 0 }}
-                                      animate={{ width: `${gpu.util}%` }}
-                                      className="h-full rounded-full"
-                                      style={{ backgroundColor: usageColor }}
+                                    <div
+                                      className="h-full rounded-full transition-[width] duration-300"
+                                      style={{ width: `${gpu.util}%`, backgroundColor: usageColor }}
                                     />
                                   </div>
                                   <div

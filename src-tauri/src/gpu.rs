@@ -1,18 +1,18 @@
+use chrono::Utc;
+use ssh2::Session;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
-use ssh2::Session;
-use chrono::Utc;
 use tauri::{AppHandle, Emitter};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use crate::models::{ServerConfig, GpuConfig, AppConfig, GpuInfo, ServerGpuData, GlobalState};
 use crate::config_store;
+use crate::models::{AppConfig, GlobalState, GpuConfig, GpuInfo, ServerConfig, ServerGpuData};
 
 const GPU_CACHE_FILE: &str = "gpu_data_cache.json";
 
@@ -51,6 +51,54 @@ pub fn persist_gpu_data_cache(app: &AppHandle, state: &GlobalState) {
     }
 }
 
+fn gpu_update_payload_changed(previous: Option<&ServerGpuData>, next: &ServerGpuData) -> bool {
+    match previous {
+        Some(prev) => {
+            prev.host != next.host
+                || prev.is_online != next.is_online
+                || prev.gpu_list != next.gpu_list
+                || prev.error != next.error
+                || prev.slurm_steps != next.slurm_steps
+                || prev.slurm_nodelists != next.slurm_nodelists
+                || prev.slurm_times != next.slurm_times
+        }
+        None => true,
+    }
+}
+
+pub fn emit_gpu_update_if_changed(app: &AppHandle, state: &GlobalState, next: &ServerGpuData) {
+    let should_emit = match state.gpu_last_emitted.lock() {
+        Ok(mut emitted) => {
+            if gpu_update_payload_changed(emitted.get(&next.host), next) {
+                emitted.insert(next.host.clone(), next.clone());
+                true
+            } else {
+                false
+            }
+        }
+        Err(e) => {
+            log::warn!("gpu_last_emitted lock poisoned: {}", e);
+            true
+        }
+    };
+
+    if should_emit {
+        let _ = app.emit("gpu_update", next.clone());
+    }
+}
+
+pub fn clear_gpu_emit_cache(state: &GlobalState) {
+    if let Ok(mut emitted) = state.gpu_last_emitted.lock() {
+        emitted.clear();
+    }
+}
+
+pub fn clear_gpu_emit_cache_for_host(state: &GlobalState, host: &str) {
+    if let Ok(mut emitted) = state.gpu_last_emitted.lock() {
+        emitted.remove(host);
+    }
+}
+
 fn gpu_server_fingerprint(server: &ServerConfig) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     server.host.hash(&mut hasher);
@@ -69,12 +117,11 @@ pub fn parse_nvidia_smi_output(output: &str) -> Vec<GpuInfo> {
         let mut node_id = None;
         let mut content = line;
 
-        // Handle Slurm --label output: "0: name, used, ..."
-        if line.contains(": ") {
-            let parts: Vec<&str> = line.splitn(2, ": ").collect();
-            if parts.len() == 2 && parts[0].chars().all(|c| c.is_numeric()) {
-                node_id = Some(parts[0].trim().to_string());
-                content = parts[1];
+        // Handle Slurm-prefixed output: "node-a01: name, used, ..."
+        if let Some((prefix, rest)) = line.split_once(": ") {
+            if !prefix.trim().is_empty() {
+                node_id = Some(prefix.trim().to_string());
+                content = rest;
             }
         }
 
@@ -97,24 +144,26 @@ pub fn parse_nvidia_smi_output(output: &str) -> Vec<GpuInfo> {
 
 pub fn ssh_authenticate(sess: &mut Session, s: &ServerConfig) -> Result<(), String> {
     let user = s.user.as_deref().unwrap_or("root");
-    
+
     // 1. Try custom key file if provided and not empty
     if let Some(key_path) = &s.key_file {
         if !key_path.trim().is_empty() {
             let expanded = shellexpand::tilde(key_path).to_string();
-            return sess.userauth_pubkey_file(user, None, std::path::Path::new(&expanded), None)
+            return sess
+                .userauth_pubkey_file(user, None, std::path::Path::new(&expanded), None)
                 .map_err(|e| format!("Key auth failed for custom key '{}': {}", key_path, e));
         }
     }
-    
+
     // 2. Try password auth if password is provided and not empty
     if let Some(pass) = &s.password {
         if !pass.is_empty() {
-            return sess.userauth_password(user, pass)
+            return sess
+                .userauth_password(user, pass)
                 .map_err(|e| format!("Password auth failed: {}", e));
         }
     }
-    
+
     // 3. Fallback to default keys and SSH agent
     let default_keys = [
         "~/.ssh/id_ed25519",
@@ -231,7 +280,7 @@ pub fn start_ssh_monitor_task(
     state: Arc<GlobalState>,
     server: ServerConfig,
     jid: Option<String>,
-    node_count: Option<String>,
+    target_node: Option<String>,
     interval: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -241,11 +290,11 @@ pub fn start_ssh_monitor_task(
             let state_inner = state.clone();
             let s_m = server.clone();
             let j_m = jid.clone();
-            let n_m = node_count.clone();
-            
+            let node_m = target_node.clone();
+
             let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
                 let my_key = match &j_m {
-                    Some(id) => format!("{}:{}:{}", s_m.host, id, n_m.as_deref().unwrap_or("1")),
+                    Some(id) => format!("{}:{}:{}", s_m.host, id, node_m.as_deref().unwrap_or("job")),
                     None => format!("{}:node:0", s_m.host),
                 };
                 let timeout_secs = (interval * 3).max(15) + 10;
@@ -253,33 +302,50 @@ pub fn start_ssh_monitor_task(
                     &s_m,
                     Duration::from_secs(timeout_secs),
                 )?;
-                
+
                 let mut channel = sess.channel_session().map_err(|e| format!("Channel open failed: {}", e))?;
                 let watch_cmd = match &j_m {
                     Some(id) => {
-                        let n_arg = match &n_m {
-                            Some(n) => format!("-n {} --ntasks-per-node=1", n),
-                            None => "--ntasks-per-node=1".to_string(),
+                        let node_arg = match &node_m {
+                            Some(node) => format!("-N 1 -n 1 -w {}", node),
+                            None => "-n 1".to_string(),
                         };
-                        format!("srun --jobid {} --overlap {} --label --job-name=widgitron-gpu sh -c 'while true; do {} || exit; echo \"END_BATCH\" || exit; sleep {}; done'", id, n_arg, smi_cmd, interval)
+                        format!(
+                            "srun --jobid {} --overlap {} --job-name=widgitron-gpu sh -c 'node=$(hostname -s 2>/dev/null || hostname); while true; do {} | sed \"s/^/${{node}}: /\" || exit; echo \"${{node}}: END_BATCH\" || exit; sleep {}; done'",
+                            id,
+                            node_arg,
+                            smi_cmd,
+                            interval
+                        )
                     },
                     None => format!("sh -c 'while true; do {} || exit; echo \"END_BATCH\" || exit; sleep {}; done'", smi_cmd, interval),
                 };
-                
+
+                log::debug!(
+                    "Launching GPU watch on host {} job {:?} node {:?}",
+                    s_m.host,
+                    j_m,
+                    node_m
+                );
+
                 channel.exec(&watch_cmd).map_err(|e| format!("Command exec failed: {}", e))?;
-                
+
                 let mut task_batches: HashMap<String, String> = HashMap::new();
                 let reader = std::io::BufReader::new(channel);
                 use std::io::BufRead;
                 for line in reader.lines() {
                     let l = line.map_err(|e| format!("Read line error: {}", e))?;
-                    // Identify task ID from Slurm --label prefix (e.g., "0: ...")
-                    let task_id = if l.contains(": ") {
-                        let parts: Vec<&str> = l.splitn(2, ": ").collect();
-                        if parts.len() == 2 && parts[0].trim().chars().all(|c| c.is_numeric()) {
-                            parts[0].trim().to_string()
-                        } else { "default".to_string() }
-                    } else { "default".to_string() };
+                    // Identify Slurm node prefix (e.g., "node-a01: ...")
+                    let task_id = if let Some((prefix, _)) = l.split_once(": ") {
+                        let prefix = prefix.trim();
+                        if !prefix.is_empty() {
+                            prefix.to_string()
+                        } else {
+                            "default".to_string()
+                        }
+                    } else {
+                        "default".to_string()
+                    };
 
                     if l.contains("END_BATCH") {
                         let app_config = config_store::read_config::<AppConfig>(&app_inner, "app_config.json");
@@ -301,8 +367,20 @@ pub fn start_ssh_monitor_task(
                         let batch = task_batches.entry(task_id.clone()).or_default();
                         let mut parsed = parse_nvidia_smi_output(batch);
                         if !parsed.is_empty() {
-                            for p in &mut parsed { p.job_id = j_m.clone(); }
-                            
+                            log::debug!(
+                                "Received {} GPUs from host {} job {:?} node {:?}",
+                                parsed.len(),
+                                s_m.host,
+                                j_m,
+                                parsed.first().and_then(|gpu| gpu.node.clone()).or_else(|| node_m.clone())
+                            );
+                            for p in &mut parsed {
+                                p.job_id = j_m.clone();
+                                if p.node.is_none() {
+                                    p.node = node_m.clone();
+                                }
+                            }
+
                             let node_to_replace = parsed[0].node.clone();
 
                             if let Ok(mut state_gpu) = state_inner.gpu_data.lock() {
@@ -316,20 +394,18 @@ pub fn start_ssh_monitor_task(
                                     slurm_nodelists: None,
                                     slurm_times: None,
                                 });
-                                
+
                                 data.is_online = true;
                                 data.error = None;
-                                
+
                                 if let Some(node) = node_to_replace {
                                     data.gpu_list.retain(|g| !(g.job_id == j_m && g.node == Some(node.clone())));
                                 } else {
                                     data.gpu_list.retain(|g| g.job_id != j_m);
                                 }
-                                
+
                                 data.gpu_list.extend(parsed.clone());
                                 data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
-                                let data_clone = data.clone();
-                                let _ = app_inner.emit("gpu_update", data_clone);
                             }
                         }
                         batch.clear();
@@ -341,7 +417,7 @@ pub fn start_ssh_monitor_task(
                 }
                 Err("SSH stream closed EOF".to_string())
             }).await;
-            
+
             match res {
                 Ok(Ok(())) => {
                     break;
@@ -349,16 +425,19 @@ pub fn start_ssh_monitor_task(
                 Ok(Err(err_msg)) => {
                     log::warn!("SSH monitor task for {} failed: {}", server.host, err_msg);
                     if let Ok(mut state_gpu) = state.gpu_data.lock() {
-                        let entry = state_gpu.entry(server.host.clone()).or_insert_with(|| ServerGpuData {
-                            host: server.host.clone(),
-                            is_online: false,
-                            gpu_list: vec![],
-                            error: None,
-                            last_update: None,
-                            slurm_steps: None,
-                            slurm_nodelists: None,
-                            slurm_times: None,
-                        });
+                        let entry =
+                            state_gpu
+                                .entry(server.host.clone())
+                                .or_insert_with(|| ServerGpuData {
+                                    host: server.host.clone(),
+                                    is_online: false,
+                                    gpu_list: vec![],
+                                    error: None,
+                                    last_update: None,
+                                    slurm_steps: None,
+                                    slurm_nodelists: None,
+                                    slurm_times: None,
+                                });
                         let has_cached_gpus = !entry.gpu_list.is_empty();
                         entry.is_online = has_cached_gpus;
                         entry.error = Some(if has_cached_gpus {
@@ -367,13 +446,15 @@ pub fn start_ssh_monitor_task(
                             err_msg.clone()
                         });
                         entry.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
-                        let data_clone = entry.clone();
-                        let _ = app.emit("gpu_update", data_clone);
                     }
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 }
                 Err(join_err) => {
-                    log::error!("SSH monitor task for {} panicked or cancelled: {}", server.host, join_err);
+                    log::error!(
+                        "SSH monitor task for {} panicked or cancelled: {}",
+                        server.host,
+                        join_err
+                    );
                     break;
                 }
             }
@@ -384,25 +465,22 @@ pub fn start_ssh_monitor_task(
 pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
     let smi_cmd = "nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits";
 
-        {
-            let snapshot = hydrate_gpu_from_cache(&app, state.as_ref());
-            let config = config_store::read_config::<GpuConfig>(&app, "gpu_monitor.json");
-            let configured_hosts: std::collections::HashSet<String> = config
-                .servers
-                .iter()
-                .map(|s| s.host.clone())
-                .collect();
-            let mut emitted = 0usize;
-            for item in snapshot {
-                if configured_hosts.contains(&item.host) {
-                    let _ = app.emit("gpu_update", item);
-                    emitted += 1;
-                }
-            }
-            if emitted > 0 {
-                log::info!("Loaded GPU data cache for {} host(s)", emitted);
+    {
+        let snapshot = hydrate_gpu_from_cache(&app, state.as_ref());
+        let config = config_store::read_config::<GpuConfig>(&app, "gpu_monitor.json");
+        let configured_hosts: std::collections::HashSet<String> =
+            config.servers.iter().map(|s| s.host.clone()).collect();
+        let mut emitted = 0usize;
+        for item in snapshot {
+            if configured_hosts.contains(&item.host) {
+                emit_gpu_update_if_changed(&app, state.as_ref(), &item);
+                emitted += 1;
             }
         }
+        if emitted > 0 {
+            log::info!("Loaded GPU data cache for {} host(s)", emitted);
+        }
+    }
 
     // Startup delay to let frontend initialize cleanly
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -424,7 +502,10 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                 let server_id = gpu_server_fingerprint(server);
                 current_server_ids.push(server_id.clone());
 
-                let mut workers = state.active_workers.lock().unwrap_or_else(|e| e.into_inner());
+                let mut workers = state
+                    .active_workers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let needs_start = match workers.get(&server_id) {
                     None => true,
                     Some(h) => h.is_finished(),
@@ -437,13 +518,17 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                     let update_interval = config.update_interval.unwrap_or(5);
 
                     let handle = tokio::spawn(async move {
-                        log::info!("--- Starting persistent worker for host: {} ---", server_inner.host);
+                        log::info!(
+                            "--- Starting persistent worker for host: {} ---",
+                            server_inner.host
+                        );
                         let mut session: Option<Session> = None;
                         let mut last_squeue_update = Utc::now() - Duration::from_secs(60);
                         let mut slurm_job_ids: Vec<String> = Vec::new();
                         let mut slurm_nodelists: HashMap<String, String> = HashMap::new();
                         let mut slurm_times: HashMap<String, String> = HashMap::new();
-                        let mut slurm_steps: HashMap<String, Vec<crate::models::SlurmStep>> = HashMap::new();
+                        let mut slurm_steps: HashMap<String, Vec<crate::models::SlurmStep>> =
+                            HashMap::new();
 
                         loop {
                             let res = tokio::task::spawn_blocking({
@@ -478,13 +563,13 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
 
                                     if s.host == "localhost" || s.host == "127.0.0.1" {
                                         let local_smi_args = ["--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"];
-                                        
+
                                         #[cfg(windows)]
                                         let output = std::process::Command::new("nvidia-smi")
                                             .args(local_smi_args)
                                             .creation_flags(0x08000000) // CREATE_NO_WINDOW
                                             .output();
-                                        
+
                                         #[cfg(not(windows))]
                                         let output = std::process::Command::new("nvidia-smi")
                                             .args(local_smi_args)
@@ -553,12 +638,12 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                     Some(Utc::now().format("%H:%M:%S").to_string());
                                             }
                                         }
-                                        
+
                                         if let Ok(mut data) = state_task.gpu_data.lock() {
                                             data.insert(s.host.clone(), gpu_data.clone());
                                         }
                                         let _ = app_task.emit("gpu_update", gpu_data);
-                                        
+
                                         Ok((None, vec![], HashMap::new(), HashMap::new(), HashMap::new()))
                                     } else {
                                         // SSH Logic
@@ -566,7 +651,7 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
 
                                         gpu_data.is_online = true;
                                         let mut desired_monitor_keys = Vec::new();
-                                        
+
                                         if s.use_slurm.unwrap_or(false) {
                                              let user = s.user.as_deref().unwrap_or("root");
                                              let mut job_nodes = HashMap::new();
@@ -651,7 +736,42 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                      }
                                                  }
                                              }
-                                                
+
+                                             let mut expanded_job_nodes: HashMap<String, Vec<String>> = HashMap::new();
+                                             for jid in &job_ids {
+                                                 let mut expanded = Vec::new();
+                                                 if let Some(nodelist) = nodelists.get(jid) {
+                                                     if let Ok(mut channel) = sess.channel_session() {
+                                                         let host_cmd = format!("scontrol show hostnames {}", nodelist);
+                                                         if channel.exec(&host_cmd).is_ok() {
+                                                             let mut host_out = String::new();
+                                                             if channel.read_to_string(&mut host_out).is_ok() {
+                                                                 expanded = host_out
+                                                                     .lines()
+                                                                     .map(|line| line.trim().to_string())
+                                                                     .filter(|line| !line.is_empty())
+                                                                     .collect();
+                                                             }
+                                                         }
+                                                     }
+
+                                                     if expanded.is_empty()
+                                                         && !nodelist.contains('[')
+                                                         && !nodelist.contains(',')
+                                                     {
+                                                         expanded.push(nodelist.clone());
+                                                     }
+                                                 }
+
+                                                 log::debug!(
+                                                     "Slurm job {} on {} expanded nodes: {:?}",
+                                                     jid,
+                                                     s.host,
+                                                     expanded
+                                                 );
+                                                 expanded_job_nodes.insert(jid.clone(), expanded);
+                                             }
+
                                                 // Now, if we have job_ids, query sacct for SubmitLine of these job steps!
                                                 let mut submit_lines = HashMap::new();
                                                 if !job_ids.is_empty() {
@@ -674,7 +794,7 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                         }
                                                     }
                                                 }
-                                                
+
                                                 // Query Slurm Job Steps
                                                 if let Ok(mut channel) = sess.channel_session() {
                                                     let s_cmd = format!("squeue -s --me -h -o \"%i|%j|%M\" 2>/dev/null || squeue -s -u $(whoami) -h -o \"%i|%j|%M\" || squeue -s -u {} -h -o \"%i|%j|%M\"", user);
@@ -692,10 +812,10 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                                     // Only list numeric computation steps
                                                                     if step_part.chars().all(|c| c.is_numeric()) {
                                                                         let job_id = step_id[..dot_idx].to_string();
-                                                                        
+
                                                                         // Look up SubmitLine command
                                                                         let mut cmd = submit_lines.get(&step_id).cloned().unwrap_or_else(|| parts[1].to_string());
-                                                                        
+
                                                                         // Clean up "srun" prefix and arguments if present to keep it neat
                                                                         if cmd.starts_with("srun") {
                                                                             let mut cmd_words = Vec::new();
@@ -724,7 +844,7 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                                                 cmd = cmd_words.join(" ");
                                                                             }
                                                                         }
-                                                                        
+
                                                                         let step = crate::models::SlurmStep {
                                                                             id: step_id,
                                                                             name: parts[1].to_string(),
@@ -739,10 +859,16 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                         steps = new_steps;
                                                     }
                                                 }
-                                            
+
                                             for jid in &job_ids {
-                                                let n_count = job_nodes.get(jid).cloned().unwrap_or_else(|| "1".to_string());
-                                                desired_monitor_keys.push(format!("{}:{}:{}", s.host, jid, n_count));
+                                                let expanded_nodes = expanded_job_nodes.get(jid).cloned().unwrap_or_default();
+                                                if expanded_nodes.is_empty() {
+                                                    desired_monitor_keys.push(format!("{}:{}:job", s.host, jid));
+                                                } else {
+                                                    for node in expanded_nodes {
+                                                        desired_monitor_keys.push(format!("{}:{}:{}", s.host, jid, node));
+                                                    }
+                                                }
                                             }
                                         } else {
                                             desired_monitor_keys.push(format!("{}:node:0", s.host));
@@ -757,35 +883,53 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                             };
                                             if needs_start {
                                                 let parts: Vec<&str> = key.split(':').collect();
-                                                let (jid, n_count) = if parts.len() >= 3 {
-                                                    if parts[1] == "node" { (None, None) } 
-                                                    else { (Some(parts[1].to_string()), Some(parts[2].to_string())) }
-                                                } else { (None, None) };
+                                                let (jid, target_node) = if parts.len() >= 3 {
+                                                    if parts[1] == "node" {
+                                                        (None, None)
+                                                    } else if parts[2] == "job" {
+                                                        (Some(parts[1].to_string()), None)
+                                                    } else {
+                                                        (Some(parts[1].to_string()), Some(parts[2].to_string()))
+                                                    }
+                                                } else {
+                                                    (None, None)
+                                                };
 
+                                                log::debug!(
+                                                    "Starting GPU monitor for host {} job {:?} node {:?}",
+                                                    s.host,
+                                                    jid,
+                                                    target_node
+                                                );
                                                 let handle = start_ssh_monitor_task(
                                                     app_task.clone(),
                                                     state_task.clone(),
                                                     s.clone(),
                                                     jid,
-                                                    n_count,
+                                                    target_node,
                                                     update_interval,
                                                 );
                                                 monitors.insert(key.clone(), handle);
                                             }
                                         }
-                                        
+
                                         // Cleanup monitors for THIS host that are no longer needed
                                         {
                                             let mut monitors = state_task.active_monitors.lock().unwrap_or_else(|e| e.into_inner());
                                             let host_prefix = format!("{}:", s.host);
-                                            let mut removed_jids = Vec::new();
+                                            let mut removed_targets: Vec<(String, Option<String>)> = Vec::new();
                                             monitors.retain(|key, handle| {
                                                 if key.starts_with(&host_prefix) {
                                                     if !desired_monitor_keys.contains(key) {
                                                         handle.abort();
                                                         let parts: Vec<&str> = key.split(':').collect();
                                                         if parts.len() >= 2 && parts[1] != "node" {
-                                                            removed_jids.push(parts[1].to_string());
+                                                            let removed_node = if parts.len() >= 3 && parts[2] != "job" {
+                                                                Some(parts[2].to_string())
+                                                            } else {
+                                                                None
+                                                            };
+                                                            removed_targets.push((parts[1].to_string(), removed_node));
                                                         }
                                                         false
                                                     } else {
@@ -796,12 +940,20 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                 }
                                             });
 
-                                            if !removed_jids.is_empty() {
+                                            if !removed_targets.is_empty() {
                                                 if let Ok(mut data) = state_task.gpu_data.lock() {
                                                     if let Some(server_data) = data.get_mut(&s.host) {
                                                         server_data.gpu_list.retain(|g| {
                                                             if let Some(jid) = &g.job_id {
-                                                                !removed_jids.contains(jid)
+                                                                !removed_targets.iter().any(|(removed_jid, removed_node)| {
+                                                                    if jid != removed_jid {
+                                                                        return false;
+                                                                    }
+                                                                    match removed_node {
+                                                                        Some(node) => g.node.as_ref() == Some(node),
+                                                                        None => true,
+                                                                    }
+                                                                })
                                                             } else {
                                                                 true
                                                             }
@@ -930,88 +1082,110 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                  }
                                              }
                                          }
-                                        
-                                         if let Ok(mut data) = state_task.gpu_data.lock() {
-                                              if s.use_slurm.unwrap_or(false) {
-                                                  gpu_data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
-                                                  gpu_data.slurm_nodelists = Some(nodelists.clone());
-                                                  gpu_data.slurm_times = Some(times.clone());
-                                                  gpu_data.slurm_steps = Some(steps.clone());
-                                              }
-                                              data.insert(s.host.clone(), gpu_data.clone());
-                                          } else {
-                                              log::error!("gpu_data lock poisoned in main worker for {}", s.host);
-                                          }
-                                          log::debug!("Main Worker for {} emitting update", s.host);
-                                         let _ = app_task.emit("gpu_update", gpu_data);
-                                         
+                                        let mut emitted_gpu_data = gpu_data.clone();
+                                        if let Ok(mut data) = state_task.gpu_data.lock() {
+                                             if s.use_slurm.unwrap_or(false) {
+                                                 let existing_gpu_list = data
+                                                     .get(&s.host)
+                                                     .map(|current| current.gpu_list.clone())
+                                                     .unwrap_or_default();
+                                                 if !existing_gpu_list.is_empty() {
+                                                     gpu_data.gpu_list = existing_gpu_list;
+                                                 }
+                                                 gpu_data.is_online = !gpu_data.gpu_list.is_empty() || gpu_data.is_online;
+                                                 gpu_data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
+                                                 gpu_data.slurm_nodelists = Some(nodelists.clone());
+                                                 gpu_data.slurm_times = Some(times.clone());
+                                                 gpu_data.slurm_steps = Some(steps.clone());
+                                             }
+                                             data.insert(s.host.clone(), gpu_data.clone());
+                                             emitted_gpu_data = gpu_data.clone();
+                                         } else {
+                                             log::error!("gpu_data lock poisoned in main worker for {}", s.host);
+                                         }
+                                         log::debug!("Main Worker for {} emitting update", s.host);
+                                        emit_gpu_update_if_changed(&app_task, state_task.as_ref(), &emitted_gpu_data);
+
                                          Ok((Some(sess), job_ids, nodelists, times, steps))
                                      }
                                  }
                              }).await;
 
-                             match res {
-                                 Ok(Ok((sess, jobs, nodelists, times, steps))) => {
-                                     session = sess;
-                                     slurm_job_ids = jobs;
-                                     slurm_nodelists = nodelists;
-                                     slurm_times = times;
-                                     slurm_steps = steps;
-                                     if (Utc::now() - last_squeue_update).num_seconds() >= 30 {
-                                         last_squeue_update = Utc::now();
-                                     }
-                                 }
-                                 _ => {
-                                     log::warn!("Worker for {} failed or disconnected, retrying in 10s", server_inner.host);
-                                     session = None;
+                            match res {
+                                Ok(Ok((sess, jobs, nodelists, times, steps))) => {
+                                    session = sess;
+                                    slurm_job_ids = jobs;
+                                    slurm_nodelists = nodelists;
+                                    slurm_times = times;
+                                    slurm_steps = steps;
+                                    if (Utc::now() - last_squeue_update).num_seconds() >= 30 {
+                                        last_squeue_update = Utc::now();
+                                    }
+                                }
+                                _ => {
+                                    log::warn!(
+                                        "Worker for {} failed or disconnected, retrying in 10s",
+                                        server_inner.host
+                                    );
+                                    session = None;
 
-                                     {
-                                         let mut monitors = state_inner.active_monitors.lock().unwrap_or_else(|e| e.into_inner());
-                                         let prefix = format!("{}:", server_inner.host);
-                                         monitors.retain(|key, handle| {
-                                             if key.starts_with(&prefix) {
-                                                 handle.abort();
-                                                 false
-                                             } else {
-                                                 true
-                                             }
-                                         });
-                                     }
+                                    {
+                                        let mut monitors = state_inner
+                                            .active_monitors
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        let prefix = format!("{}:", server_inner.host);
+                                        monitors.retain(|key, handle| {
+                                            if key.starts_with(&prefix) {
+                                                handle.abort();
+                                                false
+                                            } else {
+                                                true
+                                            }
+                                        });
+                                    }
 
-                                     let mut gpu_data = state_inner
-                                         .gpu_data
-                                         .lock()
-                                         .ok()
-                                         .and_then(|data| data.get(&server_inner.host).cloned())
-                                         .unwrap_or_else(|| ServerGpuData {
-                                             host: server_inner.host.clone(),
-                                             is_online: false,
-                                             gpu_list: vec![],
-                                             error: None,
-                                             last_update: None,
-                                             slurm_steps: None,
-                                             slurm_nodelists: None,
-                                             slurm_times: None,
-                                         });
-                                     gpu_data.is_online = false;
-                                     if gpu_data.gpu_list.is_empty() {
-                                         gpu_data.error =
-                                             Some("SSH connection failed or disconnected".to_string());
-                                     } else {
-                                         gpu_data.error = Some(
-                                             "SSH connection failed (showing cached data)".to_string(),
-                                         );
-                                     }
-                                     gpu_data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
+                                    let mut gpu_data = state_inner
+                                        .gpu_data
+                                        .lock()
+                                        .ok()
+                                        .and_then(|data| data.get(&server_inner.host).cloned())
+                                        .unwrap_or_else(|| ServerGpuData {
+                                            host: server_inner.host.clone(),
+                                            is_online: false,
+                                            gpu_list: vec![],
+                                            error: None,
+                                            last_update: None,
+                                            slurm_steps: None,
+                                            slurm_nodelists: None,
+                                            slurm_times: None,
+                                        });
+                                    gpu_data.is_online = false;
+                                    if gpu_data.gpu_list.is_empty() {
+                                        gpu_data.error = Some(
+                                            "SSH connection failed or disconnected".to_string(),
+                                        );
+                                    } else {
+                                        gpu_data.error = Some(
+                                            "SSH connection failed (showing cached data)"
+                                                .to_string(),
+                                        );
+                                    }
+                                    gpu_data.last_update =
+                                        Some(Utc::now().format("%H:%M:%S").to_string());
 
-                                     if let Ok(mut data) = state_inner.gpu_data.lock() {
-                                         data.insert(server_inner.host.clone(), gpu_data.clone());
-                                     }
-                                     let _ = app_inner.emit("gpu_update", gpu_data);
+                                    if let Ok(mut data) = state_inner.gpu_data.lock() {
+                                        data.insert(server_inner.host.clone(), gpu_data.clone());
+                                    }
+                                    emit_gpu_update_if_changed(
+                                        &app_inner,
+                                        state_inner.as_ref(),
+                                        &gpu_data,
+                                    );
 
-                                     tokio::time::sleep(Duration::from_secs(10)).await;
-                                 }
-                             }
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                }
+                            }
 
                             tokio::time::sleep(Duration::from_secs(update_interval)).await;
                         }
@@ -1024,31 +1198,41 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
             if let Ok(mut data) = state.gpu_data.lock() {
                 data.clear();
             }
+            clear_gpu_emit_cache(state.as_ref());
             let _ = config_store::write_config(&app, GPU_CACHE_FILE, &Vec::<ServerGpuData>::new());
             let _ = app.emit("gpu_clear", ());
         }
 
         // Cleanup workers for removed servers
         {
-            let mut workers = state.active_workers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut workers = state
+                .active_workers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             workers.retain(|id, handle| {
                 if !current_server_ids.contains(id) {
                     handle.abort();
                     // Also cleanup monitors for this host
                     let host = id.split(':').next().unwrap_or_default();
                     if !host.is_empty() {
-                        let mut monitors = state.active_monitors.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut monitors = state
+                            .active_monitors
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         let prefix = format!("{}:", host);
                         monitors.retain(|k, h| {
                             if k.starts_with(&prefix) {
                                 h.abort();
                                 false
-                            } else { true }
+                            } else {
+                                true
+                            }
                         });
 
                         // Clean up gpu_data entry
                         if let Ok(mut data) = state.gpu_data.lock() {
                             if data.remove(host).is_some() {
+                                clear_gpu_emit_cache_for_host(state.as_ref(), host);
                                 let _ = app.emit("gpu_prune", host.to_string());
                             }
                         }

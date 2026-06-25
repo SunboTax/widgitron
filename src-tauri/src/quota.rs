@@ -8,6 +8,8 @@ use crate::models::{AppConfig, QuotaBar, QuotaConfig, QuotaItem, GlobalState};
 use crate::config_store;
 use crate::vscode_secrets;
 
+const REMOVED_QUOTA_PROVIDERS: &[&str] = &["minimax-cn", "openai-compatible"];
+
 #[derive(serde::Serialize, Clone)]
 pub struct QuotaMonitorStatus {
     pub consecutive_failures: u32,
@@ -18,6 +20,39 @@ pub struct QuotaMonitorStatus {
 
 fn emit_quota_monitor_status(app: &AppHandle, status: QuotaMonitorStatus) {
     let _ = app.emit("quota_monitor_status", status);
+}
+
+fn is_removed_quota_provider(provider: &str) -> bool {
+    REMOVED_QUOTA_PROVIDERS.contains(&provider)
+}
+
+fn strip_removed_quota_providers(config: &mut QuotaConfig) -> usize {
+    let before = config.items.len();
+    config
+        .items
+        .retain(|item| !is_removed_quota_provider(item.provider.as_str()));
+    before.saturating_sub(config.items.len())
+}
+
+pub fn sanitize_quota_config(mut config: QuotaConfig) -> QuotaConfig {
+    let _ = strip_removed_quota_providers(&mut config);
+    config
+}
+
+pub fn read_quota_config(app: &AppHandle) -> QuotaConfig {
+    let mut config = config_store::read_config::<QuotaConfig>(app, "quota_config.json");
+    let removed = strip_removed_quota_providers(&mut config);
+    if removed > 0 {
+        log::info!(
+            "Removed {} deprecated quota provider entr{} from quota_config.json",
+            removed,
+            if removed == 1 { "y" } else { "ies" }
+        );
+        if let Err(err) = config_store::write_config(app, "quota_config.json", &config) {
+            log::warn!("Failed to persist sanitized quota_config.json: {}", err);
+        }
+    }
+    config
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2015,125 +2050,6 @@ async fn fetch_pioneer_quota(item: &QuotaItem) -> Result<QuotaItem, String> {
     })
 }
 
-// ─── MiniMax CN ────────────────────────────────────────────────────────────
-
-const MINIMAX_CN_DEFAULT_URL: &str = "https://api.minimax.chat/v1/token_plan/remains";
-
-fn minimax_cn_api_url(item: &QuotaItem) -> String {
-    item.api_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .unwrap_or(MINIMAX_CN_DEFAULT_URL)
-        .to_string()
-}
-
-fn parse_minimax_cn_remains(json_val: &Value) -> Option<f64> {
-    json_val
-        .get("token_plan")
-        .and_then(|tp| tp.get("remains"))
-        .or_else(|| json_val.get("remains"))
-        .and_then(|v| {
-            if v.is_number() {
-                v.as_f64()
-            } else if v.is_string() {
-                v.as_str().and_then(|s| s.trim().parse::<f64>().ok())
-            } else {
-                None
-            }
-        })
-}
-
-fn build_minimax_cn_quota_item(item: &QuotaItem, current_value: f64) -> QuotaItem {
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    QuotaItem {
-        id: item.id.clone(),
-        name: item.name.clone(),
-        provider: "minimax-cn".to_string(),
-        api_key: String::new(),
-        api_url: item.api_url.clone(),
-        json_path: item.json_path.clone(),
-        max_quota: item.max_quota,
-        current_value: Some(current_value),
-        error_msg: None,
-        last_update: Some(now),
-        unit: item.unit.clone().or_else(|| Some("tokens".to_string())),
-        auth_mode: item.auth_mode.clone(),
-        ..Default::default()
-    }
-}
-
-async fn fetch_minimax_cn_quota(item: &QuotaItem) -> Result<QuotaItem, String> {
-    let api_key = item.api_key.trim();
-    if api_key.is_empty() {
-        return Err(
-            "MiniMax CN API key not configured. Add your API key in Settings.".to_string(),
-        );
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
-
-    let url = minimax_cn_api_url(item);
-    let res = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let hint = match status.as_u16() {
-            401 => " Invalid API key.",
-            403 => " Access denied; check your MiniMax account.",
-            429 => " Rate limited; try again later.",
-            s if (500..=599).contains(&s) => " Server error; try again later.",
-            _ => "",
-        };
-        return Err(format!("MiniMax CN API error: HTTP {}{}", status, hint));
-    }
-
-    let text = res
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read MiniMax CN response: {}", e))?;
-
-    let json_val: Value = serde_json::from_str(&text).map_err(|e| {
-        format!(
-            "Failed to parse MiniMax CN response: {} — body: {}",
-            e,
-            &text[..text.len().min(200)]
-        )
-    })?;
-
-    let remains = if let Some(path) = item.json_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-        get_json_value_by_path(&json_val, path).and_then(|v| {
-            if v.is_number() {
-                v.as_f64()
-            } else if v.is_string() {
-                v.as_str().and_then(|s| s.trim().parse::<f64>().ok())
-            } else {
-                None
-            }
-        })
-    } else {
-        parse_minimax_cn_remains(&json_val)
-    };
-
-    let remains = remains.ok_or_else(|| {
-        format!(
-            "Could not find remaining quota in MiniMax CN response. Raw: {}",
-            &text[..text.len().min(300)]
-        )
-    })?;
-
-    Ok(build_minimax_cn_quota_item(item, remains))
-}
-
 // ─── Claude Code ───────────────────────────────────────────────────────────
 
 fn get_claude_settings_path() -> Option<PathBuf> {
@@ -2151,8 +2067,8 @@ fn get_claude_settings_path() -> Option<PathBuf> {
 }
 
 /// Fetch Claude Code remaining token quota.
-/// If the ANTHROPIC_AUTH_TOKEN starts with "sk-cp-" it is a MiniMax China proxy
-/// token – we query https://api.minimaxi.com/v1/token_plan/remains for the balance.
+/// If the ANTHROPIC_AUTH_TOKEN starts with "sk-cp-" we query
+/// https://api.minimaxi.com/v1/token_plan/remains for the balance.
 /// Otherwise we return an error because standard Anthropic tokens have no public
 /// balance API.
 async fn fetch_claude_code_quota(item: &QuotaItem) -> Result<QuotaItem, String> {
@@ -2202,14 +2118,14 @@ async fn fetch_claude_code_quota(item: &QuotaItem) -> Result<QuotaItem, String> 
             json_path: None,
             max_quota: None,
             current_value: None,
-            error_msg: Some("Anthropic official tokens have no public balance API. Use a MiniMax-proxied sk-cp- token for quota tracking.".to_string()),
+            error_msg: Some("Anthropic official tokens have no public balance API. Use an sk-cp- token for quota tracking.".to_string()),
             last_update: Some(now),
             unit: None,
             ..Default::default()
         });
     }
 
-    // MiniMax China proxy token – query remaining balance
+    // sk-cp- token – query remaining balance
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -2227,7 +2143,7 @@ async fn fetch_claude_code_quota(item: &QuotaItem) -> Result<QuotaItem, String> 
         let status = res.status();
         let hint = match status.as_u16() {
             401 => " Token may be expired; refresh your sk-cp- token.",
-            403 => " Access denied; check your MiniMax proxy subscription.",
+            403 => " Access denied; check that this token still has quota access.",
             429 => " Rate limited; try again later.",
             s if (500..=599).contains(&s) => " Server error; try again later.",
             _ => "",
@@ -2285,21 +2201,7 @@ async fn fetch_claude_code_quota(item: &QuotaItem) -> Result<QuotaItem, String> 
 }
 
 fn resolve_quota_provider(item: &QuotaItem) -> &str {
-    if item.provider == "openai-compatible" {
-        if item.id.starts_with("antigravity") {
-            "antigravity"
-        } else if item.id.starts_with("codex") {
-            "codex"
-        } else if item.id.starts_with("cursor") {
-            "cursor"
-        } else if item.id.starts_with("copilot") {
-            "copilot"
-        } else {
-            "openai-compatible"
-        }
-    } else {
-        &item.provider
-    }
+    &item.provider
 }
 
 fn quota_items_display_equal(a: &[QuotaItem], b: &[QuotaItem]) -> bool {
@@ -2337,7 +2239,7 @@ pub async fn perform_quota_fetch(
 ) -> Result<Vec<QuotaItem>, String> {
     let _fetch_guard = state.quota_fetch_lock.lock().await;
 
-    let config = config_store::read_config::<QuotaConfig>(app, "quota_config.json");
+    let config = read_quota_config(app);
     let source_items: std::collections::HashMap<String, QuotaItem> = config
         .items
         .iter()
@@ -2381,13 +2283,6 @@ pub async fn perform_quota_fetch(
         .filter(|item| item.provider == "claude-code")
         .cloned()
         .collect();
-    let minimax_items: Vec<QuotaItem> = config
-        .items
-        .iter()
-        .filter(|item| item.provider == "minimax-cn")
-        .cloned()
-        .collect();
-
     let (ag_res, codex_res, cursor_res) = tokio::join!(
         async {
             if needs_provider("antigravity") {
@@ -2420,7 +2315,6 @@ pub async fn perform_quota_fetch(
         .chain(qoder_items)
         .chain(pioneer_items)
         .chain(claude_items)
-        .chain(minimax_items)
     {
         prefetch_set.spawn(async move {
             let id = item.id.clone();
@@ -2438,7 +2332,6 @@ pub async fn perform_quota_fetch(
                 "qoder-cn" => fetch_qoder_cn_quota(&item).await,
                 "pioneer" => fetch_pioneer_quota(&item).await,
                 "claude-code" => fetch_claude_code_quota(&item).await,
-                "minimax-cn" => fetch_minimax_cn_quota(&item).await,
                 other => Err(format!("Unsupported prefetch provider: {}", other)),
             };
             (id, result)
@@ -2461,7 +2354,6 @@ pub async fn perform_quota_fetch(
     let mut qoder_cn_processed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut pioneer_processed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut claude_code_processed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut minimax_processed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for item in &config.items {
         let provider = resolve_quota_provider(item);
@@ -2565,24 +2457,6 @@ pub async fn perform_quota_fetch(
                     }
                 }
             }
-        } else if provider == "minimax-cn" {
-            if !minimax_processed_ids.contains(&item.id) {
-                minimax_processed_ids.insert(item.id.clone());
-                match prefetch_by_id.get(&item.id) {
-                    Some(Ok(resolved_item)) => fetched_items.push(resolved_item.clone()),
-                    Some(Err(e)) => {
-                        push_quota_provider_fetch_error(
-                            &mut fetched_items,
-                            item,
-                            "MiniMax CN",
-                            e,
-                        );
-                    }
-                    None => {
-                        push_prefetch_missing_item(&mut fetched_items, item, "minimax-cn");
-                    }
-                }
-            }
         } else if item.provider == "manual" {
             let mut resolved_item = item.clone();
             resolved_item.error_msg = None;
@@ -2594,26 +2468,12 @@ pub async fn perform_quota_fetch(
                 Some(u) => {
                     let trimmed = u.trim();
                     if trimmed.is_empty() {
-                        if resolved_item.provider == "minimax-cn" {
-                            "https://api.minimax.chat/v1/token_plan/remains".to_string()
-                        } else if resolved_item.provider == "openai-compatible" {
-                            "https://api.openai.com/v1/dashboard/billing/subscription".to_string()
-                        } else {
-                            "".to_string()
-                        }
+                        "".to_string()
                     } else {
                         trimmed.to_string()
                     }
                 }
-                None => {
-                    if resolved_item.provider == "minimax-cn" {
-                        "https://api.minimax.chat/v1/token_plan/remains".to_string()
-                    } else if resolved_item.provider == "openai-compatible" {
-                        "https://api.openai.com/v1/dashboard/billing/subscription".to_string()
-                    } else {
-                        "".to_string()
-                    }
-                }
+                None => "".to_string(),
             };
 
             if url.is_empty() {
@@ -2681,34 +2541,12 @@ pub async fn perform_quota_fetch(
 
             let extracted_val = if let Some(path) = &resolved_item.json_path {
                 if path.trim().is_empty() {
-                    if resolved_item.provider == "minimax-cn" {
-                        json_val.get("token_plan").and_then(|tp| tp.get("remains"))
-                            .or_else(|| json_val.get("remains"))
-                            .cloned()
-                    } else if resolved_item.provider == "openai-compatible" {
-                        json_val.get("hard_limit_usd")
-                            .or_else(|| json_val.get("total_amount"))
-                            .or_else(|| json_val.get("remains"))
-                            .cloned()
-                    } else {
-                        Some(json_val.clone())
-                    }
+                    Some(json_val.clone())
                 } else {
                     get_json_value_by_path(&json_val, path.trim())
                 }
             } else {
-                if resolved_item.provider == "minimax-cn" {
-                    json_val.get("token_plan").and_then(|tp| tp.get("remains"))
-                        .or_else(|| json_val.get("remains"))
-                        .cloned()
-                } else if resolved_item.provider == "openai-compatible" {
-                    json_val.get("hard_limit_usd")
-                        .or_else(|| json_val.get("total_amount"))
-                        .or_else(|| json_val.get("remains"))
-                        .cloned()
-                } else {
-                    Some(json_val.clone())
-                }
+                Some(json_val.clone())
             };
 
             match extracted_val {
@@ -2824,7 +2662,7 @@ pub fn order_quota_items_by_config(fetched: &[QuotaItem], config: &QuotaConfig) 
 
 /// Write fetched display fields back to quota_config.json so restarts show fresh data.
 fn persist_quota_fetch_results(app: &AppHandle, fetched: &[QuotaItem]) -> Result<(), String> {
-    let mut config = config_store::read_config::<QuotaConfig>(app, "quota_config.json");
+    let mut config = read_quota_config(app);
     let fetched_by_id: std::collections::HashMap<&str, &QuotaItem> =
         fetched.iter().map(|item| (item.id.as_str(), item)).collect();
 
@@ -2896,7 +2734,7 @@ fn apply_fetched_quota_fields(target: &mut QuotaItem, fetched: &QuotaItem) {
 
     let auto_fetched = matches!(
         fetched.provider.as_str(),
-        "pioneer" | "qoder-cn" | "claude-code" | "codex" | "cursor" | "antigravity" | "copilot" | "minimax-cn"
+        "pioneer" | "qoder-cn" | "claude-code" | "codex" | "cursor" | "antigravity" | "copilot"
     );
     if auto_fetched {
         target.unit = fetched.unit.clone();
@@ -2927,7 +2765,7 @@ fn merge_quota_item_config(fetched: &mut QuotaItem, source: &QuotaItem) {
     // Keep fetched display fields (unit, quota values) for auto-fetched providers.
     let auto_fetched = matches!(
         fetched.provider.as_str(),
-        "pioneer" | "qoder-cn" | "claude-code" | "codex" | "cursor" | "antigravity" | "copilot" | "minimax-cn"
+        "pioneer" | "qoder-cn" | "claude-code" | "codex" | "cursor" | "antigravity" | "copilot"
     );
     if !auto_fetched {
         if source.max_quota.is_some() {
@@ -2969,7 +2807,7 @@ fn is_fetch_config_different(a: &QuotaConfig, b: &QuotaConfig) -> bool {
 pub async fn start_quota_monitor(app: AppHandle, state: std::sync::Arc<GlobalState>) {
     // Emit cached data to any widgets already listening (state was pre-loaded in setup)
     {
-        let quota_config = config_store::read_config::<QuotaConfig>(&app, "quota_config.json");
+        let quota_config = read_quota_config(&app);
         if let Ok(qd) = state.quota_data.lock() {
             let ordered = order_quota_items_by_config(&qd, &quota_config);
             if !ordered.is_empty() {
@@ -2985,7 +2823,7 @@ pub async fn start_quota_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
 
     loop {
         let app_config = config_store::read_config::<AppConfig>(&app, "app_config.json");
-        let quota_config = config_store::read_config::<QuotaConfig>(&app, "quota_config.json");
+        let quota_config = read_quota_config(&app);
         let interval = quota_config.update_interval.unwrap_or(300).max(60);
 
         if !app_config.quota_enabled.unwrap_or(true) {
@@ -3074,7 +2912,7 @@ pub async fn start_quota_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
         }
 
         // Wait for interval, break early if config changes
-        let last_config = config_store::read_config::<QuotaConfig>(&app, "quota_config.json");
+        let last_config = read_quota_config(&app);
         let check_interval = 30;
         let loops = interval / check_interval;
         for _ in 0..loops.max(1) {
@@ -3084,7 +2922,7 @@ pub async fn start_quota_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
                 break;
             }
 
-            let current_config = config_store::read_config::<QuotaConfig>(&app, "quota_config.json");
+            let current_config = read_quota_config(&app);
             if is_fetch_config_different(&last_config, &current_config) {
                 break;
             }
