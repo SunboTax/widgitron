@@ -9,6 +9,7 @@ export interface AppConfig {
   arxiv_enabled?: boolean;
   quota_enabled?: boolean;
   hide_on_startup?: boolean;
+  arxiv_proxy?: string;
   active_widgets?: Record<string, boolean>;
 }
 
@@ -72,6 +73,7 @@ export interface ArxivPaper {
   id: string;
   title: string;
   summary: string;
+  matched_keywords?: string[];
   authors: string[];
   link: string;
   published: string;

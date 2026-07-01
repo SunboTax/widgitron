@@ -82,6 +82,8 @@ pub struct ArxivPaper {
     pub id: String,
     pub title: String,
     pub summary: String,
+    #[serde(default)]
+    pub matched_keywords: Vec<String>,
     pub authors: Vec<String>,
     pub link: String,
     pub published: String,
@@ -97,6 +99,7 @@ pub struct AppConfig {
     pub arxiv_enabled: Option<bool>,
     pub quota_enabled: Option<bool>,
     pub hide_on_startup: Option<bool>,
+    pub arxiv_proxy: Option<String>,
     pub active_widgets: Option<HashMap<String, bool>>,
 }
 
@@ -122,6 +125,7 @@ impl Default for AppConfig {
             arxiv_enabled: Some(true),
             quota_enabled: Some(true),
             hide_on_startup: Some(false),
+            arxiv_proxy: None,
             active_widgets: Some(HashMap::new()),
         }
     }
