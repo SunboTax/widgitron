@@ -102,6 +102,9 @@ export interface TauriCommandMap {
   remove_arxiv_discarded_paper: void;
   update_manual_quota: void;
   show_main: void;
+  show_sidebar: void;
+  hide_sidebar: void;
+  toggle_sidebar: void;
   exit_app: void;
   set_desktop_mode: void;
   log_frontend_error: void;
@@ -150,6 +153,9 @@ export const TAURI_COMMAND_NAMES = [
   "remove_arxiv_discarded_paper",
   "update_manual_quota",
   "show_main",
+  "show_sidebar",
+  "hide_sidebar",
+  "toggle_sidebar",
   "exit_app",
   "set_desktop_mode",
   "log_frontend_error",
@@ -209,6 +215,9 @@ export interface TauriCommandArgs {
     error?: string;
   };
   show_main: undefined;
+  show_sidebar: undefined;
+  hide_sidebar: undefined;
+  toggle_sidebar: undefined;
   exit_app: undefined;
   open_log_dir: undefined;
   open_config_dir: undefined;

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Sun, Moon, X, Plus, RotateCcw, RefreshCw, Settings, Cpu, Calendar, BookOpen, Coins, Info, GripVertical, ChevronDown } from "lucide-react";
+import { Sun, Moon, X, Plus, RotateCcw, RefreshCw, Settings, Cpu, Calendar, BookOpen, Coins, Info, GripVertical, ChevronDown, PanelRight } from "lucide-react";
 import { motion, AnimatePresence, Reorder, useDragControls } from "framer-motion";
 import { WidgetThemeConfig } from "../types/theme";
 import type {
@@ -38,6 +38,15 @@ import {
   serviceWidgetMeta,
   type ServiceField,
 } from "../utils/widgetLifecycle";
+
+const DEFAULT_SIDEBAR_THEME = {
+  background: "#050814",
+  header: "#080d1d",
+  quota: "#06b6d4",
+  gpu: "#3b82f6",
+  deadlines: "#f59e0b",
+  arxiv: "#ec4899",
+};
 
 const PROVIDER_LOGOS: Record<string, string> = {
   antigravity: "/icons/antigravity.svg",
@@ -618,6 +627,9 @@ export function SettingsPanel({
   const [localPaper, setLocalPaper] = useState<PaperConfig>(paperConfig);
   const [localArxiv, setLocalArxiv] = useState<ArxivConfig>(arxivConfig);
   const [arxivProxyInput, setArxivProxyInput] = useState(appConfig.arxiv_proxy || "");
+  const [sidebarHotkeyInput, setSidebarHotkeyInput] = useState(
+    appConfig.sidebar_hotkey || "Ctrl+Alt+W"
+  );
   const [deadlineSubscriptionsInput, setDeadlineSubscriptionsInput] = useState(() =>
     formatDeadlineSubscriptionsInput(paperConfig.subscribed_titles)
   );
@@ -809,6 +821,7 @@ export function SettingsPanel({
 
   const tabs: { id: SettingsSection; label: string; icon: typeof Settings }[] = [
     { id: "general", label: SETTINGS_SECTION_LABELS.general, icon: Settings },
+    { id: "sidebar", label: SETTINGS_SECTION_LABELS.sidebar, icon: PanelRight },
     { id: LIVE_DATA_SECTION.QUOTA, label: LIVE_DATA_SECTION_LABELS.quota, icon: Coins },
     { id: LIVE_DATA_SECTION.GPU, label: LIVE_DATA_SECTION_LABELS.gpu, icon: Cpu },
     { id: LIVE_DATA_SECTION.DEADLINES, label: LIVE_DATA_SECTION_LABELS.deadlines, icon: Calendar },
@@ -819,6 +832,11 @@ export function SettingsPanel({
   useEffect(() => {
     setArxivProxyInput(appConfig.arxiv_proxy || "");
   }, [appConfig.arxiv_proxy]);
+
+  useEffect(() => {
+    setSidebarHotkeyInput(appConfig.sidebar_hotkey || "Ctrl+Alt+W");
+  }, [appConfig.sidebar_hotkey]);
+
   useEffect(() => {
     setLocalGpu(sanitizeGpuConfig(gpuConfig));
   }, [gpuConfig]);
@@ -1149,6 +1167,227 @@ export function SettingsPanel({
             Open Log Folder
           </button>
         </div>
+      </div>
+    </section>
+  );
+
+  const renderSidebarSection = () => (
+    <section className="space-y-6">
+      <div>
+        <h2 className={`text-xs font-black uppercase tracking-wider ${appConfig.theme === "light" ? "text-slate-500" : "text-slate-400"}`}>
+          Sidebar Settings
+        </h2>
+      </div>
+      <div
+        className={`p-6 border border-[var(--dashboard-border)] rounded-2xl space-y-6 ${
+          appConfig.theme === "light" ? "bg-slate-50" : "bg-white/5"
+        }`}
+      >
+        {(() => {
+          const sidebarTheme = { ...DEFAULT_SIDEBAR_THEME, ...(appConfig.sidebar_theme || {}) };
+          const colorInputClass =
+            "w-10 h-10 rounded-xl border border-[var(--dashboard-border)] bg-transparent p-1 cursor-pointer";
+          const saveSidebarColor = (key: keyof typeof DEFAULT_SIDEBAR_THEME, value: string) => {
+            onSaveApp({
+              ...appConfig,
+              sidebar_theme: {
+                ...sidebarTheme,
+                [key]: value,
+              },
+            });
+          };
+          const colorControl = (key: keyof typeof DEFAULT_SIDEBAR_THEME, label: string) => (
+            <label
+              key={key}
+              className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border ${
+                appConfig.theme === "light"
+                  ? "bg-white border-slate-200"
+                  : "bg-black/30 border-white/10"
+              }`}
+            >
+              <span className={`text-[10px] font-black uppercase tracking-wider ${
+                appConfig.theme === "light" ? "text-slate-700" : "text-slate-300"
+              }`}>
+                {label}
+              </span>
+              <div className="flex items-center gap-2">
+                <span
+                  className="w-5 h-5 rounded-md border border-black/10"
+                  style={{ backgroundColor: sidebarTheme[key] }}
+                />
+                <input
+                  type="color"
+                  value={sidebarTheme[key]}
+                  onChange={(e) => saveSidebarColor(key, e.target.value)}
+                  className={colorInputClass}
+                  title={label}
+                />
+              </div>
+            </label>
+          );
+          const sidebarWidgets = appConfig.sidebar_widgets || {};
+          const saveSidebarWidget = (key: string, enabled: boolean) => {
+            onSaveApp({
+              ...appConfig,
+              sidebar_widgets: {
+                ...sidebarWidgets,
+                [key]: enabled,
+              },
+            });
+          };
+          const sidebarWidgetControls = [
+            { key: "quota", label: "Quota Monitor", icon: <Coins size={14} />, color: "text-cyan-400" },
+            { key: "gpu", label: "GPU Monitor", icon: <Cpu size={14} />, color: "text-blue-400" },
+            { key: "deadlines", label: "Deadlines", icon: <Calendar size={14} />, color: "text-amber-400" },
+            { key: "arxiv", label: "Arxiv Radar", icon: <BookOpen size={14} />, color: "text-pink-400" },
+          ];
+
+          return (
+            <>
+        <div className="flex items-center justify-between gap-4">
+          <div className="space-y-1">
+            <div className={`text-xs font-bold ${appConfig.theme === "light" ? "text-slate-900" : "text-white"}`}>
+              Summon Sidebar
+            </div>
+            <p className="text-[10px] text-slate-400">
+              Open the always-on-top widget hub from the current screen.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => tauriInvoke("show_sidebar")}
+            className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-[10px] font-black uppercase tracking-wider transition-all shadow-lg shadow-blue-600/20"
+          >
+            Open Sidebar
+          </button>
+        </div>
+
+        <div className="border-t border-[var(--dashboard-border)] pt-6 space-y-3">
+          <div className="space-y-1">
+            <div className={`text-xs font-bold ${appConfig.theme === "light" ? "text-slate-900" : "text-white"}`}>
+              Sidebar Widgets
+            </div>
+            <p className="text-[10px] text-slate-400">
+              Choose which modules appear inside the summonable sidebar.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {sidebarWidgetControls.map((item) => (
+              <div
+                key={item.key}
+                className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border ${
+                  appConfig.theme === "light"
+                    ? "bg-white border-slate-200"
+                    : "bg-black/30 border-white/10"
+                }`}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className={item.color}>{item.icon}</span>
+                  <span className={`text-[10px] font-black uppercase tracking-wider truncate ${
+                    appConfig.theme === "light" ? "text-slate-700" : "text-slate-300"
+                  }`}>
+                    {item.label}
+                  </span>
+                </div>
+                <MasterSwitch
+                  enabled={sidebarWidgets[item.key] !== false}
+                  onToggle={(enabled) => saveSidebarWidget(item.key, enabled)}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="border-t border-[var(--dashboard-border)] pt-6 space-y-3">
+          <div className="space-y-1">
+            <div className={`text-xs font-bold ${appConfig.theme === "light" ? "text-slate-900" : "text-white"}`}>
+              Sidebar Colors
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {colorControl("background", "Background")}
+            {colorControl("header", "Header")}
+            {colorControl("quota", "Quota")}
+            {colorControl("gpu", "GPU")}
+            {colorControl("deadlines", "Deadlines")}
+            {colorControl("arxiv", "Arxiv")}
+          </div>
+          <button
+            type="button"
+            onClick={() => onSaveApp({ ...appConfig, sidebar_theme: DEFAULT_SIDEBAR_THEME })}
+            className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider border transition-all ${
+              appConfig.theme === "light"
+                ? "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
+                : "bg-black/40 border-white/10 text-slate-400 hover:text-white hover:bg-white/10"
+            }`}
+          >
+            Reset Colors
+          </button>
+        </div>
+
+        <div className="border-t border-[var(--dashboard-border)] pt-6 space-y-3">
+          <div className="space-y-1">
+            <div className={`text-xs font-bold ${appConfig.theme === "light" ? "text-slate-900" : "text-white"}`}>
+              Global Shortcut
+            </div>
+            <p className="text-[10px] text-slate-400">
+              Summon or hide the sidebar from anywhere. Use combinations like Ctrl+Alt+W or Ctrl+Shift+Space.
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={sidebarHotkeyInput}
+              onChange={(e) => setSidebarHotkeyInput(e.target.value)}
+              onBlur={(e) =>
+                onSaveApp({
+                  ...appConfig,
+                  sidebar_hotkey: e.target.value.trim() || "Ctrl+Alt+W",
+                })
+              }
+              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+              className={`min-w-0 flex-1 px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
+                appConfig.theme === "light"
+                  ? "bg-white border-slate-200 text-slate-900 focus:bg-white"
+                  : "bg-black/40 border-white/10 text-white focus:bg-black/60"
+              }`}
+              placeholder="Ctrl+Alt+W"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                setSidebarHotkeyInput("Ctrl+Alt+W");
+                onSaveApp({ ...appConfig, sidebar_hotkey: "Ctrl+Alt+W" });
+              }}
+              className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider border transition-all ${
+                appConfig.theme === "light"
+                  ? "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
+                  : "bg-black/40 border-white/10 text-slate-400 hover:text-white hover:bg-white/10"
+              }`}
+            >
+              Reset
+            </button>
+          </div>
+        </div>
+
+        <div className="border-t border-[var(--dashboard-border)] pt-6">
+          <div className={`text-xs font-bold mb-2 ${appConfig.theme === "light" ? "text-slate-900" : "text-white"}`}>
+            Hide Behavior
+          </div>
+          <div className={`grid grid-cols-1 md:grid-cols-2 gap-3 text-[10px] font-bold ${
+            appConfig.theme === "light" ? "text-slate-600" : "text-slate-400"
+          }`}>
+            <div className={`px-3 py-2 rounded-xl border ${appConfig.theme === "light" ? "bg-white border-slate-200" : "bg-black/30 border-white/10"}`}>
+              Shortcut toggles visibility
+            </div>
+            <div className={`px-3 py-2 rounded-xl border ${appConfig.theme === "light" ? "bg-white border-slate-200" : "bg-black/30 border-white/10"}`}>
+              Esc hides the sidebar
+            </div>
+          </div>
+        </div>
+            </>
+          );
+        })()}
       </div>
     </section>
   );
@@ -2009,6 +2248,7 @@ export function SettingsPanel({
             className="space-y-8"
           >
             {activeSection === "general" && renderGeneralSection()}
+            {activeSection === "sidebar" && renderSidebarSection()}
             {activeSection === LIVE_DATA_SECTION.QUOTA && renderQuotaSection()}
             {activeSection === LIVE_DATA_SECTION.GPU && renderGpuSection()}
             {activeSection === LIVE_DATA_SECTION.DEADLINES && renderDeadlinesSection()}

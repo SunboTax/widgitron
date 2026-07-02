@@ -1,3 +1,38 @@
 {
-  "theme": "light"
+  "theme": "light",
+  "sidebar_hotkey": "Ctrl+Alt+W",
+  "sidebar_theme": {
+    "background": "#050814",
+    "header": "#080d1d",
+    "quota": "#06b6d4",
+    "gpu": "#3b82f6",
+    "deadlines": "#f59e0b",
+    "arxiv": "#ec4899"
+  },
+  "sidebar_width": 420,
+  "sidebar_widgets": {
+    "quota": true,
+    "gpu": true,
+    "deadlines": true,
+    "arxiv": true
+  },
+  "sidebar_layout": {
+    "quota": 0.72,
+    "gpu": 1.1,
+    "deadlines": 0.82,
+    "arxiv": 1.36
+  },
+  "sidebar_order": ["quota", "gpu", "deadlines", "arxiv"],
+  "sidebar_tile_sizes": {
+    "quota": "wide",
+    "gpu": "large",
+    "deadlines": "wide",
+    "arxiv": "large"
+  },
+  "sidebar_tile_layout": {
+    "quota": { "x": 0, "y": 0, "w": 1, "h": 152 },
+    "gpu": { "x": 0, "y": 160, "w": 1, "h": 312 },
+    "deadlines": { "x": 0, "y": 480, "w": 1, "h": 152 },
+    "arxiv": { "x": 0, "y": 640, "w": 1, "h": 312 }
+  }
 }

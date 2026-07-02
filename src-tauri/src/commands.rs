@@ -1,10 +1,205 @@
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window};
 
 use crate::config_store;
 use crate::models::{
     AppConfig, ArxivConfig, ArxivPaper, GlobalState, GpuConfig, PaperConfig, PaperDeadlineInfo,
     QuotaConfig, QuotaItem, ServerGpuData, ToggleWidgetResponse, WidgetThemeConfig,
 };
+
+const SIDEBAR_LABEL: &str = "sidebar";
+const SIDEBAR_WIDTH_LOGICAL: f64 = 420.0;
+const SIDEBAR_MIN_WIDTH_LOGICAL: f64 = 320.0;
+const SIDEBAR_MARGIN_LOGICAL: f64 = 16.0;
+const SIDEBAR_MIN_HEIGHT_LOGICAL: f64 = 480.0;
+
+#[derive(Clone, Copy)]
+struct SidebarWorkArea {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+}
+
+fn monitor_near_cursor(app: &AppHandle) -> Option<tauri::Monitor> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut pt = POINT::default();
+    let has_cursor = unsafe { GetCursorPos(&mut pt).is_ok() };
+
+    if has_cursor {
+        if let Ok(monitors) = app.available_monitors() {
+            for monitor in monitors {
+                let pos = monitor.position();
+                let size = monitor.size();
+                if pt.x >= pos.x
+                    && pt.x < pos.x + size.width as i32
+                    && pt.y >= pos.y
+                    && pt.y < pos.y + size.height as i32
+                {
+                    return Some(monitor);
+                }
+            }
+        }
+    }
+
+    app.primary_monitor().ok().flatten()
+}
+
+fn sidebar_work_area(app: &AppHandle) -> Option<SidebarWorkArea> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut pt = POINT::default();
+    let has_cursor = unsafe { GetCursorPos(&mut pt).is_ok() };
+    if !has_cursor {
+        return None;
+    }
+
+    let monitor_handle = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+    if monitor_handle.is_invalid() {
+        return None;
+    }
+
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor_handle, &mut info).as_bool() } {
+        return None;
+    }
+
+    let scale_factor = app
+        .available_monitors()
+        .ok()
+        .and_then(|monitors| {
+            monitors.into_iter().find_map(|monitor| {
+                let pos = monitor.position();
+                let size = monitor.size();
+                let x = pt.x;
+                let y = pt.y;
+                if x >= pos.x
+                    && x < pos.x + size.width as i32
+                    && y >= pos.y
+                    && y < pos.y + size.height as i32
+                {
+                    Some(monitor.scale_factor())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(1.0);
+
+    let rc = info.rcWork;
+    let width = (rc.right - rc.left).max(1) as u32;
+    let height = (rc.bottom - rc.top).max(1) as u32;
+    Some(SidebarWorkArea {
+        x: rc.left,
+        y: rc.top,
+        width,
+        height,
+        scale_factor,
+    })
+}
+
+fn place_sidebar_window(app: &AppHandle, window: &WebviewWindow) -> Result<(), String> {
+    let area = if let Some(area) = sidebar_work_area(app) {
+        area
+    } else {
+        let monitor = monitor_near_cursor(app)
+            .ok_or_else(|| "No monitor available for sidebar placement".to_string())?;
+        SidebarWorkArea {
+            x: monitor.position().x,
+            y: monitor.position().y,
+            width: monitor.size().width,
+            height: monitor.size().height,
+            scale_factor: monitor.scale_factor(),
+        }
+    };
+
+    let scale = area.scale_factor;
+    let margin = (SIDEBAR_MARGIN_LOGICAL * scale).round() as i32;
+    let config = config_store::read_config::<AppConfig>(app, "app_config.json");
+    let max_width_logical = (area.width as f64 / scale - SIDEBAR_MARGIN_LOGICAL * 2.0)
+        .max(SIDEBAR_MIN_WIDTH_LOGICAL);
+    let width_logical = config
+        .sidebar_width
+        .unwrap_or(SIDEBAR_WIDTH_LOGICAL)
+        .clamp(SIDEBAR_MIN_WIDTH_LOGICAL, max_width_logical);
+    let width = (width_logical * scale).round() as u32;
+    let min_height = (SIDEBAR_MIN_HEIGHT_LOGICAL * scale).round() as i32;
+    let available_height = area.height as i32 - margin * 2;
+    let height = available_height.max(min_height).min(area.height as i32) as u32;
+    let y = if height == area.height {
+        area.y
+    } else {
+        area.y + margin
+    };
+    let x = area.x + area.width as i32 - width as i32 - margin;
+
+    window
+        .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(width, height)))
+        .map_err(|e| e.to_string())?;
+    window
+        .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)))
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+pub fn persist_sidebar_width(app: &AppHandle, window: &Window) {
+    let size = match window.inner_size() {
+        Ok(size) => size,
+        Err(err) => {
+            log::warn!("Failed to read sidebar size: {}", err);
+            return;
+        }
+    };
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let width_logical = (size.width as f64 / scale)
+        .round()
+        .max(SIDEBAR_MIN_WIDTH_LOGICAL);
+
+    let mut config = config_store::read_config::<AppConfig>(app, "app_config.json");
+    if config
+        .sidebar_width
+        .map(|current| (current - width_logical).abs() < 1.0)
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    config.sidebar_width = Some(width_logical);
+    if let Err(err) = config_store::write_config(app, "app_config.json", &config) {
+        log::warn!("Failed to persist sidebar width: {}", err);
+        return;
+    }
+    let _ = app.emit("app_config_update", &config);
+}
+
+fn ensure_sidebar_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window(SIDEBAR_LABEL) {
+        return Ok(window);
+    }
+
+    WebviewWindowBuilder::new(app, SIDEBAR_LABEL, WebviewUrl::App("index.html".into()))
+        .title("Widgitron Sidebar")
+        .inner_size(SIDEBAR_WIDTH_LOGICAL, 720.0)
+        .decorations(false)
+        .resizable(true)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible(false)
+        .build()
+        .map_err(|e| e.to_string())
+}
 
 #[tauri::command]
 pub async fn save_gpu_config(
@@ -113,6 +308,7 @@ pub async fn get_paper_config(app: AppHandle) -> Result<PaperConfig, String> {
 #[tauri::command]
 pub async fn save_app_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     config_store::write_config(&app, "app_config.json", &config)?;
+    crate::sidebar_hotkey::update_global_sidebar_hotkey(config.sidebar_hotkey.clone());
     let _ = app.emit("app_config_update", &config);
     Ok(())
 }
@@ -195,6 +391,45 @@ pub async fn refresh_gpu_data(
 #[tauri::command]
 pub async fn show_main(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    if let Some(tray_menu) = app.get_webview_window("tray-menu") {
+        let _ = tray_menu.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn show_sidebar(app: tauri::AppHandle) -> Result<(), String> {
+    let window = ensure_sidebar_window(&app)?;
+    place_sidebar_window(&app, &window)?;
+    let _ = window.set_always_on_top(true);
+    let _ = window.show();
+    let _ = window.set_focus();
+    if let Some(tray_menu) = app.get_webview_window("tray-menu") {
+        let _ = tray_menu.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn hide_sidebar(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(SIDEBAR_LABEL) {
+        let _ = window.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toggle_sidebar(app: tauri::AppHandle) -> Result<(), String> {
+    let window = ensure_sidebar_window(&app)?;
+    let is_visible = window.is_visible().unwrap_or(false);
+    if is_visible {
+        let _ = window.hide();
+    } else {
+        place_sidebar_window(&app, &window)?;
+        let _ = window.set_always_on_top(true);
         let _ = window.show();
         let _ = window.set_focus();
     }

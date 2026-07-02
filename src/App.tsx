@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import {
   LayoutDashboard,
   Settings,
@@ -19,6 +19,8 @@ import {
   Trash2,
   RefreshCw,
   Gauge,
+  GripVertical,
+  Maximize2,
   Globe,
   User,
   ChevronDown
@@ -39,7 +41,7 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 import { WidgetTheme, WidgetThemeConfig } from "./types/theme";
-import { hexToRgba } from "./utils/color";
+import { hexToRgba, isLightColor } from "./utils/color";
 import { listenBackendServiceError } from "./utils/backendServiceError";
 import { listenQuotaMonitorStatus, type QuotaMonitorStatus } from "./utils/quotaMonitorStatus";
 import { listenServiceUpdateEvents } from "./utils/serviceUpdateEvents";
@@ -132,6 +134,250 @@ const PROVIDER_LOGOS: Record<string, string> = {
   pioneer: "/icons/pioneer.svg",
   "claude-code": "/icons/claude-code.svg",
 };
+
+const DEFAULT_SIDEBAR_THEME = {
+  background: "#050814",
+  header: "#080d1d",
+  quota: "#06b6d4",
+  gpu: "#3b82f6",
+  deadlines: "#f59e0b",
+  arxiv: "#ec4899",
+};
+
+type SidebarSectionKey = "quota" | "gpu" | "deadlines" | "arxiv";
+
+const DEFAULT_SIDEBAR_ORDER: SidebarSectionKey[] = ["quota", "gpu", "deadlines", "arxiv"];
+
+const SIDEBAR_TILE_GAP = 8;
+const SIDEBAR_TILE_MIN_WIDTH_RATIO = 0.32;
+const SIDEBAR_TILE_MIN_HEIGHT = 152;
+const LEGACY_SIDEBAR_GRID_COLUMNS = 4;
+const LEGACY_SIDEBAR_GRID_GAP = 8;
+const LEGACY_SIDEBAR_GRID_ROW_HEIGHT = 72;
+
+type SidebarTileRect = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+const DEFAULT_SIDEBAR_TILE_LAYOUT: Record<SidebarSectionKey, SidebarTileRect> = {
+  quota: { x: 0, y: 0, w: 1, h: 152 },
+  gpu: { x: 0, y: 160, w: 1, h: 312 },
+  deadlines: { x: 0, y: 480, w: 1, h: 152 },
+  arxiv: { x: 0, y: 640, w: 1, h: 312 },
+};
+
+type SidebarSectionDefinition = {
+  key: SidebarSectionKey;
+  title: string;
+  icon: ReactNode;
+  accentColor: string;
+  content: ReactNode;
+};
+
+const normalizeSidebarOrder = (order?: string[]): SidebarSectionKey[] => {
+  const keys = new Set<SidebarSectionKey>(DEFAULT_SIDEBAR_ORDER);
+  const normalized = (order || []).filter((key): key is SidebarSectionKey =>
+    keys.has(key as SidebarSectionKey)
+  );
+  for (const key of DEFAULT_SIDEBAR_ORDER) {
+    if (!normalized.includes(key)) normalized.push(key);
+  }
+  return normalized;
+};
+
+function sidebarRectsOverlap(a: SidebarTileRect, b: SidebarTileRect) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+const normalizeSidebarTileLayout = (
+  layout?: Record<string, Partial<SidebarTileRect>>
+): Record<SidebarSectionKey, SidebarTileRect> => {
+  const normalizeRect = (key: SidebarSectionKey): SidebarTileRect => {
+    const fallback = DEFAULT_SIDEBAR_TILE_LAYOUT[key];
+    const source = layout?.[key];
+    const hasLegacyColumns =
+      (typeof source?.w === "number" && Number.isFinite(source.w) && source.w > 1) ||
+      (typeof source?.x === "number" && Number.isFinite(source.x) && source.x > 1);
+
+    if (source && hasLegacyColumns) {
+      const legacyW =
+        typeof source.w === "number" && Number.isFinite(source.w)
+          ? source.w
+          : fallback.w * LEGACY_SIDEBAR_GRID_COLUMNS;
+      const legacyH =
+        typeof source.h === "number" && Number.isFinite(source.h)
+          ? source.h
+          : Math.max(
+              1,
+              Math.round(
+                (fallback.h + LEGACY_SIDEBAR_GRID_GAP) /
+                  (LEGACY_SIDEBAR_GRID_ROW_HEIGHT + LEGACY_SIDEBAR_GRID_GAP)
+              )
+            );
+      const legacyX =
+        typeof source.x === "number" && Number.isFinite(source.x)
+          ? source.x
+          : fallback.x * LEGACY_SIDEBAR_GRID_COLUMNS;
+      const legacyY =
+        typeof source.y === "number" && Number.isFinite(source.y)
+          ? source.y
+          : Math.round(fallback.y / (LEGACY_SIDEBAR_GRID_ROW_HEIGHT + LEGACY_SIDEBAR_GRID_GAP));
+      const w = Math.min(
+        1,
+        Math.max(SIDEBAR_TILE_MIN_WIDTH_RATIO, legacyW / LEGACY_SIDEBAR_GRID_COLUMNS)
+      );
+      const x = Math.min(1 - w, Math.max(0, legacyX / LEGACY_SIDEBAR_GRID_COLUMNS));
+      const y = Math.max(0, legacyY * (LEGACY_SIDEBAR_GRID_ROW_HEIGHT + LEGACY_SIDEBAR_GRID_GAP));
+      const h = Math.max(
+        SIDEBAR_TILE_MIN_HEIGHT,
+        legacyH * LEGACY_SIDEBAR_GRID_ROW_HEIGHT + Math.max(0, legacyH - 1) * LEGACY_SIDEBAR_GRID_GAP
+      );
+      return { x, y, w, h };
+    }
+
+    const w =
+      typeof source?.w === "number" && Number.isFinite(source.w)
+        ? Math.min(1, Math.max(SIDEBAR_TILE_MIN_WIDTH_RATIO, source.w))
+        : fallback.w;
+    const h =
+      typeof source?.h === "number" && Number.isFinite(source.h)
+        ? Math.max(SIDEBAR_TILE_MIN_HEIGHT, source.h)
+        : fallback.h;
+    const x =
+      typeof source?.x === "number" && Number.isFinite(source.x)
+        ? Math.min(1 - w, Math.max(0, source.x))
+        : fallback.x;
+    const y =
+      typeof source?.y === "number" && Number.isFinite(source.y)
+        ? Math.max(0, source.y)
+        : fallback.y;
+    return { x, y, w, h };
+  };
+
+  const result = {
+    quota: normalizeRect("quota"),
+    gpu: normalizeRect("gpu"),
+    deadlines: normalizeRect("deadlines"),
+    arxiv: normalizeRect("arxiv"),
+  };
+
+  const placed: SidebarSectionKey[] = [];
+  for (const key of DEFAULT_SIDEBAR_ORDER) {
+    while (placed.some((otherKey) => sidebarRectsOverlap(result[key], result[otherKey]))) {
+      result[key] = { ...result[key], y: result[key].y + 1 };
+    }
+    placed.push(key);
+  }
+
+  return result;
+};
+
+const sidebarTileFits = (
+  key: SidebarSectionKey,
+  rect: SidebarTileRect,
+  layout: Record<SidebarSectionKey, SidebarTileRect>,
+  visibleKeys: SidebarSectionKey[]
+) => {
+  if (
+    rect.x < 0 ||
+    rect.y < 0 ||
+    rect.w < SIDEBAR_TILE_MIN_WIDTH_RATIO ||
+    rect.h < SIDEBAR_TILE_MIN_HEIGHT
+  ) {
+    return false;
+  }
+  if (rect.x + rect.w > 1) return false;
+  return visibleKeys.every((otherKey) => {
+    if (otherKey === key) return true;
+    return !sidebarRectsOverlap(rect, layout[otherKey]);
+  });
+};
+
+function SidebarWidgetSection({
+  title,
+  icon,
+  accentColor,
+  isLight,
+  onClose,
+  onMoveStart,
+  onResizeStart,
+  children,
+}: {
+  title: string;
+  icon: ReactNode;
+  accentColor: string;
+  isLight: boolean;
+  onClose: () => void;
+  onMoveStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onResizeStart: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  children: ReactNode;
+}) {
+  return (
+    <section
+      className="h-full min-h-0 rounded-lg border overflow-hidden shadow-sm flex flex-col relative"
+      style={{
+        background: isLight
+          ? `linear-gradient(180deg, ${hexToRgba(accentColor, 0.12)}, rgba(255, 255, 255, 0.96))`
+          : `linear-gradient(180deg, ${hexToRgba(accentColor, 0.1)}, rgba(5, 8, 20, 0.98))`,
+        borderColor: hexToRgba(accentColor, isLight ? 0.34 : 0.26),
+      }}
+    >
+      <div
+        className="h-8 shrink-0 px-3 flex items-center justify-between border-b cursor-grab active:cursor-grabbing"
+        style={{
+          backgroundColor: hexToRgba(accentColor, isLight ? 0.16 : 0.12),
+          borderColor: hexToRgba(accentColor, isLight ? 0.22 : 0.18),
+        }}
+        onPointerDown={onMoveStart}
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <GripVertical
+            size={13}
+            className={isLight ? "text-slate-400" : "text-slate-500"}
+          />
+          <span style={{ color: accentColor }}>{icon}</span>
+          <h2
+            className={`text-[11px] font-black uppercase tracking-widest truncate ${
+              isLight ? "text-slate-800" : "text-white"
+            }`}
+          >
+            {title}
+          </h2>
+        </div>
+        <div className="flex items-center gap-1" onPointerDown={(event) => event.stopPropagation()}>
+          <button
+            type="button"
+            onClick={onClose}
+            className={`w-6 h-6 flex items-center justify-center rounded-md transition-colors ${
+              isLight
+                ? "text-slate-500 hover:text-red-600 hover:bg-red-50"
+                : "text-slate-500 hover:text-white hover:bg-white/10"
+            }`}
+            title={`Hide ${title}`}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      </div>
+      <div className="flex-1 min-h-0 p-3 overflow-hidden">{children}</div>
+      <button
+        type="button"
+        onPointerDown={onResizeStart}
+        className={`absolute right-1 bottom-1 w-6 h-6 flex items-center justify-center rounded-md cursor-nwse-resize transition-colors ${
+          isLight
+            ? "text-slate-400 hover:text-slate-800 hover:bg-slate-100"
+            : "text-white/30 hover:text-white hover:bg-white/10"
+        }`}
+        title={`Resize ${title}`}
+      >
+        <Maximize2 size={12} />
+      </button>
+    </section>
+  );
+}
 
 const renderProviderIcon = (provider: string, isManual = false) => {
   if (isManual) {
@@ -307,6 +553,11 @@ function App() {
   const [serviceToggleBusy, setServiceToggleBusy] = useState<Partial<Record<ServiceField, boolean>>>({});
   const [generalServiceRefreshError, setGeneralServiceRefreshError] = useState<ServiceToggleError | null>(null);
   const [serviceToggleErrorDismissed, setServiceToggleErrorDismissed] = useState(false);
+  const [sidebarTileLayoutDraft, setSidebarTileLayoutDraft] =
+    useState<Record<SidebarSectionKey, SidebarTileRect> | null>(null);
+  const [activeSidebarTile, setActiveSidebarTile] = useState<SidebarSectionKey | null>(null);
+  const sidebarOrderRef = useRef<SidebarSectionKey[]>(DEFAULT_SIDEBAR_ORDER);
+  const sidebarBoardRef = useRef<HTMLDivElement | null>(null);
   const prevActiveTabRef = useRef(activeTab);
 
   useEffect(() => {
@@ -691,28 +942,30 @@ function App() {
 
         loadArxivArchiveLists(() => active, setArxivSavedPapers, setArxivDiscardedPapers);
 
-        // Check for updates on startup & every 12 hours in background
-        const runUpdateCheck = () => {
-          tauriInvoke("check_for_updates")
-            .then((res) => {
-              if (active) {
-                setUpdateInfo(res);
-                setUpdateCheckError(null);
-              }
-            })
-            .catch((err) => {
-              console.error("Failed to check for updates:", err);
-              if (active) {
-                setUpdateCheckError(String(err));
-              }
-            });
-        };
+        if (win.label === "main") {
+          // Check for updates on startup & every 12 hours in background.
+          const runUpdateCheck = () => {
+            tauriInvoke("check_for_updates")
+              .then((res) => {
+                if (active) {
+                  setUpdateInfo(res);
+                  setUpdateCheckError(null);
+                }
+              })
+              .catch((err) => {
+                console.error("Failed to check for updates:", err);
+                if (active) {
+                  setUpdateCheckError(String(err));
+                }
+              });
+          };
 
-        const startupOtaDelay = setTimeout(runUpdateCheck, 8000);
-        unlisteners.push(() => clearTimeout(startupOtaDelay));
+          const startupOtaDelay = setTimeout(runUpdateCheck, 8000);
+          unlisteners.push(() => clearTimeout(startupOtaDelay));
 
-        const updateInterval = setInterval(runUpdateCheck, 12 * 60 * 60 * 1000);
-        unlisteners.push(() => clearInterval(updateInterval));
+          const updateInterval = setInterval(runUpdateCheck, 12 * 60 * 60 * 1000);
+          unlisteners.push(() => clearInterval(updateInterval));
+        }
       } catch (e) {
         console.error("Init failed", e);
       }
@@ -729,7 +982,7 @@ function App() {
               }, 10);
             }
           } catch (err) {
-            console.error("Error checking tray-menu visibility on focus change:", err);
+            console.error(`Error checking ${win.label} visibility on focus change:`, err);
           }
         }
       }).then((u) => {
@@ -989,6 +1242,8 @@ function App() {
       const win = getCurrentWindow();
       if (windowLabel === "main") {
         await win.hide();
+      } else if (windowLabel === "sidebar") {
+        await tauriInvoke("hide_sidebar");
       } else if (windowLabel.startsWith("widget-")) {
         await tauriInvoke("close_widget", { id: windowLabel });
       } else {
@@ -1011,10 +1266,33 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    if (windowLabel !== "sidebar") return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        tauriInvoke("hide_sidebar").catch(console.error);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [windowLabel]);
+
   // --- CUSTOM TRAY MENU VIEW ---
   if (windowLabel === "tray-menu") {
     return (
       <div className="h-screen w-screen flex flex-col bg-white border border-slate-200 rounded-lg overflow-hidden shadow-xl p-1 select-none">
+        <button
+          onClick={() => tauriInvoke("show_sidebar")}
+          className="w-full flex items-center gap-3 px-3 py-2 rounded-md hover:bg-slate-100 text-slate-700 transition-colors group"
+        >
+          <Activity
+            size={14}
+            className="text-slate-500 group-hover:text-cyan-600 transition-colors"
+          />
+          <span className="text-[11px] font-bold">Sidebar</span>
+        </button>
         <button
           onClick={() => tauriInvoke("show_main")}
           className="w-full flex items-center gap-3 px-3 py-2 rounded-md hover:bg-slate-100 text-slate-700 transition-colors group"
@@ -1032,6 +1310,311 @@ function App() {
           <X size={14} className="text-slate-500 group-hover:text-red-500 transition-colors" />
           <span className="text-[11px] font-bold">Exit</span>
         </button>
+      </div>
+    );
+  }
+
+  // --- SUMMONABLE SIDEBAR HUB VIEW ---
+  if (windowLabel === "sidebar") {
+    const openDashboard = async () => {
+      await tauriInvoke("show_main");
+    };
+    const sidebarTheme = { ...DEFAULT_SIDEBAR_THEME, ...(appConfig.sidebar_theme || {}) };
+    const sidebarIsLight = isLightColor(sidebarTheme.background);
+    const sidebarWidgets = appConfig.sidebar_widgets || {};
+    const sidebarOrder = normalizeSidebarOrder(appConfig.sidebar_order);
+    const sidebarTileLayout =
+      sidebarTileLayoutDraft ?? normalizeSidebarTileLayout(appConfig.sidebar_tile_layout);
+    sidebarOrderRef.current = sidebarOrder;
+    const updateSidebarWidget = async (key: string, visible: boolean) => {
+      await onSaveApp({
+        ...appConfig,
+        sidebar_order: sidebarOrderRef.current,
+        sidebar_tile_layout: sidebarTileLayout,
+        sidebar_widgets: {
+          ...sidebarWidgets,
+          [key]: visible,
+        },
+      });
+    };
+    const allSidebarSections: SidebarSectionDefinition[] = [
+      {
+        key: "quota",
+        title: "Quota Monitor",
+        icon: <Gauge size={14} />,
+        accentColor: sidebarTheme.quota,
+        content: <QuotaWidgetContent />,
+      },
+      {
+        key: "gpu",
+        title: "GPU Monitor",
+        icon: <Cpu size={14} />,
+        accentColor: sidebarTheme.gpu,
+        content: <GPUWidgetContent />,
+      },
+      {
+        key: "deadlines",
+        title: "Deadlines",
+        icon: <Trophy size={14} />,
+        accentColor: sidebarTheme.deadlines,
+        content: <DeadlineWidgetContent />,
+      },
+      {
+        key: "arxiv",
+        title: "Arxiv Radar",
+        icon: <Activity size={14} />,
+        accentColor: sidebarTheme.arxiv,
+        content: <ArxivWidgetContent />,
+      },
+    ];
+    const sectionByKey = new Map(allSidebarSections.map((section) => [section.key, section]));
+    const sidebarSections = sidebarOrder
+      .map((key) => sectionByKey.get(key))
+      .filter((section): section is SidebarSectionDefinition =>
+        Boolean(section && sidebarWidgets[section.key] !== false)
+      );
+    const visibleSidebarKeys = sidebarSections.map((section) => section.key);
+    const boardRows = Math.max(
+      640,
+      ...visibleSidebarKeys.map((key) => sidebarTileLayout[key].y + sidebarTileLayout[key].h)
+    );
+    const boardHeight = boardRows;
+    const getSidebarGridMetrics = () => {
+      const board = sidebarBoardRef.current;
+      if (!board) return null;
+      return {
+        width: board.clientWidth,
+      };
+    };
+    const saveSidebarTileLayout = (nextLayout: Record<SidebarSectionKey, SidebarTileRect>) => {
+      setSidebarTileLayoutDraft(nextLayout);
+      onSaveApp({
+        ...appConfig,
+        sidebar_order: sidebarOrderRef.current,
+        sidebar_tile_layout: nextLayout,
+      }).catch(console.error);
+    };
+    const startSidebarTileMove = (
+      event: ReactPointerEvent<HTMLDivElement>,
+      key: SidebarSectionKey
+    ) => {
+      const metrics = getSidebarGridMetrics();
+      if (!metrics) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      setActiveSidebarTile(key);
+
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startRect = sidebarTileLayout[key];
+      let latestLayout = sidebarTileLayout;
+
+      const onPointerMove = (moveEvent: PointerEvent) => {
+        const nextRect = {
+          ...startRect,
+          x: Math.min(1 - startRect.w, Math.max(0, startRect.x + (moveEvent.clientX - startX) / metrics.width)),
+          y: Math.max(0, startRect.y + (moveEvent.clientY - startY)),
+        };
+        if (!sidebarTileFits(key, nextRect, latestLayout, visibleSidebarKeys)) return;
+        latestLayout = { ...latestLayout, [key]: nextRect };
+        setSidebarTileLayoutDraft(latestLayout);
+      };
+
+      const onPointerUp = () => {
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        setActiveSidebarTile(null);
+        saveSidebarTileLayout(latestLayout);
+      };
+
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp, { once: true });
+    };
+    const startSidebarTileResize = (
+      event: ReactPointerEvent<HTMLButtonElement>,
+      key: SidebarSectionKey
+    ) => {
+      const metrics = getSidebarGridMetrics();
+      if (!metrics) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      setActiveSidebarTile(key);
+
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startRect = sidebarTileLayout[key];
+      let latestLayout = sidebarTileLayout;
+
+      const onPointerMove = (moveEvent: PointerEvent) => {
+        const minWidthRatio = Math.min(0.95, Math.max(SIDEBAR_TILE_MIN_WIDTH_RATIO, 180 / metrics.width));
+        const nextRect = {
+          ...startRect,
+          w: Math.min(
+            1 - startRect.x,
+            Math.max(
+              minWidthRatio,
+              startRect.w + (moveEvent.clientX - startX) / metrics.width
+            )
+          ),
+          h: Math.max(
+            SIDEBAR_TILE_MIN_HEIGHT,
+            startRect.h + (moveEvent.clientY - startY)
+          ),
+        };
+        if (!sidebarTileFits(key, nextRect, latestLayout, visibleSidebarKeys)) return;
+        latestLayout = { ...latestLayout, [key]: nextRect };
+        setSidebarTileLayoutDraft(latestLayout);
+      };
+
+      const onPointerUp = () => {
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        setActiveSidebarTile(null);
+        saveSidebarTileLayout(latestLayout);
+      };
+
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp, { once: true });
+    };
+
+    return (
+      <div
+        className={`absolute inset-0 flex flex-col overflow-hidden border rounded-l-lg shadow-2xl select-none ${
+          sidebarIsLight ? "text-slate-900" : "text-white"
+        }`}
+        style={{
+          backgroundColor: sidebarTheme.background,
+          borderColor: sidebarIsLight
+            ? hexToRgba(sidebarTheme.header, 0.28)
+            : hexToRgba(sidebarTheme.header, 0.9),
+        }}
+      >
+        <header
+          className="h-14 shrink-0 px-4 flex items-center justify-between border-b"
+          style={{
+            backgroundColor: sidebarTheme.header,
+            borderColor: sidebarIsLight
+              ? hexToRgba(sidebarTheme.header, 0.28)
+              : hexToRgba(sidebarTheme.header, 0.9),
+          }}
+          onMouseDown={startDrag}
+          data-tauri-drag-region="true"
+        >
+          <div className="flex items-center gap-2.5 pointer-events-none min-w-0">
+            <div className="w-8 h-8 rounded-lg overflow-hidden bg-blue-600 shadow-lg shadow-cyan-500/20">
+              <img src="/logo.png" alt="Widgitron" className="w-full h-full object-cover" />
+            </div>
+            <div className="min-w-0">
+              <h1 className="text-sm font-black leading-none truncate">Widgitron Hub</h1>
+              <div
+                className={`text-[9px] font-black uppercase tracking-widest mt-1 ${
+                  sidebarIsLight ? "text-slate-500" : "text-slate-500"
+                }`}
+              >
+                {appConfig.sidebar_hotkey || "Ctrl+Alt+W"}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5" data-no-drag="true">
+            <button
+              type="button"
+              onClick={openDashboard}
+              className={`w-8 h-8 flex items-center justify-center rounded-md border transition-colors ${
+                sidebarIsLight
+                  ? "bg-white border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-50"
+                  : "bg-slate-800 border-slate-600 text-slate-300 hover:text-white hover:bg-slate-700"
+              }`}
+              title="Open dashboard"
+            >
+              <LayoutDashboard size={15} />
+            </button>
+            <button
+              type="button"
+              onClick={handleClose}
+              className={`w-8 h-8 flex items-center justify-center rounded-md border transition-colors ${
+                sidebarIsLight
+                  ? "bg-white border-slate-200 text-slate-600 hover:text-white hover:bg-red-600"
+                  : "bg-slate-800 border-slate-600 text-slate-300 hover:text-white hover:bg-red-600"
+              }`}
+              title="Hide sidebar"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        </header>
+
+        <div
+          className="flex-1 min-h-0 overflow-y-auto custom-scrollbar p-3"
+          data-no-drag="true"
+        >
+          {sidebarSections.length > 0 ? (
+            <div
+              ref={sidebarBoardRef}
+              className="relative min-w-0"
+              style={{ height: boardHeight }}
+            >
+              {sidebarSections.map((section) => {
+                const rect = sidebarTileLayout[section.key];
+                const isActive = activeSidebarTile === section.key;
+                return (
+                  <div
+                    key={section.key}
+                    className={`absolute min-h-0 ${
+                      isActive ? "" : "transition-[left,top,width,height,opacity] duration-150"
+                    } ${
+                      isActive ? "z-20 opacity-90" : "z-0 opacity-100"
+                    }`}
+                    style={{
+                      left: `${rect.x * 100}%`,
+                      top: rect.y,
+                      width: `calc(${rect.w * 100}% - ${SIDEBAR_TILE_GAP}px)`,
+                      height: rect.h,
+                    }}
+                  >
+                    <SidebarWidgetSection
+                      title={section.title}
+                      icon={section.icon}
+                      accentColor={section.accentColor}
+                      isLight={sidebarIsLight}
+                      onClose={() => updateSidebarWidget(section.key, false)}
+                      onMoveStart={(event) => startSidebarTileMove(event, section.key)}
+                      onResizeStart={(event) => startSidebarTileResize(event, section.key)}
+                    >
+                      {section.content}
+                    </SidebarWidgetSection>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div
+              className={`h-full min-h-[320px] rounded-lg border border-dashed flex flex-col items-center justify-center text-center px-6 ${
+                sidebarIsLight
+                  ? "border-slate-300 bg-white/70 text-slate-500"
+                  : "border-white/10 bg-white/5 text-slate-400"
+              }`}
+            >
+              <LayoutDashboard size={20} className="mb-3 opacity-70" />
+              <div className="text-[11px] font-black uppercase tracking-widest">
+                No Sidebar Widgets
+              </div>
+              <button
+                type="button"
+                onClick={openDashboard}
+                className={`mt-4 px-4 py-2 rounded-lg border text-[10px] font-black uppercase tracking-wider transition-colors ${
+                  sidebarIsLight
+                    ? "bg-slate-900 text-white border-slate-900 hover:bg-slate-700"
+                    : "bg-white/10 text-white border-white/10 hover:bg-white/15"
+                }`}
+              >
+                Open Settings
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -1274,13 +1857,27 @@ function App() {
                 </div>
 
                 <div className="mt-4">
-                  <h2
-                    className={`text-xl font-bold tracking-tight mb-6 ${
-                      appConfig.theme === "light" ? "text-slate-900" : "text-white"
-                    }`}
-                  >
-                    Quick Launch Widgets
-                  </h2>
+                  <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+                    <h2
+                      className={`text-xl font-bold tracking-tight ${
+                        appConfig.theme === "light" ? "text-slate-900" : "text-white"
+                      }`}
+                    >
+                      Quick Launch Widgets
+                    </h2>
+                    <button
+                      type="button"
+                      onClick={() => tauriInvoke("show_sidebar")}
+                      className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-black uppercase tracking-widest transition-colors ${
+                        appConfig.theme === "light"
+                          ? "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                          : "bg-white/5 border-white/10 text-slate-200 hover:bg-white/10"
+                      }`}
+                    >
+                      <Activity size={14} />
+                      Open Sidebar
+                    </button>
+                  </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {QUICK_LAUNCH_WIDGETS.map(({ field, color, detail }) => {
                       if (appConfig[field] === false) return null;

@@ -35,6 +35,7 @@ mod models;
 mod ota;
 mod quota;
 mod secrets;
+mod sidebar_hotkey;
 mod utils;
 mod vscode_secrets;
 mod widget_layout;
@@ -68,6 +69,9 @@ pub fn run() {
             commands::get_gpu_data,
             commands::refresh_gpu_data,
             commands::show_main,
+            commands::show_sidebar,
+            commands::hide_sidebar,
+            commands::toggle_sidebar,
             commands::exit_app,
             commands::get_theme_config,
             commands::save_theme_config,
@@ -207,8 +211,8 @@ pub fn run() {
                                     }
                                 }
 
-                                let physical_width = (140.0 * scale_factor) as i32;
-                                let physical_height = (70.0 * scale_factor) as i32;
+                                let physical_width = (150.0 * scale_factor) as i32;
+                                let physical_height = (104.0 * scale_factor) as i32;
 
                                 // Adjust X so the window doesn't overflow the right edge of the monitor
                                 let mut x = pt.x;
@@ -249,7 +253,10 @@ pub fn run() {
                             button: MouseButton::Left,
                             ..
                         } => {
-                            // Left click can also toggle or do nothing, keeping it clean
+                            let app_handle = tray.app_handle().clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = commands::show_sidebar(app_handle).await;
+                            });
                         }
                         TrayIconEvent::DoubleClick {
                             button: MouseButton::Left,
@@ -296,6 +303,10 @@ pub fn run() {
             // Auto-start Widgets (respecting Master Switch)
             let app_config =
                 config_store::read_config::<models::AppConfig>(&handle, "app_config.json");
+            sidebar_hotkey::start_global_sidebar_hotkey(
+                handle.clone(),
+                app_config.sidebar_hotkey.clone(),
+            );
 
             // Ensure Main Window is visible (or hidden based on config)
             if let Some(main_win) = handle.get_webview_window("main") {
@@ -371,6 +382,11 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             let label = window.label().to_string();
+            if label == "sidebar" && matches!(event, tauri::WindowEvent::Resized(_)) {
+                commands::persist_sidebar_width(&window.app_handle(), window);
+                return;
+            }
+
             if label == "main"
                 && matches!(
                     event,

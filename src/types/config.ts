@@ -10,7 +10,31 @@ export interface AppConfig {
   quota_enabled?: boolean;
   hide_on_startup?: boolean;
   arxiv_proxy?: string;
+  sidebar_hotkey?: string;
+  sidebar_theme?: SidebarThemeConfig;
+  sidebar_width?: number;
+  sidebar_widgets?: Record<string, boolean>;
+  sidebar_layout?: Record<string, number>;
+  sidebar_order?: string[];
+  sidebar_tile_sizes?: Record<string, string>;
+  sidebar_tile_layout?: Record<string, SidebarTileLayoutConfig>;
   active_widgets?: Record<string, boolean>;
+}
+
+export interface SidebarTileLayoutConfig {
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+}
+
+export interface SidebarThemeConfig {
+  background?: string;
+  header?: string;
+  quota?: string;
+  gpu?: string;
+  deadlines?: string;
+  arxiv?: string;
 }
 
 export interface ServerConfig {

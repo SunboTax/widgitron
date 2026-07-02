@@ -106,7 +106,33 @@ pub struct AppConfig {
     pub quota_enabled: Option<bool>,
     pub hide_on_startup: Option<bool>,
     pub arxiv_proxy: Option<String>,
+    pub sidebar_hotkey: Option<String>,
+    pub sidebar_theme: Option<SidebarThemeConfig>,
+    pub sidebar_width: Option<f64>,
+    pub sidebar_widgets: Option<HashMap<String, bool>>,
+    pub sidebar_layout: Option<HashMap<String, f64>>,
+    pub sidebar_order: Option<Vec<String>>,
+    pub sidebar_tile_sizes: Option<HashMap<String, String>>,
+    pub sidebar_tile_layout: Option<HashMap<String, SidebarTileLayoutConfig>>,
     pub active_widgets: Option<HashMap<String, bool>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SidebarThemeConfig {
+    pub background: Option<String>,
+    pub header: Option<String>,
+    pub quota: Option<String>,
+    pub gpu: Option<String>,
+    pub deadlines: Option<String>,
+    pub arxiv: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SidebarTileLayoutConfig {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub w: Option<f64>,
+    pub h: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -122,6 +148,59 @@ pub struct ToggleWidgetResponse {
 
 impl Default for AppConfig {
     fn default() -> Self {
+        let mut sidebar_widgets = HashMap::new();
+        sidebar_widgets.insert("quota".into(), true);
+        sidebar_widgets.insert("gpu".into(), true);
+        sidebar_widgets.insert("deadlines".into(), true);
+        sidebar_widgets.insert("arxiv".into(), true);
+        let mut sidebar_layout = HashMap::new();
+        sidebar_layout.insert("quota".into(), 0.72);
+        sidebar_layout.insert("gpu".into(), 1.1);
+        sidebar_layout.insert("deadlines".into(), 0.82);
+        sidebar_layout.insert("arxiv".into(), 1.36);
+        let mut sidebar_tile_sizes = HashMap::new();
+        sidebar_tile_sizes.insert("quota".into(), "wide".into());
+        sidebar_tile_sizes.insert("gpu".into(), "large".into());
+        sidebar_tile_sizes.insert("deadlines".into(), "wide".into());
+        sidebar_tile_sizes.insert("arxiv".into(), "large".into());
+        let mut sidebar_tile_layout = HashMap::new();
+        sidebar_tile_layout.insert(
+            "quota".into(),
+            SidebarTileLayoutConfig {
+                x: Some(0.0),
+                y: Some(0.0),
+                w: Some(1.0),
+                h: Some(152.0),
+            },
+        );
+        sidebar_tile_layout.insert(
+            "gpu".into(),
+            SidebarTileLayoutConfig {
+                x: Some(0.0),
+                y: Some(160.0),
+                w: Some(1.0),
+                h: Some(312.0),
+            },
+        );
+        sidebar_tile_layout.insert(
+            "deadlines".into(),
+            SidebarTileLayoutConfig {
+                x: Some(0.0),
+                y: Some(480.0),
+                w: Some(1.0),
+                h: Some(152.0),
+            },
+        );
+        sidebar_tile_layout.insert(
+            "arxiv".into(),
+            SidebarTileLayoutConfig {
+                x: Some(0.0),
+                y: Some(640.0),
+                w: Some(1.0),
+                h: Some(312.0),
+            },
+        );
+
         Self {
             theme: Some("dark".into()),
             always_on_top: Some(HashMap::new()),
@@ -132,6 +211,26 @@ impl Default for AppConfig {
             quota_enabled: Some(true),
             hide_on_startup: Some(false),
             arxiv_proxy: None,
+            sidebar_hotkey: Some(crate::sidebar_hotkey::DEFAULT_SIDEBAR_HOTKEY.into()),
+            sidebar_theme: Some(SidebarThemeConfig {
+                background: Some("#050814".into()),
+                header: Some("#080d1d".into()),
+                quota: Some("#06b6d4".into()),
+                gpu: Some("#3b82f6".into()),
+                deadlines: Some("#f59e0b".into()),
+                arxiv: Some("#ec4899".into()),
+            }),
+            sidebar_width: Some(420.0),
+            sidebar_widgets: Some(sidebar_widgets),
+            sidebar_layout: Some(sidebar_layout),
+            sidebar_order: Some(vec![
+                "quota".into(),
+                "gpu".into(),
+                "deadlines".into(),
+                "arxiv".into(),
+            ]),
+            sidebar_tile_sizes: Some(sidebar_tile_sizes),
+            sidebar_tile_layout: Some(sidebar_tile_layout),
             active_widgets: Some(HashMap::new()),
         }
     }
