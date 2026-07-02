@@ -15,6 +15,9 @@ import type { GpuConfig, GpuInfo, ServerGpuData, SlurmStep } from "../types/conf
 import { tauriInvoke } from "../utils/tauriInvoke";
 import { tauriListen } from "../utils/tauriListen";
 
+const NON_COMPACT_GPU_CARD_MIN_WIDTH = 96;
+const NON_COMPACT_GPU_CARD_MAX_WIDTH = 112;
+
 function parseSlurmTime(timeStr: string): number {
   if (!timeStr) return 0;
   let days = 0;
@@ -282,6 +285,7 @@ export function GPUWidgetContent() {
     gpuOfflineCount,
   });
   const gpuHeaderHint = gpuStat.hint;
+  const isCompact = gpuConfig?.compact_mode !== false;
 
   const handleRefresh = async () => {
     if (isRefreshing || !serviceEnabled) return;
@@ -332,10 +336,14 @@ export function GPUWidgetContent() {
         refreshCachedLabel={gpuRefreshCachedLabel(orderedServerData.length > 0)}
         className="mb-2 space-y-2"
       />
-      <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-6">
+      <div
+        className={`flex-1 overflow-y-auto custom-scrollbar pr-2 ${
+          isCompact ? "space-y-6" : "space-y-5"
+        }`}
+      >
         {!serviceEnabled ? (
           <div
-            className="flex flex-col items-center justify-center text-center py-10 px-4 rounded-xl border border-dashed"
+            className="flex w-full flex-col items-center justify-center text-center py-10 px-4 rounded-xl border border-dashed"
             style={{ borderColor: `${subText}33`, color: subText }}
           >
             <span className="text-[10px] font-black uppercase tracking-widest">Service Disabled</span>
@@ -354,26 +362,60 @@ export function GPUWidgetContent() {
             });
 
             return (
-              <div key={idx} className="space-y-4">
-                <div className="flex items-center justify-between border-l-2 border-white/10 pl-2">
-                  <div className="flex flex-col items-start">
+              <div
+                key={idx}
+                className={`${isCompact ? "space-y-4" : "space-y-2"} min-w-0 max-w-full`}
+              >
+                <div
+                  className={`flex items-center border-l-2 border-white/10 pl-2 ${
+                    isCompact ? "justify-between" : "justify-start gap-2"
+                  }`}
+                >
+                  <div className="flex items-center gap-2 min-w-0">
                     <span
-                      className="text-[10px] font-black uppercase tracking-tighter"
+                      className="text-[10px] font-black uppercase tracking-tighter truncate"
                       style={{ color: mainText }}
                     >
                       {server.host}
                     </span>
                   </div>
                   {server.is_online ? (
-                    <span className="text-[7px] font-black uppercase" style={{ color: success }}>
+                    <span
+                      className={`text-[7px] font-black uppercase shrink-0 ${
+                        isCompact ? "" : "rounded border px-1.5 py-0.5"
+                      }`}
+                      style={{
+                        color: success,
+                        borderColor: isCompact ? undefined : `${success}44`,
+                        backgroundColor: isCompact ? undefined : `${success}12`,
+                      }}
+                    >
                       Online
                     </span>
                   ) : showStaleOffline ? (
-                    <span className="text-[7px] font-black uppercase" style={{ color: warning }}>
+                    <span
+                      className={`text-[7px] font-black uppercase shrink-0 ${
+                        isCompact ? "" : "rounded border px-1.5 py-0.5"
+                      }`}
+                      style={{
+                        color: warning,
+                        borderColor: isCompact ? undefined : `${warning}44`,
+                        backgroundColor: isCompact ? undefined : `${warning}12`,
+                      }}
+                    >
                       Offline · cached
                     </span>
                   ) : (
-                    <span className="text-[7px] font-black uppercase" style={{ color: danger }}>
+                    <span
+                      className={`text-[7px] font-black uppercase shrink-0 ${
+                        isCompact ? "" : "rounded border px-1.5 py-0.5"
+                      }`}
+                      style={{
+                        color: danger,
+                        borderColor: isCompact ? undefined : `${danger}44`,
+                        backgroundColor: isCompact ? undefined : `${danger}12`,
+                      }}
+                    >
                       Offline
                     </span>
                   )}
@@ -388,135 +430,206 @@ export function GPUWidgetContent() {
                   </div>
                 )}
 
-                <div className="space-y-3 pl-2">
-                  {sortGpuJobGroups(groups).map(([jobId, gpus]) => (
-                    <div key={jobId} className="space-y-1.5">
-                      {jobId !== "SYSTEM" && (
-                        <div
-                          className="flex items-center justify-between text-[8px] font-black uppercase tracking-widest pl-1 pr-1 group/job"
-                          style={{ color: subText }}
-                        >
-                          <div className="flex items-center gap-1">
-                            <Activity size={10} style={{ color: accent }} /> JOB: {jobId}
-                            <div className="ml-1 flex items-center" data-no-drag="true">
-                              <CopyButton text={jobId} />
+                <div className={`${isCompact ? "space-y-3" : "space-y-2"} pl-2`}>
+                  {isCompact ? (
+                    sortGpuJobGroups(groups).map(([jobId, gpus]) => (
+                      <div key={jobId} className="space-y-1.5">
+                        {jobId !== "SYSTEM" && (
+                          <div
+                            className="flex items-center justify-between text-[8px] font-black uppercase tracking-widest pl-1 pr-1 group/job"
+                            style={{ color: subText }}
+                          >
+                            <div className="flex items-center gap-1">
+                              <Activity size={10} style={{ color: accent }} /> JOB: {jobId}
+                              <div className="ml-1 flex items-center" data-no-drag="true">
+                                <CopyButton text={jobId} />
+                              </div>
                             </div>
+                            {(server.slurm_nodelists?.[jobId] || server.slurm_times?.[jobId]) && (
+                              <div className="flex items-center gap-1.5 shrink-0 select-none">
+                                {server.slurm_nodelists?.[jobId] && (
+                                  <span className="opacity-60 font-mono text-[7px] text-right truncate max-w-[120px]" title={server.slurm_nodelists[jobId]}>
+                                    {server.slurm_nodelists[jobId]}
+                                  </span>
+                                )}
+                                {server.slurm_times?.[jobId] && (
+                                  <span className="opacity-80 font-mono text-[7px] text-right shrink-0" style={{ color: accent }} title="Job Run Time">
+                                    {formatSlurmTime(durations[jobId] ?? parseSlurmTime(server.slurm_times[jobId]))}
+                                  </span>
+                                )}
+                              </div>
+                            )}
                           </div>
-                          {(server.slurm_nodelists?.[jobId] || server.slurm_times?.[jobId]) && (
-                            <div className="flex items-center gap-1.5 shrink-0 select-none">
-                              {server.slurm_nodelists?.[jobId] && (
-                                <span className="opacity-60 font-mono text-[7px] text-right truncate max-w-[120px]" title={server.slurm_nodelists[jobId]}>
-                                  {server.slurm_nodelists[jobId]}
-                                </span>
-                              )}
-                              {server.slurm_times?.[jobId] && (
-                                <span className="opacity-80 font-mono text-[7px] text-right shrink-0" style={{ color: accent }} title="Job Run Time">
-                                  {formatSlurmTime(durations[jobId] ?? parseSlurmTime(server.slurm_times[jobId]))}
-                                </span>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                      {(() => {
-                        const isCompact = gpuConfig?.compact_mode !== false;
-                        return (
-                          <div className={isCompact ? "grid grid-cols-8 gap-1" : "grid grid-cols-4 gap-1.5"}>
-                            {gpus.map((gpu, i) => {
-                              const usage = gpu.util / 100;
-                              const usageColor = usage > 0.9 ? danger : usage > 0.6 ? warning : accent;
+                        )}
+                        <div className="grid grid-cols-8 gap-1">
+                          {gpus.map((gpu, i) => {
+                            const usage = gpu.util / 100;
+                            const usageColor = usage > 0.9 ? danger : usage > 0.6 ? warning : accent;
 
-                              if (isCompact) {
+                            return (
+                              <div
+                                key={i}
+                                className="relative aspect-square bg-white/5 rounded-lg border border-white/5 flex flex-col items-center justify-center min-w-0 overflow-hidden select-none"
+                                title={`GPU #${i}: ${gpu.util}% (${gpu.name})`}
+                              >
+                                {/* Progress Background Overlay */}
+                                <div
+                                  className="absolute left-0 top-0 bottom-0 z-0 pointer-events-none opacity-20 transition-[width] duration-300"
+                                  style={{ width: `${gpu.util}%`, backgroundColor: usageColor }}
+                                />
+                                {/* Text Overlay */}
+                                <div className="relative z-10 flex flex-col items-center justify-center text-center leading-normal">
+                                  <span className="text-[7.5px] font-black tracking-tighter" style={{ color: mainText }}>
+                                    {(gpu.mem_used / 1024).toFixed(0)}G
+                                  </span>
+                                  <span className="text-[6.5px] font-bold tracking-tighter opacity-80" style={{ color: subText }}>
+                                    {(gpu.power || 0).toFixed(0)}W
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {(() => {
+                          const activeSteps = (server.slurm_steps?.[jobId] || []).filter(
+                            (step: SlurmStep) => step.name !== "widgitron-gpu"
+                          );
+                          if (activeSteps.length === 0) return null;
+                          return (
+                            <div className="mt-2 space-y-0.5 max-h-24 overflow-y-auto custom-scrollbar">
+                              {activeSteps.map((step, sIdx) => {
+                                const shortStepId = step.id.includes('.') ? '.' + step.id.split('.').slice(1).join('.') : step.id;
                                 return (
                                   <div
-                                    key={i}
-                                    className="relative aspect-square bg-white/5 rounded-lg border border-white/5 flex flex-col items-center justify-center min-w-0 overflow-hidden select-none"
-                                    title={`GPU #${i}: ${gpu.util}% (${gpu.name})`}
+                                    key={sIdx}
+                                    className="flex items-center justify-between text-[7px] bg-white/5 px-2 py-0.5 rounded border border-white/5 font-mono"
                                   >
-                                    {/* Progress Background Overlay */}
-                                    <div
-                                      className="absolute left-0 top-0 bottom-0 z-0 pointer-events-none opacity-20 transition-[width] duration-300"
-                                      style={{ width: `${gpu.util}%`, backgroundColor: usageColor }}
-                                    />
-                                    {/* Text Overlay */}
-                                    <div className="relative z-10 flex flex-col items-center justify-center text-center leading-normal">
-                                      <span className="text-[7.5px] font-black tracking-tighter" style={{ color: mainText }}>
-                                        {(gpu.mem_used / 1024).toFixed(0)}G
-                                      </span>
-                                      <span className="text-[6.5px] font-bold tracking-tighter opacity-80" style={{ color: subText }}>
-                                        {(gpu.power || 0).toFixed(0)}W
-                                      </span>
+                                    <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                                      <span style={{ color: accent }} className="shrink-0">{shortStepId}</span>
+                                      <span className="font-bold opacity-80 shrink-0" title={step.name}>{step.name}</span>
+                                      <span className="opacity-65 truncate" title={step.command}>{step.command}</span>
+                                    </div>
+                                    <div className="flex items-center gap-2 opacity-60 shrink-0 ml-2">
+                                      <span>{formatSlurmTime(durations[step.id] ?? parseSlurmTime(step.time))}</span>
                                     </div>
                                   </div>
                                 );
-                              }
+                              })}
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    ))
+                  ) : (
+                    <>
+                      <div
+                        className="grid gap-1.5 justify-start"
+                        style={{
+                          gridTemplateColumns: `repeat(auto-fit, minmax(${NON_COMPACT_GPU_CARD_MIN_WIDTH}px, ${NON_COMPACT_GPU_CARD_MAX_WIDTH}px))`,
+                        }}
+                      >
+                        {server.gpu_list.map((gpu, i) => {
+                          const usage = gpu.util / 100;
+                          const usageColor = usage > 0.9 ? danger : usage > 0.6 ? warning : accent;
 
-                              return (
+                          return (
+                            <div
+                              key={i}
+                              className="h-11 space-y-0.5 bg-white/5 px-2 py-1 rounded-md border border-white/5 flex flex-col justify-center min-w-0"
+                              title={`GPU #${i}: ${gpu.util}% (${gpu.name})`}
+                            >
+                              <div className="flex justify-between items-center text-[8px] font-black tracking-tighter">
+                                <span style={{ color: subText }}>#{i}</span>
+                                <span style={{ color: usageColor }}>{gpu.util}%</span>
+                              </div>
+                              <div className="h-0.5 w-full bg-black/40 rounded-full overflow-hidden">
                                 <div
-                                  key={i}
-                                  className="space-y-1 bg-white/5 p-1.5 rounded-lg border border-white/5 flex flex-col justify-center min-w-0"
-                                >
-                                  <div className="flex justify-between items-center text-[8px] font-black tracking-tighter">
-                                    <span style={{ color: subText }}>#{i}</span>
-                                    <span style={{ color: usageColor }}>{gpu.util}%</span>
-                                  </div>
-                                  <div className="h-1 w-full bg-black/40 rounded-full overflow-hidden">
-                                    <div
-                                      className="h-full rounded-full transition-[width] duration-300"
-                                      style={{ width: `${gpu.util}%`, backgroundColor: usageColor }}
-                                    />
-                                  </div>
-                                  <div
-                                    className="flex justify-between items-center text-[7px] font-bold tracking-tighter tabular-nums"
-                                    style={{ color: subText }}
-                                  >
-                                    <span>{(gpu.mem_used / 1024).toFixed(0)}G</span>
-                                    <span>{(gpu.power || 0).toFixed(0)}W</span>
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        );
-                      })()}
+                                  className="h-full rounded-full transition-[width] duration-300"
+                                  style={{ width: `${gpu.util}%`, backgroundColor: usageColor }}
+                                />
+                              </div>
+                              <div
+                                className="flex justify-between items-center gap-1 text-[7px] font-bold tracking-tighter tabular-nums"
+                                style={{ color: subText }}
+                              >
+                                <span>{(gpu.mem_used / 1024).toFixed(0)}G</span>
+                                <span className="opacity-50">·</span>
+                                <span>{(gpu.power || 0).toFixed(0)}W</span>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
 
-                      {(() => {
+                      {sortGpuJobGroups(groups).map(([jobId]) => {
+                        if (jobId === "SYSTEM") return null;
                         const activeSteps = (server.slurm_steps?.[jobId] || []).filter(
                           (step: SlurmStep) => step.name !== "widgitron-gpu"
                         );
-                        if (activeSteps.length === 0) return null;
+
                         return (
-                          <div className="mt-2 space-y-0.5 max-h-24 overflow-y-auto custom-scrollbar">
-                            {activeSteps.map((step, sIdx) => {
-                              const shortStepId = step.id.includes('.') ? '.' + step.id.split('.').slice(1).join('.') : step.id;
-                              return (
-                                <div
-                                  key={sIdx}
-                                  className="flex items-center justify-between text-[7px] bg-white/5 px-2 py-0.5 rounded border border-white/5 font-mono"
-                                >
-                                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                                    <span style={{ color: accent }} className="shrink-0">{shortStepId}</span>
-                                    <span className="font-bold opacity-80 shrink-0" title={step.name}>{step.name}</span>
-                                    <span className="opacity-65 truncate" title={step.command}>{step.command}</span>
-                                  </div>
-                                  <div className="flex items-center gap-2 opacity-60 shrink-0 ml-2">
-                                    <span>{formatSlurmTime(durations[step.id] ?? parseSlurmTime(step.time))}</span>
-                                  </div>
+                          <div key={jobId} className="space-y-1">
+                            <div
+                              className="flex items-center justify-between text-[8px] font-black uppercase tracking-widest pl-1 pr-1 group/job"
+                              style={{ color: subText }}
+                            >
+                              <div className="flex items-center gap-1 min-w-0">
+                                <Activity size={10} style={{ color: accent }} /> JOB: {jobId}
+                                <div className="ml-1 flex items-center" data-no-drag="true">
+                                  <CopyButton text={jobId} />
                                 </div>
-                              );
-                            })}
+                              </div>
+                              {(server.slurm_nodelists?.[jobId] || server.slurm_times?.[jobId]) && (
+                                <div className="flex items-center gap-1.5 shrink-0 select-none">
+                                  {server.slurm_nodelists?.[jobId] && (
+                                    <span className="opacity-60 font-mono text-[7px] text-right truncate max-w-[120px]" title={server.slurm_nodelists[jobId]}>
+                                      {server.slurm_nodelists[jobId]}
+                                    </span>
+                                  )}
+                                  {server.slurm_times?.[jobId] && (
+                                    <span className="opacity-80 font-mono text-[7px] text-right shrink-0" style={{ color: accent }} title="Job Run Time">
+                                      {formatSlurmTime(durations[jobId] ?? parseSlurmTime(server.slurm_times[jobId]))}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+
+                            {activeSteps.length > 0 && (
+                              <div className="space-y-0.5 max-h-24 overflow-y-auto custom-scrollbar">
+                                {activeSteps.map((step, sIdx) => {
+                                  const shortStepId = step.id.includes('.') ? '.' + step.id.split('.').slice(1).join('.') : step.id;
+                                  return (
+                                    <div
+                                      key={sIdx}
+                                      className="flex items-center justify-between text-[7px] bg-white/5 px-2 py-0.5 rounded border border-white/5 font-mono"
+                                    >
+                                      <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                                        <span style={{ color: accent }} className="shrink-0">{shortStepId}</span>
+                                        <span className="font-bold opacity-80 shrink-0" title={step.name}>{step.name}</span>
+                                        <span className="opacity-65 truncate" title={step.command}>{step.command}</span>
+                                      </div>
+                                      <div className="flex items-center gap-2 opacity-60 shrink-0 ml-2">
+                                        <span>{formatSlurmTime(durations[step.id] ?? parseSlurmTime(step.time))}</span>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
                           </div>
                         );
-                      })()}
-                    </div>
-                  ))}
+                      })}
+                    </>
+                  )}
                 </div>
               </div>
             );
           })
         ) : configuredServerCount === 0 ? (
           <div
-            className="flex flex-col items-center justify-center text-center mt-10 px-4 py-8 rounded-xl border border-dashed"
+            className="flex w-full flex-col items-center justify-center text-center mt-10 px-4 py-8 rounded-xl border border-dashed"
             style={{ borderColor: `${subText}33`, color: subText }}
           >
             <Cpu size={20} style={{ color: accent, opacity: 0.5 }} className="mb-3" />
@@ -528,7 +641,7 @@ export function GPUWidgetContent() {
             </span>
           </div>
         ) : (
-          <div className="text-xs italic text-center mt-4" style={{ color: subText }}>
+          <div className="w-full text-xs italic text-center mt-4" style={{ color: subText }}>
             Waiting for backend...
           </div>
         )}
