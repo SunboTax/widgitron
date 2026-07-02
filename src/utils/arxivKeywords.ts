@@ -12,6 +12,13 @@ export function normalizeArxivKeyword(keyword: string): string {
   return keyword.trim().replace(/^"|"$/g, "").toLowerCase();
 }
 
+function getArxivKeywordTerms(keyword: string): string[] {
+  return normalizeArxivKeyword(keyword)
+    .split(/\s+/)
+    .map((term) => term.replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, ""))
+    .filter(Boolean);
+}
+
 export function getArxivKeywords(keywords?: string[]): string[] {
   const seen = new Set<string>();
   return (keywords || []).filter((keyword) => {
@@ -30,7 +37,11 @@ export function paperMatchesArxivKeyword(paper: ArxivPaper, keyword: string): bo
     return true;
   }
 
-  return `${paper.title} ${paper.summary}`.toLowerCase().includes(normalized);
+  const haystack = `${paper.title} ${paper.summary}`.toLowerCase();
+  if (haystack.includes(normalized)) return true;
+
+  const terms = getArxivKeywordTerms(keyword);
+  return terms.length > 0 && terms.every((term) => haystack.includes(term));
 }
 
 export function getPaperArxivKeywords(paper: ArxivPaper, keywords?: string[]): string[] {

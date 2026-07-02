@@ -10,6 +10,7 @@ import {
   Activity,
   Lock,
   Unlock,
+  Bell,
   Pin,
   PinOff,
   Trophy,
@@ -59,6 +60,7 @@ import { StatCard } from "./components/StatCard";
 import { WidgetPreviewCard } from "./components/WidgetPreviewCard";
 import { CopyButton } from "./components/CopyButton";
 import { DeadlineCountdown } from "./components/DeadlineCountdown";
+import { deadlineInstanceKey } from "./utils/deadlineKeys";
 import { GPUWidgetContent } from "./widgets/GPUWidgetContent";
 import { DeadlineWidgetContent } from "./widgets/DeadlineWidgetContent";
 import { ArxivWidgetContent } from "./widgets/ArxivWidgetContent";
@@ -768,12 +770,23 @@ function App() {
     }
   };
 
-  const togglePinConference = async (title: string) => {
-    const pinned = paperConfig.pinned_titles || [];
-    const nextPinned = pinned.includes(title)
-      ? pinned.filter((t) => t !== title)
-      : [...pinned, title];
-    const nextConfig = { ...paperConfig, pinned_titles: nextPinned };
+  const togglePinDeadline = async (deadline: PaperDeadlineInfo) => {
+    const key = deadlineInstanceKey(deadline);
+    const pinned = paperConfig.pinned_deadline_ids || [];
+    const nextPinned = pinned.includes(key)
+      ? pinned.filter((item) => item !== key)
+      : [...pinned, key];
+    const nextConfig = { ...paperConfig, pinned_deadline_ids: nextPinned };
+    await savePaperConfig(nextConfig);
+  };
+
+  const toggleSubscribeConference = async (title: string) => {
+    const subscribed = paperConfig.subscribed_titles || [];
+    const titleKey = title.toLowerCase();
+    const nextSubscribed = subscribed.some((t) => t.toLowerCase() === titleKey)
+      ? subscribed.filter((t) => t.toLowerCase() !== titleKey)
+      : [...subscribed, title];
+    const nextConfig = { ...paperConfig, subscribed_titles: nextSubscribed };
     await savePaperConfig(nextConfig);
   };
 
@@ -1564,7 +1577,11 @@ function App() {
                     </div>
                   ) : (
                     deadlines.map((dl, idx) => {
-                      const isPinned = (paperConfig.pinned_titles || []).includes(dl.title);
+                      const deadlineKey = deadlineInstanceKey(dl);
+                      const isPinned = (paperConfig.pinned_deadline_ids || []).includes(deadlineKey);
+                      const isSubscribed = (paperConfig.subscribed_titles || []).some(
+                        (title) => title.toLowerCase() === dl.title.toLowerCase()
+                      );
                       return (
                         <div
                           key={idx}
@@ -1588,12 +1605,22 @@ function App() {
                                 className={appConfig.theme === "light" ? "text-purple-600" : "text-purple-400"}
                               />
                               <button
-                                onClick={() => togglePinConference(dl.title)}
+                                onClick={() => togglePinDeadline(dl)}
                                 className={`absolute -top-2 -right-2 p-1.5 rounded-full shadow-lg transition-all ${
                                   isPinned ? "bg-amber-500 text-white scale-110" : "bg-slate-800 text-slate-500 opacity-0 group-hover:opacity-100"
                                 }`}
+                                title={isPinned ? "Unpin this deadline from widget" : "Pin this deadline to widget"}
                               >
                                 <Pin size={10} className={isPinned ? "fill-current" : ""} />
+                              </button>
+                              <button
+                                onClick={() => toggleSubscribeConference(dl.title)}
+                                className={`absolute -bottom-2 -right-2 p-1.5 rounded-full shadow-lg transition-all ${
+                                  isSubscribed ? "bg-emerald-500 text-white scale-110" : "bg-slate-800 text-slate-500 opacity-0 group-hover:opacity-100"
+                                }`}
+                                title={isSubscribed ? "Unsubscribe conference" : "Subscribe conference"}
+                              >
+                                <Bell size={10} className={isSubscribed ? "fill-current" : ""} />
                               </button>
                             </div>
                             <div>

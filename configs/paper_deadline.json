@@ -16,13 +16,11 @@
     "CG",
     "HI",
     "CV",
+    "DB",
     "NLP",
     "HCI"
   ],
-  "pinned_titles": [
-    "NeurIPS",
-    "ACM SIGGRAPH ASIA",
-    "EMNLP",
-    "BMVC"
-  ]
+  "pinned_titles": [],
+  "pinned_deadline_ids": [],
+  "subscribed_titles": []
 }

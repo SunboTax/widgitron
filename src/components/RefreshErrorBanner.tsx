@@ -25,7 +25,7 @@ export function RefreshErrorBanner({
           : "bg-amber-500/10 border-amber-500/20 text-amber-400"
       }`}
     >
-      <span>
+      <span className="min-w-0 flex-1 whitespace-pre-wrap break-words overflow-hidden">
         {cachedLabel ? `${cachedLabel} ` : ""}
         {message}
       </span>

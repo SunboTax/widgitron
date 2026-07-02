@@ -59,6 +59,8 @@ export interface PaperConfig {
   filter_by_rank?: string[];
   filter_by_sub?: string[];
   pinned_titles?: string[];
+  pinned_deadline_ids?: string[];
+  subscribed_titles?: string[];
   filter_by_core?: string[];
 }
 
@@ -77,6 +79,7 @@ export interface ArxivPaper {
   authors: string[];
   link: string;
   published: string;
+  updated?: string;
 }
 
 export interface GpuInfo {

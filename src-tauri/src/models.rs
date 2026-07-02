@@ -41,6 +41,8 @@ pub struct PaperConfig {
     pub filter_by_rank: Option<Vec<String>>,
     pub filter_by_sub: Option<Vec<String>>,
     pub pinned_titles: Option<Vec<String>>,
+    pub pinned_deadline_ids: Option<Vec<String>>,
+    pub subscribed_titles: Option<Vec<String>>,
     pub filter_by_core: Option<Vec<String>>,
 }
 
@@ -53,6 +55,8 @@ impl Default for PaperConfig {
             filter_by_rank: Some(vec!["A".into(), "B".into(), "C".into()]),
             filter_by_sub: None,
             pinned_titles: None,
+            pinned_deadline_ids: None,
+            subscribed_titles: None,
             filter_by_core: Some(vec!["A*".into(), "A".into()]),
         }
     }
@@ -87,6 +91,8 @@ pub struct ArxivPaper {
     pub authors: Vec<String>,
     pub link: String,
     pub published: String,
+    #[serde(default)]
+    pub updated: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

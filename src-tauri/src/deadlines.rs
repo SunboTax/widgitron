@@ -20,6 +20,37 @@ fn persist_deadlines_cache(app: &AppHandle, deadlines: &Vec<PaperDeadlineInfo>) 
     }
 }
 
+fn normalize_paper_config(config: &mut PaperConfig) {
+    if let Some(subs) = config.filter_by_sub.as_mut() {
+        for sub in subs.iter_mut() {
+            if sub == "DM" {
+                *sub = "DB".to_string();
+            }
+        }
+        let mut seen = Vec::new();
+        subs.retain(|sub| {
+            if seen.contains(sub) {
+                false
+            } else {
+                seen.push(sub.clone());
+                true
+            }
+        });
+    }
+}
+
+fn normalize_title(title: &str) -> String {
+    title.trim().to_lowercase()
+}
+
+fn is_subscribed_title(title: &str, config: &PaperConfig) -> bool {
+    let normalized = normalize_title(title);
+    config
+        .subscribed_titles
+        .as_ref()
+        .is_some_and(|titles| titles.iter().any(|item| normalize_title(item) == normalized))
+}
+
 fn restore_and_emit_cached_deadlines(app: &AppHandle, state: &Arc<GlobalState>, error: &str) {
     let _ = app.emit("paper_error", error.to_string());
 
@@ -63,10 +94,14 @@ pub fn hydrate_deadlines_from_cache(app: &AppHandle, state: &GlobalState) -> Vec
 pub fn build_deadlines_from_yaml(text: &str, config: &PaperConfig) -> Result<Vec<PaperDeadlineInfo>, String> {
     let items: Vec<YamlConfItem> =
         serde_yaml::from_str(text).map_err(|e| format!("Failed to parse deadline data: {}", e))?;
+    let mut config = config.clone();
+    normalize_paper_config(&mut config);
     let mut deadlines = Vec::new();
     let now = Utc::now();
 
     for item in items {
+        let title = item.title.clone();
+        let subscribed = is_subscribed_title(&title, &config);
         let ccf_rank = item.rank.as_ref().and_then(|r| r.ccf.clone());
         let core_rank = item.rank.as_ref().and_then(|r| r.core.clone());
         let rank = ccf_rank.clone().unwrap_or_else(|| "N".to_string());
@@ -94,13 +129,15 @@ pub fn build_deadlines_from_yaml(text: &str, config: &PaperConfig) -> Result<Vec
             (false, false) => true,
         };
 
-        if !keep {
+        if !subscribed && !keep {
             continue;
         }
 
-        if let Some(allowed) = &config.filter_by_sub {
+        if !subscribed {
+            if let Some(allowed) = &config.filter_by_sub {
             if !allowed.is_empty() && !allowed.contains(&sub) {
                 continue;
+            }
             }
         }
 
@@ -125,7 +162,7 @@ pub fn build_deadlines_from_yaml(text: &str, config: &PaperConfig) -> Result<Vec
                                 let utc_dt = parsed.with_timezone(&Utc);
                                 if utc_dt >= now {
                                     deadlines.push(PaperDeadlineInfo {
-                                        title: item.title.clone(),
+                                        title: title.clone(),
                                         year: conf.year.clone(),
                                         deadline_utc: utc_dt.to_rfc3339(),
                                         timezone: conf

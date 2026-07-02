@@ -10,6 +10,7 @@ import { LIVE_DATA_SECTION, refetchSectionLiveData } from "../utils/sectionLiveD
 import { CACHED_LABELS, cachedLabelWhen } from "../utils/cachedLabels";
 import { ServiceErrorBanners } from "../components/ServiceErrorBanners";
 import type { PaperConfig, PaperDeadlineInfo } from "../types/config";
+import { deadlineInstanceKey, deadlineTitleEquals } from "../utils/deadlineKeys";
 import { tauriInvoke } from "../utils/tauriInvoke";
 import { tauriListen } from "../utils/tauriListen";
 
@@ -136,9 +137,12 @@ export function DeadlineWidgetContent() {
   const mainText = getT("Main Text", "#ffffff");
   const subText = getT("Sub Text", "#64748b");
 
-  const pinnedTitles = paperConfig.pinned_titles || [];
-  const pinnedList = deadlines.filter((d) => pinnedTitles.includes(d.title));
-  const displayList = pinnedList.length > 0 ? pinnedList : deadlines.length > 0 ? [deadlines[0]] : [];
+  const pinnedDeadlineIds = paperConfig.pinned_deadline_ids || [];
+  const pinnedList = deadlines.filter((d) => pinnedDeadlineIds.includes(deadlineInstanceKey(d)));
+  const subscribedList = deadlines.filter((d) =>
+    (paperConfig.subscribed_titles || []).some((title) => deadlineTitleEquals(title, d.title))
+  );
+  const displayList = pinnedList.length > 0 ? pinnedList : subscribedList.length > 0 ? subscribedList : deadlines.length > 0 ? [deadlines[0]] : [];
 
   const handleRefresh = async () => {
     if (isRefreshing || !serviceEnabled) return;
