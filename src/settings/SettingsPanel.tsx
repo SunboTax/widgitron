@@ -578,6 +578,21 @@ const parseArxivKeywordsInput = (value: string) =>
     .map((keyword) => keyword.trim())
     .filter(Boolean);
 
+const formatDeadlineSubscriptionsInput = (titles?: string[]) => (titles || []).join(", ");
+
+const parseDeadlineSubscriptionsInput = (value: string) => {
+  const seen = new Set<string>();
+  return value
+    .split(",")
+    .map((title) => title.trim())
+    .filter((title) => {
+      const normalized = title.toLowerCase();
+      if (!normalized || seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    });
+};
+
 export function SettingsPanel({
   gpuConfig,
   paperConfig,
@@ -603,6 +618,9 @@ export function SettingsPanel({
   const [localPaper, setLocalPaper] = useState<PaperConfig>(paperConfig);
   const [localArxiv, setLocalArxiv] = useState<ArxivConfig>(arxivConfig);
   const [arxivProxyInput, setArxivProxyInput] = useState(appConfig.arxiv_proxy || "");
+  const [deadlineSubscriptionsInput, setDeadlineSubscriptionsInput] = useState(() =>
+    formatDeadlineSubscriptionsInput(paperConfig.subscribed_titles)
+  );
   const [arxivKeywordsInput, setArxivKeywordsInput] = useState(() =>
     formatArxivKeywordsInput(arxivConfig.keywords)
   );
@@ -807,6 +825,7 @@ export function SettingsPanel({
 
   useEffect(() => {
     setLocalPaper(paperConfig);
+    setDeadlineSubscriptionsInput(formatDeadlineSubscriptionsInput(paperConfig.subscribed_titles));
   }, [paperConfig]);
 
   useEffect(() => {
@@ -1085,7 +1104,7 @@ export function SettingsPanel({
           </button>
         </div>
 
-        <div className="border-t border-[var(--dashboard-border)] pt-6 grid grid-cols-1 md:grid-cols-[1fr_320px] gap-4 items-center">
+        <div className="border-t border-[var(--dashboard-border)] pt-6 space-y-3">
           <div className="space-y-1">
             <div className={`text-xs font-bold ${appConfig.theme === "light" ? "text-slate-900" : "text-white"}`}>
               Arxiv Proxy
@@ -1378,7 +1397,7 @@ export function SettingsPanel({
             Categories
           </label>
           <div className="flex flex-wrap gap-2">
-            {["AI", "CV", "NLP", "HCI", "DM", "Graphics", "Security", "Network", "Systems"].map((cat) => (
+            {["AI", "CV", "NLP", "HCI", "DB", "Graphics", "Security", "Network", "Systems"].map((cat) => (
               <button
                 key={cat}
                 onClick={() => {
@@ -1400,6 +1419,31 @@ export function SettingsPanel({
               </button>
             ))}
           </div>
+        </div>
+
+        <div className="space-y-3 border-t border-[var(--dashboard-border)] pt-6">
+          <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">
+            Subscribed Conferences
+          </label>
+          <input
+            type="text"
+            value={deadlineSubscriptionsInput}
+            onChange={(e) => setDeadlineSubscriptionsInput(e.target.value)}
+            onBlur={(e) => {
+              const nextTitles = parseDeadlineSubscriptionsInput(e.target.value);
+              const nextConfig = { ...localPaper, subscribed_titles: nextTitles };
+              setDeadlineSubscriptionsInput(formatDeadlineSubscriptionsInput(nextTitles));
+              setLocalPaper(nextConfig);
+              onSavePaper(nextConfig);
+            }}
+            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+            className={`w-full px-4 py-2 rounded-xl text-xs font-bold border transition-all ${
+              appConfig.theme === "light"
+                ? "bg-slate-50 border-slate-200 text-slate-900 focus:bg-white"
+                : "bg-black/40 border-white/10 text-white focus:bg-black/60"
+            }`}
+            placeholder="VLDB, SIGMOD, KDD"
+          />
         </div>
       </div>
       <ThemeManagementSection
