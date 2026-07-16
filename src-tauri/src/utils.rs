@@ -22,6 +22,26 @@ pub fn is_program_files_install() -> bool {
         .unwrap_or(false)
 }
 
+/// Cargo/dev builds and explicit portable installs may use exe-adjacent configs.
+/// Normal MSI/NSIS installs always use AppData so upgrades keep user settings —
+/// installers rewrite the app folder (including a bundled `configs/`) on every update.
+fn is_dev_or_explicit_portable() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let path = exe.to_string_lossy().to_lowercase();
+    if path.contains("\\target\\debug\\")
+        || path.contains("\\target\\release\\")
+        || path.contains("/target/debug/")
+        || path.contains("/target/release/")
+    {
+        return true;
+    }
+    exe.parent()
+        .map(|dir| dir.join(".portable").exists() || dir.join("PORTABLE").exists())
+        .unwrap_or(false)
+}
+
 fn portable_config_path(filename: &str) -> Option<PathBuf> {
     let mut exe_dir = std::env::current_exe().ok()?;
     exe_dir.pop();
@@ -29,15 +49,13 @@ fn portable_config_path(filename: &str) -> Option<PathBuf> {
 }
 
 fn app_config_dir(app: &AppHandle) -> PathBuf {
-    app.path().app_config_dir().unwrap_or_else(|_| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join("configs")
-    })
+    app.path()
+        .app_config_dir()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join("configs"))
 }
 
 fn should_use_portable_config(portable_path: &Path, app_data_path: &Path) -> bool {
-    if is_program_files_install() {
+    if is_program_files_install() || !is_dev_or_explicit_portable() {
         return false;
     }
 
@@ -65,7 +83,11 @@ fn seed_config_from_resources(app: &AppHandle, filename: &str, dest: &Path) -> b
                 log::info!("Seeded config '{}' from bundled resources", filename);
                 return true;
             }
-            log::warn!("Failed to copy bundled config '{}' to {}", filename, dest.display());
+            log::warn!(
+                "Failed to copy bundled config '{}' to {}",
+                filename,
+                dest.display()
+            );
         } else {
             log::debug!("Bundled config '{}' not found in resources", filename);
         }
@@ -81,8 +103,97 @@ const SEED_CONFIG_FILES: &[&str] = &[
     "antigravity_oauth.json",
 ];
 
+/// User-owned config/cache files that should survive installer upgrades.
+const MIGRATE_CONFIG_FILES: &[&str] = &[
+    "app_config.json",
+    "gpu_monitor.json",
+    "quota_config.json",
+    "paper_deadline.json",
+    "arxiv_config.json",
+    "widget_themes.json",
+    "widget_layouts.json",
+    "antigravity_oauth.json",
+    "arxiv_cache.json",
+    "arxiv_seen.json",
+    "arxiv_saved.json",
+    "gpu_data_cache.json",
+    "paper_deadlines_cache.json",
+];
+
+fn copy_missing_configs(from_dir: &Path, to_dir: &Path) -> usize {
+    if !from_dir.exists() || from_dir == to_dir {
+        return 0;
+    }
+    let _ = fs::create_dir_all(to_dir);
+    let mut copied = 0usize;
+    for filename in MIGRATE_CONFIG_FILES {
+        let dest = to_dir.join(filename);
+        if dest.exists() {
+            continue;
+        }
+        let src = from_dir.join(filename);
+        if !src.exists() {
+            continue;
+        }
+        match fs::copy(&src, &dest) {
+            Ok(_) => {
+                log::info!(
+                    "Migrated '{}' from {} → {}",
+                    filename,
+                    src.display(),
+                    dest.display()
+                );
+                copied += 1;
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to migrate '{}' from {}: {}",
+                    filename,
+                    src.display(),
+                    err
+                );
+            }
+        }
+    }
+    copied
+}
+
+/// Import settings from older install layouts into the active AppData dir once.
+/// Covers previous portable/exe-adjacent configs that used to be overwritten by
+/// each installer drop into the app folder.
+pub fn migrate_legacy_configs_into_appdata(app: &AppHandle) {
+    let app_data_dir = app_config_dir(app);
+    let _ = fs::create_dir_all(&app_data_dir);
+
+    let mut sources = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            sources.push(dir.join("configs"));
+        }
+    }
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        // Only migrate *missing* files; never clobber AppData with bundled defaults.
+        // Bundled resources are still seeded later via ensure_default_configs.
+        let _ = resource_dir;
+    }
+
+    let mut migrated = 0usize;
+    for src in sources {
+        migrated += copy_missing_configs(&src, &app_data_dir);
+    }
+    if migrated > 0 {
+        log::info!(
+            "Migrated {} config file(s) into AppData ({})",
+            migrated,
+            app_data_dir.display()
+        );
+    }
+}
+
 /// Seed bundled default configs into the user config directory on first install.
 pub fn ensure_default_configs(app: &AppHandle) {
+    migrate_legacy_configs_into_appdata(app);
+
     let config_dir = get_config_dir(app);
     let mut seeded = 0usize;
     for filename in SEED_CONFIG_FILES {
@@ -92,11 +203,15 @@ pub fn ensure_default_configs(app: &AppHandle) {
         }
     }
     if seeded > 0 {
-        log::info!("Seeded {} default config file(s) into {}", seeded, config_dir.display());
-    }
-    if is_program_files_install() {
         log::info!(
-            "Program Files install detected — user configs live in AppData: {}",
+            "Seeded {} default config file(s) into {}",
+            seeded,
+            config_dir.display()
+        );
+    }
+    if is_program_files_install() || !is_dev_or_explicit_portable() {
+        log::info!(
+            "Installed build — user configs live in AppData: {}",
             config_dir.display()
         );
     }
@@ -122,7 +237,7 @@ pub fn get_config_dir(app: &AppHandle) -> PathBuf {
 }
 
 /// Resolve path for a single config file.
-/// Installed apps under Program Files always use AppData so upgrades keep user settings.
+/// Installed apps always use AppData so upgrades keep user settings.
 pub fn get_config_path(app: &AppHandle, filename: &str) -> PathBuf {
     let app_data_dir = app_config_dir(app);
     let app_data_path = app_data_dir.join(filename);

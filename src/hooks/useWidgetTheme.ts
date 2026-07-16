@@ -4,6 +4,7 @@ import type { AppConfig } from "../types/config";
 import type { WidgetTheme, WidgetThemeConfig } from "../types/theme";
 import { resolveWidgetTheme, type WidgetThemeKind } from "../utils/widgetTheme";
 import { isLightColor } from "../utils/color";
+import { resolveSidebarTheme } from "../utils/sidebarTheme";
 import { tauriInvoke } from "../utils/tauriInvoke";
 import { tauriListen } from "../utils/tauriListen";
 
@@ -21,7 +22,7 @@ export function useWidgetTheme(kind: WidgetThemeKind): WidgetTheme | null {
       if (!active || !latestThemeConfig) return;
       const sidebarLight =
         win.label === "sidebar" &&
-        isLightColor(latestAppConfig?.sidebar_theme?.background || "#050814");
+        isLightColor(resolveSidebarTheme(latestAppConfig?.sidebar_theme).background);
       setCurrentTheme(resolveWidgetTheme(latestThemeConfig, win.label, kind, { sidebarLight }));
     };
 

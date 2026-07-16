@@ -9,12 +9,14 @@ export type QuotaDisplayItem = Pick<
 export function isStaleQuotaWarning(msg: string | null | undefined): boolean {
   if (!msg) return false;
   const lower = msg.toLowerCase();
+  // Soft retention only — hard fetch errors should render as errors even if
+  // last-known values are still displayed.
   return (
-    lower.includes("cached") ||
+    lower.includes("showing cached") ||
     messageShowsCached(msg) ||
     lower.includes("retaining last") ||
-    lower.includes("server error") ||
-    lower.includes("did not complete")
+    lower.includes("offline —") ||
+    lower.includes("offline -")
   );
 }
 

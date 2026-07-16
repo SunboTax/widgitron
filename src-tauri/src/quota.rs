@@ -1,14 +1,18 @@
-use std::time::Duration;
-use tauri::{AppHandle, Emitter};
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::error::Error as StdError;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tauri::{AppHandle, Emitter};
 
-use crate::models::{AppConfig, QuotaBar, QuotaConfig, QuotaItem, GlobalState};
-use crate::{config_store, secrets};
+use crate::models::{AppConfig, GlobalState, QuotaBar, QuotaConfig, QuotaItem};
 use crate::vscode_secrets;
+use crate::{config_store, secrets};
 
 const REMOVED_QUOTA_PROVIDERS: &[&str] = &["minimax-cn", "openai-compatible"];
+const QUOTA_SAVE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(500);
+static QUOTA_SAVE_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(serde::Serialize, Clone)]
 pub struct QuotaMonitorStatus {
@@ -81,7 +85,11 @@ fn decrypt_quota_config_secrets(config: &mut QuotaConfig) {
             match secrets::decrypt_secret(encrypted) {
                 Ok(decrypted) => item.api_key = decrypted,
                 Err(err) => {
-                    log::warn!("Failed to decrypt API key for quota item '{}': {}", item.id, err);
+                    log::warn!(
+                        "Failed to decrypt API key for quota item '{}': {}",
+                        item.id,
+                        err
+                    );
                     item.api_key.clear();
                 }
             }
@@ -111,71 +119,39 @@ fn get_db_path(app_name: &str) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").ok()?;
-        Some(PathBuf::from(appdata).join(app_name).join("User").join("globalStorage").join("state.vscdb"))
+        Some(
+            PathBuf::from(appdata)
+                .join(app_name)
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb"),
+        )
     }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").ok()?;
-        Some(PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join(app_name)
-            .join("User")
-            .join("globalStorage")
-            .join("state.vscdb"))
+        Some(
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join(app_name)
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb"),
+        )
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let home = std::env::var("HOME").ok()?;
-        Some(PathBuf::from(home)
-            .join(".config")
-            .join(app_name)
-            .join("User")
-            .join("globalStorage")
-            .join("state.vscdb"))
+        Some(
+            PathBuf::from(home)
+                .join(".config")
+                .join(app_name)
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb"),
+        )
     }
-}
-
-/// Helper to read a key's value from state.vscdb
-/// Copies the database to a temporary file first to avoid locking issues while the IDE is running.
-fn read_vscdb_key(db_path: &Path, target_key: &str) -> Result<Option<String>, String> {
-    if !db_path.exists() {
-        return Ok(None);
-    }
-    
-    let temp_path = {
-        let temp_dir = std::env::temp_dir();
-        temp_dir.join(format!(
-            "vscdb_temp_{}_{}.db",
-            chrono::Utc::now().timestamp_millis(),
-            std::process::id()
-        ))
-    };
-    
-    std::fs::copy(db_path, &temp_path)
-        .map_err(|e| format!("Failed to copy state database: {}", e))?;
-        
-    let res = (|| {
-        let conn = rusqlite::Connection::open(&temp_path)
-            .map_err(|e| format!("Failed to open database: {}", e))?;
-            
-        let mut stmt = conn.prepare("SELECT value FROM ItemTable WHERE key = ?")
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-            
-        let mut rows = stmt.query([target_key])
-            .map_err(|e| format!("Query failed: {}", e))?;
-            
-        if let Some(row) = rows.next().map_err(|e| format!("Error reading row: {}", e))? {
-            let val: String = row.get(0).map_err(|e| format!("Failed to get column value: {}", e))?;
-            Ok(Some(val))
-        } else {
-            Ok(None)
-        }
-    })();
-    
-    let _ = std::fs::remove_file(&temp_path);
-    
-    res
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -284,6 +260,15 @@ fn is_quota_retriable_failure(error: &str) -> bool {
         || lower.contains("server error")
 }
 
+fn is_soft_quota_retention_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("showing cached")
+        || lower.contains("retaining last")
+        || lower.contains("did not complete")
+        || lower.contains("offline —")
+        || lower.contains("offline -")
+}
+
 fn format_retained_quota_error(error: &str) -> String {
     if is_quota_network_error(error) {
         "Offline — showing cached data (check network, VPN, or proxy)".to_string()
@@ -299,7 +284,11 @@ fn push_quota_provider_fetch_error(
     error: &str,
 ) {
     if is_quota_retriable_failure(error) && quota_item_has_display_data(item) {
-        log::warn!("{} retriable error (retained stale data): {}", provider_label, error);
+        log::warn!(
+            "{} retriable error (retained stale data): {}",
+            provider_label,
+            error
+        );
         let mut retained = item.clone();
         retained.error_msg = Some(format_retained_quota_error(error));
         fetched_items.push(retained);
@@ -324,12 +313,19 @@ fn apply_custom_quota_fetch_error(
         );
         resolved_item.error_msg = Some(format_retained_quota_error(error));
     } else {
-        log::error!("Failed to fetch custom quota provider '{}': {}", provider_name, error);
+        log::error!(
+            "Failed to fetch custom quota provider '{}': {}",
+            provider_name,
+            error
+        );
         resolved_item.error_msg = Some(error.to_string());
     }
 }
 
-fn config_items_for_provider<'a>(config_items: &'a [QuotaItem], provider: &str) -> Vec<&'a QuotaItem> {
+fn config_items_for_provider<'a>(
+    config_items: &'a [QuotaItem],
+    provider: &str,
+) -> Vec<&'a QuotaItem> {
     config_items
         .iter()
         .filter(|item| resolve_quota_provider(item) == provider)
@@ -409,11 +405,10 @@ fn push_antigravity_fetch_results(
 }
 
 fn is_quota_hard_error(msg: &str) -> bool {
-    if is_quota_retriable_failure(msg) {
+    if is_quota_retriable_failure(msg) || is_soft_quota_retention_error(msg) {
         return false;
     }
-    let lower = msg.to_lowercase();
-    !(lower.contains("cached") || lower.contains("retaining last"))
+    true
 }
 
 fn quota_cycle_all_hard_failed(config: &QuotaConfig, fetched: &[QuotaItem]) -> bool {
@@ -425,16 +420,16 @@ fn quota_cycle_all_hard_failed(config: &QuotaConfig, fetched: &[QuotaItem]) -> b
     if auto_items.is_empty() {
         return false;
     }
-    auto_items.iter().all(|cfg| {
-        match fetched.iter().find(|item| item.id == cfg.id) {
+    auto_items
+        .iter()
+        .all(|cfg| match fetched.iter().find(|item| item.id == cfg.id) {
             Some(item) => item
                 .error_msg
                 .as_ref()
                 .map(|msg| is_quota_hard_error(msg))
                 .unwrap_or(false),
             None => true,
-        }
-    })
+        })
 }
 
 #[cfg(target_os = "windows")]
@@ -473,7 +468,10 @@ fn query_listening_ports_for_pid(pid: u64) -> Result<Vec<u16>, String> {
     }
 
     let netstat_output = std::process::Command::new("cmd")
-        .args(["/C", &format!("netstat -ano | findstr LISTENING | findstr {}", pid)])
+        .args([
+            "/C",
+            &format!("netstat -ano | findstr LISTENING | findstr {}", pid),
+        ])
         .creation_flags(0x08000000)
         .output()
         .map_err(|e| format!("Failed to run netstat fallback: {}", e))?;
@@ -535,7 +533,9 @@ fn discover_ag_language_server_windows() -> Result<(String, Vec<u16>), String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if stdout.trim().is_empty() {
-        return Err("Antigravity language server not running. Please open Antigravity IDE.".to_string());
+        return Err(
+            "Antigravity language server not running. Please open Antigravity IDE.".to_string(),
+        );
     }
 
     let processes = parse_ag_windows_processes(&stdout);
@@ -555,7 +555,10 @@ fn discover_ag_language_server_windows() -> Result<(String, Vec<u16>), String> {
         }
     }
 
-    Err(format!("Language server found but unreachable: {}", last_err))
+    Err(format!(
+        "Language server found but unreachable: {}",
+        last_err
+    ))
 }
 
 /// Returns true when the Antigravity IDE language server process is reachable locally.
@@ -573,52 +576,67 @@ fn discover_ag_language_server() -> Result<(String, Vec<u16>), String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-    // Platform-specific process name
-    #[cfg(target_os = "macos")]
-    let proc_name_pattern = "language_server_macos";
-    #[cfg(not(target_os = "macos"))]
-    let proc_name_pattern = "language_server_linux";
+        // Platform-specific process name
+        #[cfg(target_os = "macos")]
+        let proc_name_pattern = "language_server_macos";
+        #[cfg(not(target_os = "macos"))]
+        let proc_name_pattern = "language_server_linux";
 
-    let output = std::process::Command::new("sh")
-        .args(["-c", &format!("ps aux | grep '{}' | grep -v grep", proc_name_pattern)])
-        .output()
-        .map_err(|e| format!("Failed to query processes: {}", e))?;
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!("ps aux | grep '{}' | grep -v grep", proc_name_pattern),
+            ])
+            .output()
+            .map_err(|e| format!("Failed to query processes: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if stdout.trim().is_empty() {
-        return Err("Antigravity language server not running. Please open Antigravity IDE.".to_string());
-    }
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if stdout.trim().is_empty() {
+            return Err(
+                "Antigravity language server not running. Please open Antigravity IDE.".to_string(),
+            );
+        }
 
-    let csrf_token = if let Some(pos) = stdout.find("--csrf_token") {
-        let rest = &stdout[pos + "--csrf_token".len()..].trim_start_matches([' ', '=']);
-        rest.split_whitespace().next()
-            .map(|s| s.trim_matches('"').to_string())
-            .ok_or_else(|| "Could not parse CSRF token".to_string())?
-    } else {
-        return Err("No CSRF token found in language server process args. Is Antigravity IDE running?".to_string());
-    };
+        let csrf_token = if let Some(pos) = stdout.find("--csrf_token") {
+            let rest = &stdout[pos + "--csrf_token".len()..].trim_start_matches([' ', '=']);
+            rest.split_whitespace()
+                .next()
+                .map(|s| s.trim_matches('"').to_string())
+                .ok_or_else(|| "Could not parse CSRF token".to_string())?
+        } else {
+            return Err(
+                "No CSRF token found in language server process args. Is Antigravity IDE running?"
+                    .to_string(),
+            );
+        };
 
-    let pid: u64 = stdout
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| "Could not extract PID from process list".to_string())?;
+        let pid: u64 = stdout
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| "Could not extract PID from process list".to_string())?;
 
-    let ports_output = std::process::Command::new("sh")
-        .args(["-c", &format!("lsof -iTCP -sTCP:LISTEN -p {} | awk '{{print $9}}' | grep -oE '[0-9]+$'", pid)])
-        .output()
-        .map_err(|e| format!("Failed to query ports: {}", e))?;
+        let ports_output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "lsof -iTCP -sTCP:LISTEN -p {} | awk '{{print $9}}' | grep -oE '[0-9]+$'",
+                    pid
+                ),
+            ])
+            .output()
+            .map_err(|e| format!("Failed to query ports: {}", e))?;
 
-    let ports: Vec<u16> = String::from_utf8_lossy(&ports_output.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u16>().ok())
-        .collect();
+        let ports: Vec<u16> = String::from_utf8_lossy(&ports_output.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u16>().ok())
+            .collect();
 
-    if ports.is_empty() {
-        return Err("Language server found but no listening ports detected.".to_string());
-    }
+        if ports.is_empty() {
+            return Err("Language server found but no listening ports detected.".to_string());
+        }
 
-    Ok((csrf_token, ports))
+        Ok((csrf_token, ports))
     }
 }
 
@@ -634,7 +652,7 @@ fn format_iso_to_local(iso: &str) -> Option<String> {
         let local = dt.with_timezone(&chrono::Local);
         return Some(local.format("%Y-%m-%d %H:%M").to_string());
     }
-    
+
     // 2. Try appending 'Z' if it's missing (e.g. "2026-06-30T17:34:56")
     if !trimmed.ends_with('Z') && !trimmed.contains('+') {
         let with_z = format!("{}Z", trimmed);
@@ -642,7 +660,7 @@ fn format_iso_to_local(iso: &str) -> Option<String> {
             let local = dt.with_timezone(&chrono::Local);
             return Some(local.format("%Y-%m-%d %H:%M").to_string());
         }
-        
+
         // Try replacing space with 'T' (e.g. "2026-06-30 17:34:56" -> "2026-06-30T17:34:56Z")
         let with_t_z = format!("{}Z", trimmed.replace(' ', "T"));
         if let Ok(dt) = with_t_z.parse::<DateTime<Utc>>() {
@@ -650,7 +668,7 @@ fn format_iso_to_local(iso: &str) -> Option<String> {
             return Some(local.format("%Y-%m-%d %H:%M").to_string());
         }
     }
-    
+
     // 3. Fallback: If it's a non-empty string, just return it as-is (e.g. pre-formatted dates)
     Some(trimmed.to_string())
 }
@@ -703,7 +721,8 @@ fn classify_antigravity_ls_error(err: &str) -> String {
 fn classify_antigravity_cloud_error(err: &str) -> String {
     let lower = err.to_lowercase();
     if lower.contains("client_secret") || lower.contains("oauth credentials not configured") {
-        "OAuth secret not configured — install Antigravity IDE or set antigravity_oauth.json".to_string()
+        "OAuth secret not configured — install Antigravity IDE or set antigravity_oauth.json"
+            .to_string()
     } else if lower.contains("oauth") || lower.contains("sign in") {
         "Sign in to Antigravity IDE once".to_string()
     } else if lower.contains("network") || lower.contains("timeout") {
@@ -748,7 +767,14 @@ async fn fetch_antigravity_via_language_server(
     let mut last_err = String::from("language server not running");
 
     for attempt in 0..2 {
-        let (csrf_token, ports) = discover_ag_language_server()?;
+        let (csrf_token, ports) = tokio::task::spawn_blocking(discover_ag_language_server)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Antigravity language-server discovery stopped unexpectedly: {}",
+                    error
+                )
+            })??;
         let mut response_text: Option<String> = None;
 
         for port in &ports {
@@ -765,16 +791,16 @@ async fn fetch_antigravity_via_language_server(
                 .send()
                 .await
             {
-                Ok(res) if res.status().is_success() => {
-                    match res.text().await {
-                        Ok(text) if !text.is_empty() => {
-                            response_text = Some(text);
-                            break;
-                        }
-                        Ok(_) => last_err = format!("Empty response from language server on port {}", port),
-                        Err(e) => last_err = format!("Failed to read language server response: {}", e),
+                Ok(res) if res.status().is_success() => match res.text().await {
+                    Ok(text) if !text.is_empty() => {
+                        response_text = Some(text);
+                        break;
                     }
-                }
+                    Ok(_) => {
+                        last_err = format!("Empty response from language server on port {}", port)
+                    }
+                    Err(e) => last_err = format!("Failed to read language server response: {}", e),
+                },
                 Ok(res) => {
                     last_err = format!("Language server HTTP {} on port {}", res.status(), port);
                 }
@@ -796,9 +822,14 @@ async fn fetch_antigravity_via_language_server(
             let model_configs = user_status
                 .cascade_model_config_data
                 .and_then(|d| d.client_model_configs)
-                .ok_or_else(|| "No model configuration data in GetUserStatus response".to_string())?;
+                .ok_or_else(|| {
+                    "No model configuration data in GetUserStatus response".to_string()
+                })?;
 
-            let tier_name = user_status.user_tier.as_ref().and_then(|ut| ut.name.clone());
+            let tier_name = user_status
+                .user_tier
+                .as_ref()
+                .and_then(|ut| ut.name.clone());
 
             return build_antigravity_quota_items_from_configs(
                 model_configs,
@@ -859,7 +890,11 @@ fn build_antigravity_quota_items(
         .collect();
 
     let refs: Vec<&AgClientModelConfig> = limited_models.iter().collect();
-    Ok(vec![build_antigravity_quota_item(&refs, snapshot.email, snapshot.tier_name)])
+    Ok(vec![build_antigravity_quota_item(
+        &refs,
+        snapshot.email,
+        snapshot.tier_name,
+    )])
 }
 
 fn build_antigravity_quota_item(
@@ -889,20 +924,24 @@ fn build_antigravity_quota_item(
     let mut bars = Vec::new();
 
     // 1. Find Gemini model
-    let gemini_model = limited_models.iter().find(|m| {
-        let label = get_label(m).to_lowercase();
-        label.contains("gemini") && label.contains("3.5") && label.contains("flash")
-    }).or_else(|| {
-        limited_models.iter().find(|m| {
+    let gemini_model = limited_models
+        .iter()
+        .find(|m| {
             let label = get_label(m).to_lowercase();
-            label.contains("gemini") && label.contains("flash")
+            label.contains("gemini") && label.contains("3.5") && label.contains("flash")
         })
-    }).or_else(|| {
-        limited_models.iter().find(|m| {
-            let label = get_label(m).to_lowercase();
-            label.contains("gemini")
+        .or_else(|| {
+            limited_models.iter().find(|m| {
+                let label = get_label(m).to_lowercase();
+                label.contains("gemini") && label.contains("flash")
+            })
         })
-    });
+        .or_else(|| {
+            limited_models.iter().find(|m| {
+                let label = get_label(m).to_lowercase();
+                label.contains("gemini")
+            })
+        });
 
     if let Some(m) = gemini_model {
         bars.push(QuotaBar {
@@ -913,25 +952,30 @@ fn build_antigravity_quota_item(
     }
 
     // 2. Find Claude/GPT-OSS model
-    let claude_gpt_model = limited_models.iter().find(|m| {
-        let label = get_label(m).to_lowercase();
-        label.contains("claude") && label.contains("opus") && label.contains("4.6")
-    }).or_else(|| {
-        limited_models.iter().find(|m| {
+    let claude_gpt_model = limited_models
+        .iter()
+        .find(|m| {
             let label = get_label(m).to_lowercase();
-            label.contains("claude") && label.contains("opus")
+            label.contains("claude") && label.contains("opus") && label.contains("4.6")
         })
-    }).or_else(|| {
-        limited_models.iter().find(|m| {
-            let label = get_label(m).to_lowercase();
-            label.contains("claude")
+        .or_else(|| {
+            limited_models.iter().find(|m| {
+                let label = get_label(m).to_lowercase();
+                label.contains("claude") && label.contains("opus")
+            })
         })
-    }).or_else(|| {
-        limited_models.iter().find(|m| {
-            let label = get_label(m).to_lowercase();
-            label.contains("gpt-oss") || label.contains("gpt")
+        .or_else(|| {
+            limited_models.iter().find(|m| {
+                let label = get_label(m).to_lowercase();
+                label.contains("claude")
+            })
         })
-    });
+        .or_else(|| {
+            limited_models.iter().find(|m| {
+                let label = get_label(m).to_lowercase();
+                label.contains("gpt-oss") || label.contains("gpt")
+            })
+        });
 
     if let Some(m) = claude_gpt_model {
         bars.push(QuotaBar {
@@ -982,25 +1026,29 @@ pub fn group_antigravity_bars(item: &mut QuotaItem) {
         Some(b) => b,
         None => return,
     };
-    
+
     let mut new_bars = Vec::new();
-    
+
     // Find Gemini
-    let gemini_bar = bars.iter().find(|b| {
-        let name = b.name.to_lowercase();
-        name.contains("gemini") && name.contains("3.5") && name.contains("flash")
-    }).or_else(|| {
-        bars.iter().find(|b| {
+    let gemini_bar = bars
+        .iter()
+        .find(|b| {
             let name = b.name.to_lowercase();
-            name.contains("gemini") && name.contains("flash")
+            name.contains("gemini") && name.contains("3.5") && name.contains("flash")
         })
-    }).or_else(|| {
-        bars.iter().find(|b| {
-            let name = b.name.to_lowercase();
-            name.contains("gemini")
+        .or_else(|| {
+            bars.iter().find(|b| {
+                let name = b.name.to_lowercase();
+                name.contains("gemini") && name.contains("flash")
+            })
         })
-    });
-    
+        .or_else(|| {
+            bars.iter().find(|b| {
+                let name = b.name.to_lowercase();
+                name.contains("gemini")
+            })
+        });
+
     if let Some(b) = gemini_bar {
         new_bars.push(QuotaBar {
             name: "Gemini".to_string(),
@@ -1008,28 +1056,33 @@ pub fn group_antigravity_bars(item: &mut QuotaItem) {
             reset: b.reset.clone(),
         });
     }
-    
+
     // Find Claude/GPT-OSS
-    let claude_gpt_bar = bars.iter().find(|b| {
-        let name = b.name.to_lowercase();
-        name.contains("claude") && name.contains("opus") && name.contains("4.6")
-    }).or_else(|| {
-        bars.iter().find(|b| {
+    let claude_gpt_bar = bars
+        .iter()
+        .find(|b| {
             let name = b.name.to_lowercase();
-            name.contains("claude") && name.contains("opus")
+            name.contains("claude") && name.contains("opus") && name.contains("4.6")
         })
-    }).or_else(|| {
-        bars.iter().find(|b| {
-            let name = b.name.to_lowercase();
-            name.contains("claude")
+        .or_else(|| {
+            bars.iter().find(|b| {
+                let name = b.name.to_lowercase();
+                name.contains("claude") && name.contains("opus")
+            })
         })
-    }).or_else(|| {
-        bars.iter().find(|b| {
-            let name = b.name.to_lowercase();
-            name.contains("gpt-oss") || name.contains("gpt")
+        .or_else(|| {
+            bars.iter().find(|b| {
+                let name = b.name.to_lowercase();
+                name.contains("claude")
+            })
         })
-    });
-    
+        .or_else(|| {
+            bars.iter().find(|b| {
+                let name = b.name.to_lowercase();
+                name.contains("gpt-oss") || name.contains("gpt")
+            })
+        });
+
     if let Some(b) = claude_gpt_bar {
         new_bars.push(QuotaBar {
             name: "Claude+GPT-OSS".to_string(),
@@ -1037,7 +1090,7 @@ pub fn group_antigravity_bars(item: &mut QuotaItem) {
             reset: b.reset.clone(),
         });
     }
-    
+
     if !new_bars.is_empty() {
         item.current_value = new_bars.first().map(|b| b.value);
         item.primary_name = new_bars.first().map(|b| b.name.clone());
@@ -1100,7 +1153,9 @@ fn get_codex_auth_paths() -> Vec<PathBuf> {
 }
 
 fn get_codex_auth_path() -> Option<PathBuf> {
-    get_codex_auth_paths().into_iter().find(|path| path.exists())
+    get_codex_auth_paths()
+        .into_iter()
+        .find(|path| path.exists())
 }
 
 #[derive(serde::Deserialize)]
@@ -1121,11 +1176,10 @@ struct CodexWindow {
 }
 
 #[derive(serde::Deserialize)]
-#[allow(dead_code)]
 struct CodexRateLimit {
-    allowed: bool,
-    limit_reached: bool,
+    #[serde(default)]
     primary_window: Option<CodexWindow>,
+    #[serde(default)]
     secondary_window: Option<CodexWindow>,
 }
 
@@ -1152,6 +1206,51 @@ fn format_seconds(seconds: u64) -> String {
     }
 }
 
+fn format_codex_reset_time(timestamp_opt: Option<u64>) -> Option<String> {
+    use chrono::TimeZone;
+
+    let ts = timestamp_opt?;
+    chrono::Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+fn codex_window_to_bar(window: CodexWindow) -> QuotaBar {
+    QuotaBar {
+        name: format!("{} Usage", format_seconds(window.limit_window_seconds)),
+        value: (100.0 - window.used_percent).clamp(0.0, 100.0),
+        reset: format_codex_reset_time(window.reset_at),
+    }
+}
+
+fn codex_windows_to_bars(
+    primary_window: Option<CodexWindow>,
+    secondary_window: Option<CodexWindow>,
+) -> Vec<QuotaBar> {
+    [primary_window, secondary_window]
+        .into_iter()
+        .flatten()
+        .map(codex_window_to_bar)
+        .collect()
+}
+
+fn format_codex_network_error(error: &reqwest::Error) -> String {
+    let mut details = error.to_string();
+    let mut source = error.source();
+
+    while let Some(cause) = source {
+        let cause_details = cause.to_string();
+        if !cause_details.is_empty() {
+            details.push_str(": ");
+            details.push_str(&cause_details);
+        }
+        source = cause.source();
+    }
+
+    details
+}
+
 fn codex_auth_not_found_message() -> String {
     let paths = get_codex_auth_paths();
     if paths.is_empty() {
@@ -1169,9 +1268,8 @@ fn codex_auth_not_found_message() -> String {
 }
 
 /// Fetch Codex Pro rate limits from ChatGPT backend wham usage endpoint
-async fn fetch_codex_quota(_show_account_name: bool) -> Result<QuotaItem, String> {
-    let auth_path =
-        get_codex_auth_path().ok_or_else(codex_auth_not_found_message)?;
+fn read_codex_access_token() -> Result<String, String> {
+    let auth_path = get_codex_auth_path().ok_or_else(codex_auth_not_found_message)?;
 
     let auth_str = std::fs::read_to_string(&auth_path)
         .map_err(|e| format!("Failed to read Codex auth file: {}", e))?;
@@ -1179,7 +1277,8 @@ async fn fetch_codex_quota(_show_account_name: bool) -> Result<QuotaItem, String
     let auth: CodexAuth = serde_json::from_str(&auth_str)
         .map_err(|e| format!("Failed to parse Codex auth file: {}", e))?;
 
-    let tokens = auth.tokens
+    let tokens = auth
+        .tokens
         .ok_or_else(|| "No tokens found in Codex auth file".to_string())?;
 
     let token = tokens.access_token;
@@ -1187,17 +1286,49 @@ async fn fetch_codex_quota(_show_account_name: bool) -> Result<QuotaItem, String
         return Err("Codex access token is empty. Please log in again.".to_string());
     }
 
+    Ok(token)
+}
+
+async fn fetch_codex_quota(_show_account_name: bool) -> Result<QuotaItem, String> {
+    let token = tokio::task::spawn_blocking(read_codex_access_token)
+        .await
+        .map_err(|error| format!("Codex credential reader stopped unexpectedly: {}", error))??;
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        // Some Windows network paths/proxies are unreliable with HTTP/2 while
+        // the same Codex endpoint remains reachable over HTTP/1.1.
+        .http1_only()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
         .unwrap_or_default();
 
-    let res = client.get("https://chatgpt.com/backend-api/wham/usage")
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
+    let mut attempt = 1;
+    let res = loop {
+        match client
+            .get("https://chatgpt.com/backend-api/wham/usage")
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+        {
+            Ok(response) => break response,
+            Err(error) if attempt < 2 => {
+                log::warn!(
+                    "Codex usage request failed on attempt {}: {}. Retrying once over HTTP/1.1.",
+                    attempt,
+                    error
+                );
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Network error: {}",
+                    format_codex_network_error(&error)
+                ))
+            }
+        }
+    };
 
     if !res.status().is_success() {
         let status = res.status();
@@ -1211,7 +1342,9 @@ async fn fetch_codex_quota(_show_account_name: bool) -> Result<QuotaItem, String
         return Err(format!("Codex API error: HTTP {}{}", status, hint));
     }
 
-    let text = res.text().await
+    let text = res
+        .text()
+        .await
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
     let resp: CodexUsageResponse = serde_json::from_str(&text)
@@ -1220,27 +1353,14 @@ async fn fetch_codex_quota(_show_account_name: bool) -> Result<QuotaItem, String
     let account_label = resp.email;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    let rl = resp.rate_limit
+    let rl = resp
+        .rate_limit
         .ok_or_else(|| "No rate limit information returned from Codex".to_string())?;
 
-    let pw = rl.primary_window
-        .ok_or_else(|| "No primary rate limit window found".to_string())?;
-
-    let sw = rl.secondary_window
-        .ok_or_else(|| "No secondary rate limit window found".to_string())?;
-
-    let remaining_pw = (100.0 - pw.used_percent).max(0.0);
-    let remaining_sw = (100.0 - sw.used_percent).max(0.0);
-
-    let format_reset_time = |timestamp_opt: Option<u64>| -> Option<String> {
-        use chrono::TimeZone;
-        let ts = timestamp_opt?;
-        if let Some(dt) = chrono::Local.timestamp_opt(ts as i64, 0).single() {
-            Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        } else {
-            None
-        }
-    };
+    let bars = codex_windows_to_bars(rl.primary_window, rl.secondary_window);
+    let primary_bar = bars
+        .first()
+        .ok_or_else(|| "No usable rate limit windows returned from Codex".to_string())?;
 
     Ok(QuotaItem {
         id: "codex".to_string(),
@@ -1252,16 +1372,14 @@ async fn fetch_codex_quota(_show_account_name: bool) -> Result<QuotaItem, String
         api_url: None,
         json_path: None,
         max_quota: Some(100.0),
-        current_value: Some(remaining_pw),
+        current_value: Some(primary_bar.value),
         error_msg: None,
         last_update: Some(now),
         unit: Some("%".to_string()),
-        
-        primary_name: Some(format!("{} Usage", format_seconds(pw.limit_window_seconds))),
-        primary_reset: format_reset_time(pw.reset_at),
-        secondary_value: Some(remaining_sw),
-        secondary_name: Some(format!("{} Usage", format_seconds(sw.limit_window_seconds))),
-        secondary_reset: format_reset_time(sw.reset_at),
+
+        primary_name: Some(primary_bar.name.clone()),
+        primary_reset: primary_bar.reset.clone(),
+        bars: Some(bars),
         plan_type: resp.plan_type.clone(),
         ..Default::default()
     })
@@ -1302,11 +1420,18 @@ struct CopilotUserResponse {
 const COPILOT_API_VERSION: &str = "2025-05-01";
 
 /// Fetch VS Code GitHub Copilot quota via the internal GitHub API.
-async fn fetch_copilot_quota(_show_account_name: bool, api_key_override: &str) -> Result<QuotaItem, String> {
+async fn fetch_copilot_quota(
+    _show_account_name: bool,
+    api_key_override: &str,
+) -> Result<QuotaItem, String> {
     let (token, raw_email) = if !api_key_override.trim().is_empty() {
         (api_key_override.trim().to_string(), None)
     } else {
-        vscode_secrets::read_vscode_copilot_github_token()?
+        tokio::task::spawn_blocking(vscode_secrets::read_vscode_copilot_github_token)
+            .await
+            .map_err(|error| {
+                format!("Copilot credential reader stopped unexpectedly: {}", error)
+            })??
     };
 
     let client = reqwest::Client::builder()
@@ -1364,49 +1489,49 @@ async fn fetch_copilot_quota(_show_account_name: bool, api_key_override: &str) -
             Err(e) => return Err(format!("Failed to parse Copilot usage response: {}", e)),
         };
 
-        let (remaining_pct, bar_name, reset_raw) =
-            if let Some(premium) = resp
-                .quota_snapshots
-                .as_ref()
-                .and_then(|s| s.premium_interactions.as_ref())
-            {
-                if premium.unlimited == Some(true) {
-                    (
-                        100.0,
-                        "Premium Requests".to_string(),
-                        resp.quota_reset_date.clone(),
-                    )
-                } else {
-                    (
-                        premium.percent_remaining.unwrap_or(0.0).clamp(0.0, 100.0),
-                        "Premium Requests".to_string(),
-                        resp.quota_reset_date.clone(),
-                    )
-                }
-            } else if let (Some(limited), Some(monthly)) =
-                (resp.limited_user_quotas.as_ref(), resp.monthly_quotas.as_ref())
-            {
-                let used = limited.chat.unwrap_or(0.0);
-                let total = monthly.chat.unwrap_or(0.0);
-                let pct = if total > 0.0 {
-                    (used / total * 100.0).clamp(0.0, 100.0)
-                } else {
-                    0.0
-                };
+        let (remaining_pct, bar_name, reset_raw) = if let Some(premium) = resp
+            .quota_snapshots
+            .as_ref()
+            .and_then(|s| s.premium_interactions.as_ref())
+        {
+            if premium.unlimited == Some(true) {
                 (
-                    pct,
-                    "Chat".to_string(),
-                    resp.limited_user_reset_date.clone(),
-                )
-            } else if let Some(chat) = resp.quota_snapshots.as_ref().and_then(|s| s.chat.as_ref()) {
-                (
-                    chat.percent_remaining.unwrap_or(0.0).clamp(0.0, 100.0),
-                    "Chat".to_string(),
+                    100.0,
+                    "Premium Requests".to_string(),
                     resp.quota_reset_date.clone(),
                 )
             } else {
-                return Err("No quota information returned from Copilot API".to_string());
+                (
+                    premium.percent_remaining.unwrap_or(0.0).clamp(0.0, 100.0),
+                    "Premium Requests".to_string(),
+                    resp.quota_reset_date.clone(),
+                )
+            }
+        } else if let (Some(limited), Some(monthly)) = (
+            resp.limited_user_quotas.as_ref(),
+            resp.monthly_quotas.as_ref(),
+        ) {
+            let used = limited.chat.unwrap_or(0.0);
+            let total = monthly.chat.unwrap_or(0.0);
+            let pct = if total > 0.0 {
+                (used / total * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
             };
+            (
+                pct,
+                "Chat".to_string(),
+                resp.limited_user_reset_date.clone(),
+            )
+        } else if let Some(chat) = resp.quota_snapshots.as_ref().and_then(|s| s.chat.as_ref()) {
+            (
+                chat.percent_remaining.unwrap_or(0.0).clamp(0.0, 100.0),
+                "Chat".to_string(),
+                resp.quota_reset_date.clone(),
+            )
+        } else {
+            return Err("No quota information returned from Copilot API".to_string());
+        };
 
         let reset_time = reset_raw.as_deref().and_then(format_iso_to_local);
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -1436,27 +1561,40 @@ async fn fetch_copilot_quota(_show_account_name: bool, api_key_override: &str) -
 }
 
 /// Fetch Cursor quota from the Cursor API using the local access token
-async fn fetch_cursor_quota(_show_account_name: bool) -> Result<QuotaItem, String> {
+fn read_cursor_local_credentials() -> Result<(String, Option<String>, Option<String>), String> {
+    const ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
+    const EMAIL_KEY: &str = "cursorAuth/cachedEmail";
+    const PLAN_KEY: &str = "cursorAuth/stripeMembershipType";
+
     let app_names = ["Cursor", "cursor"];
     let db_path = resolve_ide_db_path(&app_names)
         .ok_or_else(|| ide_db_not_found_message("Cursor", &app_names))?;
-    
-    let token_opt = read_vscdb_key(&db_path, "cursorAuth/accessToken")?;
-    let token = match token_opt {
-        Some(t) => t,
-        None => return Err("Not signed in (cursorAuth/accessToken not found)".to_string()),
-    };
-    
-    let account_label = read_vscdb_key(&db_path, "cursorAuth/cachedEmail").unwrap_or(None);
-    let plan_type = read_vscdb_key(&db_path, "cursorAuth/stripeMembershipType").unwrap_or(None);
-    
+    let mut values =
+        crate::sqlite_state::read_text_keys(&db_path, &[ACCESS_TOKEN_KEY, EMAIL_KEY, PLAN_KEY])?;
+    let token = values
+        .remove(ACCESS_TOKEN_KEY)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Not signed in (cursorAuth/accessToken not found)".to_string())?;
+
+    Ok((token, values.remove(EMAIL_KEY), values.remove(PLAN_KEY)))
+}
+
+async fn fetch_cursor_quota(_show_account_name: bool) -> Result<QuotaItem, String> {
+    let (token, account_label, plan_type) =
+        tokio::task::spawn_blocking(read_cursor_local_credentials)
+            .await
+            .map_err(|error| {
+                format!("Cursor credential reader stopped unexpectedly: {}", error)
+            })??;
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap_or_default();
-        
+
     let url = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
-    let res = client.post(url)
+    let res = client
+        .post(url)
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .header("connect-protocol-version", "1")
@@ -1464,7 +1602,7 @@ async fn fetch_cursor_quota(_show_account_name: bool) -> Result<QuotaItem, Strin
         .send()
         .await
         .map_err(|e| format!("Network error: {}", e))?;
-        
+
     if !res.status().is_success() {
         let status = res.status();
         let hint = if status.as_u16() == 401 {
@@ -1476,22 +1614,25 @@ async fn fetch_cursor_quota(_show_account_name: bool) -> Result<QuotaItem, Strin
         };
         return Err(format!("Cursor API error: HTTP {}{}", status, hint));
     }
-    
-    let text = res.text().await
+
+    let text = res
+        .text()
+        .await
         .map_err(|e| format!("Failed to read response body: {}", e))?;
-        
-    let usage_resp: CursorUsageResponse = serde_json::from_str(&text)
-        .map_err(|e| format!("Failed to parse usage details: {}", e))?;
-        
-    let plan = usage_resp.plan_usage
+
+    let usage_resp: CursorUsageResponse =
+        serde_json::from_str(&text).map_err(|e| format!("Failed to parse usage details: {}", e))?;
+
+    let plan = usage_resp
+        .plan_usage
         .ok_or_else(|| "No plan usage statistics returned from Cursor API".to_string())?;
-        
+
     let api_used = plan.api_percent_used.unwrap_or(0.0);
     let auto_used = plan.auto_percent_used.unwrap_or(0.0);
-    
+
     let remaining_api = (100.0 - api_used).max(0.0);
     let remaining_auto = (100.0 - auto_used).max(0.0);
-    
+
     let reset_time = usage_resp.billing_cycle_end.and_then(|s| {
         s.parse::<i64>().ok().and_then(|ms| {
             use chrono::TimeZone;
@@ -1502,9 +1643,9 @@ async fn fetch_cursor_quota(_show_account_name: bool) -> Result<QuotaItem, Strin
             }
         })
     });
-    
+
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    
+
     Ok(QuotaItem {
         id: "cursor".to_string(),
         name: "Cursor".to_string(),
@@ -1519,7 +1660,7 @@ async fn fetch_cursor_quota(_show_account_name: bool) -> Result<QuotaItem, Strin
         error_msg: None,
         last_update: Some(now),
         unit: Some("%".to_string()),
-        
+
         primary_name: Some("API Usage".to_string()),
         primary_reset: reset_time,
         secondary_value: Some(remaining_auto),
@@ -1537,7 +1678,7 @@ fn get_json_value_by_path(value: &Value, path: &str) -> Option<Value> {
         if part.is_empty() {
             continue;
         }
-        
+
         if part.contains('[') && part.ends_with(']') {
             let parts: Vec<&str> = part.split('[').collect();
             if parts.len() == 2 {
@@ -1552,7 +1693,7 @@ fn get_json_value_by_path(value: &Value, path: &str) -> Option<Value> {
                 }
             }
         }
-        
+
         current = current.get(part)?;
     }
     Some(current.clone())
@@ -1560,10 +1701,8 @@ fn get_json_value_by_path(value: &Value, path: &str) -> Option<Value> {
 
 // ─── Qoder CN ──────────────────────────────────────────────────────────────
 
-const QODER_CN_OPENAPI_BASES: &[&str] = &[
-    "https://openapi.qoder.com.cn",
-    "https://openapi.qoder.sh",
-];
+const QODER_CN_OPENAPI_BASES: &[&str] =
+    &["https://openapi.qoder.com.cn", "https://openapi.qoder.sh"];
 
 #[derive(Debug, Deserialize)]
 struct QoderJobTokenExchangeResponse {
@@ -1618,14 +1757,14 @@ async fn qoder_cn_exchange_personal_token(
         return Ok(token.to_string());
     }
 
-    Err("Qoder CN PAT exchange failed. Regenerate your PAT at qoder.com.cn/account/integrations.".to_string())
+    Err(
+        "Qoder CN PAT exchange failed. Regenerate your PAT at qoder.com.cn/account/integrations."
+            .to_string(),
+    )
 }
 
 /// PATs (pt-...) must be exchanged for job tokens (jt-...) before OpenAPI calls.
-async fn qoder_cn_normalize_token(
-    client: &reqwest::Client,
-    token: &str,
-) -> Result<String, String> {
+async fn qoder_cn_normalize_token(client: &reqwest::Client, token: &str) -> Result<String, String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
         return Err("Qoder CN token is empty.".to_string());
@@ -1636,14 +1775,16 @@ async fn qoder_cn_normalize_token(
     Ok(trimmed.to_string())
 }
 
-async fn qoder_cn_auth_candidates(item: &QuotaItem) -> Result<Vec<(String, Option<String>)>, String> {
+fn qoder_cn_auth_candidates(item: &QuotaItem) -> Result<Vec<(String, Option<String>)>, String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mode = quota_auth_mode(item);
 
     if mode == QuotaAuthMode::Local {
         match vscode_secrets::read_qoder_cn_auth_token() {
-            Ok(Some((token, label))) => qoder_cn_push_auth_candidate(&mut out, &mut seen, token, label),
+            Ok(Some((token, label))) => {
+                qoder_cn_push_auth_candidate(&mut out, &mut seen, token, label)
+            }
             Ok(None) => {}
             Err(e) => log::warn!("Qoder CN IDE session read failed: {}", e),
         }
@@ -1651,7 +1792,10 @@ async fn qoder_cn_auth_candidates(item: &QuotaItem) -> Result<Vec<(String, Optio
 
     if mode == QuotaAuthMode::ApiKey || out.is_empty() {
         qoder_cn_push_auth_candidate(&mut out, &mut seen, item.api_key.clone(), None);
-        for env_var in ["QODERCN_PERSONAL_ACCESS_TOKEN", "QODER_PERSONAL_ACCESS_TOKEN"] {
+        for env_var in [
+            "QODERCN_PERSONAL_ACCESS_TOKEN",
+            "QODER_PERSONAL_ACCESS_TOKEN",
+        ] {
             if let Ok(val) = std::env::var(env_var) {
                 qoder_cn_push_auth_candidate(&mut out, &mut seen, val, None);
             }
@@ -1689,7 +1833,8 @@ fn qoder_cn_error_message(status: u16, body: &str) -> String {
         return "Qoder CN authentication failed. Use a valid PAT (pt-...) or sign in to Qoder CN IDE.".to_string();
     }
     if status == 403 {
-        return "Qoder CN access denied. Check your account permissions or subscription.".to_string();
+        return "Qoder CN access denied. Check your account permissions or subscription."
+            .to_string();
     }
     if status == 429 {
         return "Qoder CN rate limited. Try again in a few minutes.".to_string();
@@ -1742,7 +1887,11 @@ fn build_qoder_cn_quota_item(
         api_url: None,
         json_path: None,
         max_quota: max_val,
-        current_value: if unit == "%" { Some(pct) } else { Some(current_val) },
+        current_value: if unit == "%" {
+            Some(pct)
+        } else {
+            Some(current_val)
+        },
         error_msg: None,
         last_update: Some(now),
         unit: Some(unit),
@@ -1811,7 +1960,9 @@ async fn qoder_cn_try_fetch(
     Ok((usage_parsed, plan_name))
 }
 
-fn parse_qoder_cn_quota(parsed: &serde_json::Value) -> Result<(f64, Option<f64>, String, Option<String>), String> {
+fn parse_qoder_cn_quota(
+    parsed: &serde_json::Value,
+) -> Result<(f64, Option<f64>, String, Option<String>), String> {
     let data = parsed.get("data").unwrap_or(parsed);
 
     let plan_name = data
@@ -1831,7 +1982,12 @@ fn parse_qoder_cn_quota(parsed: &serde_json::Value) -> Result<(f64, Option<f64>,
 
         if let (Some(r), Some(t)) = (remaining, total) {
             if t > 0.0 {
-                return Ok(((r / t * 100.0).round(), Some(100.0), "%".to_string(), plan_name));
+                return Ok((
+                    (r / t * 100.0).round(),
+                    Some(100.0),
+                    "%".to_string(),
+                    plan_name,
+                ));
             }
             return Ok((r.round(), None, "credits".to_string(), plan_name));
         }
@@ -1861,7 +2017,12 @@ fn parse_qoder_cn_quota(parsed: &serde_json::Value) -> Result<(f64, Option<f64>,
 
     if let (Some(r), Some(t)) = (remain, total) {
         if t > 0.0 {
-            return Ok(((r / t * 100.0).round(), Some(100.0), "%".to_string(), plan_name));
+            return Ok((
+                (r / t * 100.0).round(),
+                Some(100.0),
+                "%".to_string(),
+                plan_name,
+            ));
         }
         return Ok((r.round(), None, "credits".to_string(), plan_name));
     }
@@ -1876,7 +2037,11 @@ fn parse_qoder_cn_quota(parsed: &serde_json::Value) -> Result<(f64, Option<f64>,
 /// Fetch Qoder CN remaining credits via the official OpenAPI (same endpoints as QoderCN IDE).
 async fn fetch_qoder_cn_quota(item: &QuotaItem) -> Result<QuotaItem, String> {
     if quota_auth_mode(item) == QuotaAuthMode::Local {
-        if let Ok(Some(plan)) = vscode_secrets::read_qoder_cn_user_plan() {
+        let cached_item = item.clone();
+        let cached_quota = tokio::task::spawn_blocking(move || {
+            let Ok(Some(plan)) = vscode_secrets::read_qoder_cn_user_plan() else {
+                return None;
+            };
             match parse_qoder_cn_quota(&plan) {
                 Ok((current_val, max_val, unit, plan_name)) => {
                     let account_label = vscode_secrets::read_qoder_cn_auth_token()
@@ -1884,17 +2049,28 @@ async fn fetch_qoder_cn_quota(item: &QuotaItem) -> Result<QuotaItem, String> {
                         .flatten()
                         .and_then(|(_, label)| label);
                     log::debug!("Using cached Qoder CN plan from IDE storage");
-                    return Ok(build_qoder_cn_quota_item(
-                        item,
+                    Some(build_qoder_cn_quota_item(
+                        &cached_item,
                         current_val,
                         max_val,
                         unit,
                         plan_name,
                         account_label,
-                    ));
+                    ))
                 }
-                Err(e) => log::debug!("Cached Qoder CN plan unusable, falling back to API: {}", e),
+                Err(error) => {
+                    log::debug!(
+                        "Cached Qoder CN plan unusable, falling back to API: {}",
+                        error
+                    );
+                    None
+                }
             }
+        })
+        .await
+        .map_err(|error| format!("Qoder CN local data reader stopped unexpectedly: {}", error))?;
+        if let Some(cached_quota) = cached_quota {
+            return Ok(cached_quota);
         }
     }
 
@@ -1903,7 +2079,10 @@ async fn fetch_qoder_cn_quota(item: &QuotaItem) -> Result<QuotaItem, String> {
         .build()
         .unwrap_or_default();
 
-    let candidates = qoder_cn_auth_candidates(item).await?;
+    let auth_item = item.clone();
+    let candidates = tokio::task::spawn_blocking(move || qoder_cn_auth_candidates(&auth_item))
+        .await
+        .map_err(|error| format!("Qoder CN credential reader stopped unexpectedly: {}", error))??;
     let mut last_err = String::new();
 
     for (token, account_label) in candidates {
@@ -2002,17 +2181,22 @@ async fn fetch_pioneer_quota(item: &QuotaItem) -> Result<QuotaItem, String> {
         };
         return Err(format!(
             "Pioneer AI API error: HTTP {}{}{}",
-            status,
-            hint,
-            detail
+            status, hint, detail
         ));
     }
 
-    let text = res.text().await
+    let text = res
+        .text()
+        .await
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
-    let parsed: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("Failed to parse Pioneer AI response: {} — body: {}", e, &text[..text.len().min(200)]))?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "Failed to parse Pioneer AI response: {} — body: {}",
+            e,
+            &text[..text.len().min(200)]
+        )
+    })?;
 
     let data = parsed.get("data").unwrap_or(&parsed);
 
@@ -2021,44 +2205,50 @@ async fn fetch_pioneer_quota(item: &QuotaItem) -> Result<QuotaItem, String> {
     let credit_limit = data.get("credit_limit").and_then(|v| v.as_f64());
     let total_usage = data.get("total_usage").and_then(|v| v.as_f64());
 
-    let plan_name = data.get("payment_plan")
+    let plan_name = data
+        .get("payment_plan")
         .or_else(|| data.get("plan"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    let (current_val, max_val, unit) = if let (Some(remaining), Some(limit)) = (free_remaining, credit_limit) {
-        if limit > 0.0 {
-            (
-                Some((remaining / limit * 100.0).clamp(0.0, 100.0).round()),
-                Some(100.0),
-                "%".to_string(),
-            )
-        } else {
+    let (current_val, max_val, unit) =
+        if let (Some(remaining), Some(limit)) = (free_remaining, credit_limit) {
+            if limit > 0.0 {
+                (
+                    Some((remaining / limit * 100.0).clamp(0.0, 100.0).round()),
+                    Some(100.0),
+                    "%".to_string(),
+                )
+            } else {
+                (Some((remaining / 100.0).round()), None, "$".to_string())
+            }
+        } else if let Some(remaining) = free_remaining {
             (Some((remaining / 100.0).round()), None, "$".to_string())
-        }
-    } else if let Some(remaining) = free_remaining {
-        (Some((remaining / 100.0).round()), None, "$".to_string())
-    } else if let (Some(usage), Some(limit)) = (total_usage, credit_limit) {
-        if limit > 0.0 {
-            (
-                Some(((limit - usage).max(0.0) / limit * 100.0).clamp(0.0, 100.0).round()),
-                Some(100.0),
-                "%".to_string(),
-            )
+        } else if let (Some(usage), Some(limit)) = (total_usage, credit_limit) {
+            if limit > 0.0 {
+                (
+                    Some(
+                        ((limit - usage).max(0.0) / limit * 100.0)
+                            .clamp(0.0, 100.0)
+                            .round(),
+                    ),
+                    Some(100.0),
+                    "%".to_string(),
+                )
+            } else {
+                return Err(format!(
+                    "Could not find quota data in Pioneer AI response. Raw: {}",
+                    &text[..text.len().min(300)]
+                ));
+            }
         } else {
             return Err(format!(
                 "Could not find quota data in Pioneer AI response. Raw: {}",
                 &text[..text.len().min(300)]
             ));
-        }
-    } else {
-        return Err(format!(
-            "Could not find quota data in Pioneer AI response. Raw: {}",
-            &text[..text.len().min(300)]
-        ));
-    };
+        };
 
     let pct = current_val.unwrap_or(0.0);
     let bars = if unit == "%" {
@@ -2104,7 +2294,11 @@ fn get_claude_settings_path() -> Option<PathBuf> {
         }
     }
     let expanded = shellexpand::tilde("~/.claude/settings.json").to_string();
-    if expanded.starts_with('~') { None } else { Some(PathBuf::from(expanded)) }
+    if expanded.starts_with('~') {
+        None
+    } else {
+        Some(PathBuf::from(expanded))
+    }
 }
 
 /// Fetch Claude Code remaining token quota.
@@ -2118,33 +2312,43 @@ async fn fetch_claude_code_quota(item: &QuotaItem) -> Result<QuotaItem, String> 
         let key = item.api_key.trim();
         if key.is_empty() {
             return Err(
-                "Claude Code API key not configured. Add your sk-cp-... token in Settings.".to_string(),
+                "Claude Code API key not configured. Add your sk-cp-... token in Settings."
+                    .to_string(),
             );
         }
         key.to_string()
     } else {
-        let settings_path = get_claude_settings_path()
-            .ok_or_else(|| "Could not resolve Claude settings path on this system".to_string())?;
+        tokio::task::spawn_blocking(|| {
+            let settings_path = get_claude_settings_path().ok_or_else(|| {
+                "Could not resolve Claude settings path on this system".to_string()
+            })?;
 
-        if !settings_path.exists() {
-            return Err(format!(
-                "Claude Code settings not found at {}. Please run Claude Code at least once.",
-                settings_path.display()
-            ));
-        }
+            if !settings_path.exists() {
+                return Err(format!(
+                    "Claude Code settings not found at {}. Please run Claude Code at least once.",
+                    settings_path.display()
+                ));
+            }
 
-        let settings_str = std::fs::read_to_string(&settings_path)
-            .map_err(|e| format!("Failed to read Claude Code settings: {}", e))?;
+            let settings_str = std::fs::read_to_string(&settings_path)
+                .map_err(|e| format!("Failed to read Claude Code settings: {}", e))?;
+            let settings: serde_json::Value = serde_json::from_str(&settings_str)
+                .map_err(|e| format!("Failed to parse Claude Code settings.json: {}", e))?;
 
-        let settings: serde_json::Value = serde_json::from_str(&settings_str)
-            .map_err(|e| format!("Failed to parse Claude Code settings.json: {}", e))?;
-
-        settings
-            .get("env")
-            .and_then(|env| env.get("ANTHROPIC_AUTH_TOKEN"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| "ANTHROPIC_AUTH_TOKEN not found in ~/.claude/settings.json. Claude Code may not be configured with a proxy token.".to_string())?
+            settings
+                .get("env")
+                .and_then(|env| env.get("ANTHROPIC_AUTH_TOKEN"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| "ANTHROPIC_AUTH_TOKEN not found in ~/.claude/settings.json. Claude Code may not be configured with a proxy token.".to_string())
+        })
+        .await
+        .map_err(|error| {
+            format!(
+                "Claude Code settings reader stopped unexpectedly: {}",
+                error
+            )
+        })??
     };
 
     if !token.starts_with("sk-cp-") {
@@ -2196,19 +2400,22 @@ async fn fetch_claude_code_quota(item: &QuotaItem) -> Result<QuotaItem, String> 
         ));
     }
 
-    let text = res.text().await
+    let text = res
+        .text()
+        .await
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
     let parsed: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| format!("Failed to parse token balance response: {}", e))?;
 
     let data = parsed.get("token_plan").unwrap_or(&parsed);
-    let remain = data.get("remains")
-        .or_else(|| data.get("remain")
-        .or_else(|| data.get("remaining")))
+    let remain = data
+        .get("remains")
+        .or_else(|| data.get("remain").or_else(|| data.get("remaining")))
         .and_then(|v| v.as_f64());
 
-    let total = data.get("total")
+    let total = data
+        .get("total")
         .or_else(|| data.get("total_tokens"))
         .and_then(|v| v.as_f64());
 
@@ -2223,7 +2430,10 @@ async fn fetch_claude_code_quota(item: &QuotaItem) -> Result<QuotaItem, String> 
     } else if let Some(r) = remain {
         (Some(r), None, "tokens".to_string())
     } else {
-        return Err(format!("Could not find balance in Claude Code token plan response. Raw: {}", &text[..text.len().min(300)]));
+        return Err(format!(
+            "Could not find balance in Claude Code token plan response. Raw: {}",
+            &text[..text.len().min(300)]
+        ));
     };
 
     Ok(QuotaItem {
@@ -2276,12 +2486,38 @@ fn quota_items_display_equal(a: &[QuotaItem], b: &[QuotaItem]) -> bool {
 }
 
 /// Perform HTTP requests to update all non-manual quota monitors
+pub fn schedule_quota_refresh_after_save(app: AppHandle, state: GlobalState) {
+    let generation = QUOTA_SAVE_REFRESH_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(QUOTA_SAVE_REFRESH_DEBOUNCE).await;
+        if QUOTA_SAVE_REFRESH_GENERATION.load(Ordering::Acquire) != generation {
+            return;
+        }
+
+        let _fetch_guard = state.quota_fetch_lock.lock().await;
+        if QUOTA_SAVE_REFRESH_GENERATION.load(Ordering::Acquire) != generation {
+            return;
+        }
+
+        if let Err(error) = perform_quota_fetch_locked(&app, &state).await {
+            log::warn!("Background quota refresh after save failed: {}", error);
+        }
+    });
+}
+
 pub async fn perform_quota_fetch(
     app: &AppHandle,
     state: &GlobalState,
 ) -> Result<Vec<QuotaItem>, String> {
     let _fetch_guard = state.quota_fetch_lock.lock().await;
+    perform_quota_fetch_locked(app, state).await
+}
 
+async fn perform_quota_fetch_locked(
+    app: &AppHandle,
+    state: &GlobalState,
+) -> Result<Vec<QuotaItem>, String> {
     let config = read_quota_config(app);
     let source_items: std::collections::HashMap<String, QuotaItem> = config
         .items
@@ -2393,10 +2629,14 @@ pub async fn perform_quota_fetch(
     let mut antigravity_processed = false;
     let mut codex_processed = false;
     let mut cursor_processed = false;
-    let mut copilot_processed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut qoder_cn_processed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut pioneer_processed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut claude_code_processed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut copilot_processed_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut qoder_cn_processed_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut pioneer_processed_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut claude_code_processed_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for item in &config.items {
         let provider = resolve_quota_provider(item);
@@ -2434,12 +2674,7 @@ pub async fn perform_quota_fetch(
                 match prefetch_by_id.get(&item.id) {
                     Some(Ok(resolved_item)) => fetched_items.push(resolved_item.clone()),
                     Some(Err(e)) => {
-                        push_quota_provider_fetch_error(
-                            &mut fetched_items,
-                            item,
-                            "Copilot",
-                            e,
-                        );
+                        push_quota_provider_fetch_error(&mut fetched_items, item, "Copilot", e);
                     }
                     None => {
                         push_prefetch_missing_item(&mut fetched_items, item, "copilot");
@@ -2452,12 +2687,7 @@ pub async fn perform_quota_fetch(
                 match prefetch_by_id.get(&item.id) {
                     Some(Ok(resolved_item)) => fetched_items.push(resolved_item.clone()),
                     Some(Err(e)) => {
-                        push_quota_provider_fetch_error(
-                            &mut fetched_items,
-                            item,
-                            "Qoder CN",
-                            e,
-                        );
+                        push_quota_provider_fetch_error(&mut fetched_items, item, "Qoder CN", e);
                     }
                     None => {
                         push_prefetch_missing_item(&mut fetched_items, item, "qoder-cn");
@@ -2470,12 +2700,7 @@ pub async fn perform_quota_fetch(
                 match prefetch_by_id.get(&item.id) {
                     Some(Ok(resolved_item)) => fetched_items.push(resolved_item.clone()),
                     Some(Err(e)) => {
-                        push_quota_provider_fetch_error(
-                            &mut fetched_items,
-                            item,
-                            "Pioneer AI",
-                            e,
-                        );
+                        push_quota_provider_fetch_error(&mut fetched_items, item, "Pioneer AI", e);
                     }
                     None => {
                         push_prefetch_missing_item(&mut fetched_items, item, "pioneer");
@@ -2488,12 +2713,7 @@ pub async fn perform_quota_fetch(
                 match prefetch_by_id.get(&item.id) {
                     Some(Ok(resolved_item)) => fetched_items.push(resolved_item.clone()),
                     Some(Err(e)) => {
-                        push_quota_provider_fetch_error(
-                            &mut fetched_items,
-                            item,
-                            "Claude Code",
-                            e,
-                        );
+                        push_quota_provider_fetch_error(&mut fetched_items, item, "Claude Code", e);
                     }
                     None => {
                         push_prefetch_missing_item(&mut fetched_items, item, "claude-code");
@@ -2503,7 +2723,8 @@ pub async fn perform_quota_fetch(
         } else if item.provider == "manual" {
             let mut resolved_item = item.clone();
             resolved_item.error_msg = None;
-            resolved_item.last_update = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+            resolved_item.last_update =
+                Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
             fetched_items.push(resolved_item);
         } else {
             let mut resolved_item = item.clone();
@@ -2520,9 +2741,13 @@ pub async fn perform_quota_fetch(
             };
 
             if url.is_empty() {
-                log::error!("Failed to fetch custom quota '{}': API URL is empty", resolved_item.name);
+                log::error!(
+                    "Failed to fetch custom quota '{}': API URL is empty",
+                    resolved_item.name
+                );
                 resolved_item.error_msg = Some("API URL is empty".into());
-                resolved_item.last_update = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                resolved_item.last_update =
+                    Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
                 fetched_items.push(resolved_item);
                 continue;
             }
@@ -2573,10 +2798,14 @@ pub async fn perform_quota_fetch(
                         resolved_item.current_value = Some(num);
                         resolved_item.error_msg = None;
                     } else {
-                        log::error!("Response for custom quota provider '{}' is not valid JSON", resolved_item.name);
+                        log::error!(
+                            "Response for custom quota provider '{}' is not valid JSON",
+                            resolved_item.name
+                        );
                         resolved_item.error_msg = Some("Response is not valid JSON".into());
                     }
-                    resolved_item.last_update = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                    resolved_item.last_update =
+                        Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
                     fetched_items.push(resolved_item);
                     continue;
                 }
@@ -2606,17 +2835,28 @@ pub async fn perform_quota_fetch(
                         resolved_item.current_value = Some(num);
                         resolved_item.error_msg = None;
                     } else {
-                        log::error!("Extracted value is not numeric for custom quota provider '{}': {}", resolved_item.name, v);
-                        resolved_item.error_msg = Some(format!("Extracted value is not numeric: {}", v));
+                        log::error!(
+                            "Extracted value is not numeric for custom quota provider '{}': {}",
+                            resolved_item.name,
+                            v
+                        );
+                        resolved_item.error_msg =
+                            Some(format!("Extracted value is not numeric: {}", v));
                     }
                 }
                 None => {
-                    log::error!("Could not find path '{}' in JSON response for custom quota provider '{}'", resolved_item.json_path.as_deref().unwrap_or(""), resolved_item.name);
-                    resolved_item.error_msg = Some("Could not find the specified path in JSON response".into());
+                    log::error!(
+                        "Could not find path '{}' in JSON response for custom quota provider '{}'",
+                        resolved_item.json_path.as_deref().unwrap_or(""),
+                        resolved_item.name
+                    );
+                    resolved_item.error_msg =
+                        Some("Could not find the specified path in JSON response".into());
                 }
             }
 
-            resolved_item.last_update = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+            resolved_item.last_update =
+                Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
             fetched_items.push(resolved_item);
         }
     }
@@ -2631,11 +2871,7 @@ pub async fn perform_quota_fetch(
         }
     }
 
-    let previous = state
-        .quota_data
-        .lock()
-        .ok()
-        .map(|items| items.clone());
+    let previous = state.quota_data.lock().ok().map(|items| items.clone());
 
     let ordered_items = order_quota_items_by_config(&fetched_items, &config);
 
@@ -2660,15 +2896,21 @@ pub async fn perform_quota_fetch(
     Ok(ordered_items)
 }
 
-fn push_prefetch_missing_item(fetched_items: &mut Vec<QuotaItem>, item: &QuotaItem, provider: &str) {
+fn push_prefetch_missing_item(
+    fetched_items: &mut Vec<QuotaItem>,
+    item: &QuotaItem,
+    provider: &str,
+) {
     log::error!(
         "Prefetch result missing for {} quota item '{}'",
         provider,
         item.id
     );
+    // Treat as a hard failure so the UI does not stay on a sticky "cached"
+    // banner when the fetch task never produced a result.
     fetched_items.push(build_quota_fetch_error_item(
         item,
-        "Quota fetch did not complete. Retaining last known values.",
+        "Quota fetch did not complete for this provider.",
     ));
 }
 
@@ -2694,8 +2936,10 @@ fn dedupe_quota_fetch_results(items: &mut Vec<QuotaItem>) {
 
 /// Return quota display data in config item order, dropping orphaned entries.
 pub fn order_quota_items_by_config(fetched: &[QuotaItem], config: &QuotaConfig) -> Vec<QuotaItem> {
-    let by_id: std::collections::HashMap<&str, &QuotaItem> =
-        fetched.iter().map(|item| (item.id.as_str(), item)).collect();
+    let by_id: std::collections::HashMap<&str, &QuotaItem> = fetched
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect();
     config
         .items
         .iter()
@@ -2706,8 +2950,10 @@ pub fn order_quota_items_by_config(fetched: &[QuotaItem], config: &QuotaConfig) 
 /// Write fetched display fields back to quota_config.json so restarts show fresh data.
 fn persist_quota_fetch_results(app: &AppHandle, fetched: &[QuotaItem]) -> Result<(), String> {
     let mut config = read_quota_config(app);
-    let fetched_by_id: std::collections::HashMap<&str, &QuotaItem> =
-        fetched.iter().map(|item| (item.id.as_str(), item)).collect();
+    let fetched_by_id: std::collections::HashMap<&str, &QuotaItem> = fetched
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect();
 
     let mut changed = false;
     for item in &mut config.items {
@@ -2751,7 +2997,18 @@ fn quota_config_display_changed(before: &QuotaItem, after: &QuotaItem) -> bool {
 }
 
 fn apply_fetched_quota_fields(target: &mut QuotaItem, fetched: &QuotaItem) {
-    target.error_msg = fetched.error_msg.clone();
+    // Soft retention warnings belong only in the live session. Persisting them
+    // into quota_config.json resurfaces a forever-"cached" banner on startup
+    // even before the next successful fetch finishes.
+    if fetched
+        .error_msg
+        .as_deref()
+        .is_some_and(is_soft_quota_retention_error)
+    {
+        target.error_msg = None;
+    } else {
+        target.error_msg = fetched.error_msg.clone();
+    }
     target.last_update = fetched.last_update.clone();
 
     let has_fresh_data = fetched.current_value.is_some()
@@ -2824,8 +3081,16 @@ fn merge_quota_item_config(fetched: &mut QuotaItem, source: &QuotaItem) {
 }
 
 fn is_fetch_config_different(a: &QuotaConfig, b: &QuotaConfig) -> bool {
-    let map_a: std::collections::HashMap<&str, &QuotaItem> = a.items.iter().map(|item| (item.id.as_str(), item)).collect();
-    let map_b: std::collections::HashMap<&str, &QuotaItem> = b.items.iter().map(|item| (item.id.as_str(), item)).collect();
+    let map_a: std::collections::HashMap<&str, &QuotaItem> = a
+        .items
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect();
+    let map_b: std::collections::HashMap<&str, &QuotaItem> = b
+        .items
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect();
 
     if map_a.len() != map_b.len() {
         return true;
@@ -2855,16 +3120,33 @@ pub async fn start_quota_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
     // Emit cached data to any widgets already listening (state was pre-loaded in setup)
     {
         let quota_config = read_quota_config(&app);
-        if let Ok(qd) = state.quota_data.lock() {
-            let ordered = order_quota_items_by_config(&qd, &quota_config);
-            if !ordered.is_empty() {
-                let _ = app.emit("quota_update", &ordered);
+        let mut ordered = state
+            .quota_data
+            .lock()
+            .ok()
+            .map(|items| order_quota_items_by_config(&items, &quota_config))
+            .unwrap_or_default();
+        // Drop soft "showing cached" banners that may have been left in disk state
+        // from older builds, so the UI does not start in a sticky cached mode.
+        for item in &mut ordered {
+            if item
+                .error_msg
+                .as_deref()
+                .is_some_and(is_soft_quota_retention_error)
+            {
+                item.error_msg = None;
             }
+        }
+        if !ordered.is_empty() {
+            if let Ok(mut state_quota) = state.quota_data.lock() {
+                *state_quota = ordered.clone();
+            }
+            let _ = app.emit("quota_update", &ordered);
         }
     }
 
     // Startup delay to let frontend initialize cleanly
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut consecutive_failures = 0u32;
 
@@ -2875,11 +3157,18 @@ pub async fn start_quota_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
 
         if !app_config.quota_enabled.unwrap_or(true) {
             // Clear current list if disabled
-            if let Ok(mut state_quota) = state.quota_data.lock() {
-                if !state_quota.is_empty() {
-                    state_quota.clear();
-                    let _ = app.emit("quota_update", Vec::<QuotaItem>::new());
-                }
+            let should_emit_clear = state
+                .quota_data
+                .lock()
+                .ok()
+                .map(|mut items| {
+                    let had_items = !items.is_empty();
+                    items.clear();
+                    had_items
+                })
+                .unwrap_or(false);
+            if should_emit_clear {
+                let _ = app.emit("quota_update", Vec::<QuotaItem>::new());
             }
 
             // Sleep and wait for it to be re-enabled
@@ -2897,8 +3186,7 @@ pub async fn start_quota_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
             Ok(items) => {
                 if quota_cycle_all_hard_failed(&quota_config, &items) {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    let backoff_secs =
-                        (60u64 * u64::from(consecutive_failures.min(5))).min(300);
+                    let backoff_secs = (60u64 * u64::from(consecutive_failures.min(5))).min(300);
                     log::warn!(
                         "All quota providers failed hard (attempt {}). Backing off {}s.",
                         consecutive_failures,
@@ -2947,11 +3235,14 @@ pub async fn start_quota_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
                         last_error: Some(e.clone()),
                     },
                 );
-                if let Ok(qd) = state.quota_data.lock() {
-                    let ordered = order_quota_items_by_config(&qd, &quota_config);
-                    if !ordered.is_empty() {
-                        let _ = app.emit("quota_update", &ordered);
-                    }
+                let ordered = state
+                    .quota_data
+                    .lock()
+                    .ok()
+                    .map(|items| order_quota_items_by_config(&items, &quota_config))
+                    .unwrap_or_default();
+                if !ordered.is_empty() {
+                    let _ = app.emit("quota_update", &ordered);
                 }
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                 continue;
@@ -2974,5 +3265,59 @@ pub async fn start_quota_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_usage_without_the_five_hour_window_keeps_the_available_window() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "secondary_window": {
+                        "used_percent": 27.5,
+                        "limit_window_seconds": 604800
+                    }
+                }
+            }"#,
+        )
+        .expect("Codex response without the five-hour window should parse");
+        let rate_limit = response
+            .rate_limit
+            .expect("rate limit data should be present");
+
+        let bars = codex_windows_to_bars(rate_limit.primary_window, rate_limit.secondary_window);
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].name, "7d Usage");
+        assert_eq!(bars[0].value, 72.5);
+    }
+
+    #[test]
+    fn codex_usage_with_both_windows_preserves_both_rows() {
+        let bars = codex_windows_to_bars(
+            Some(CodexWindow {
+                used_percent: 10.0,
+                limit_window_seconds: 18_000,
+                reset_at: None,
+            }),
+            Some(CodexWindow {
+                used_percent: 45.0,
+                limit_window_seconds: 604_800,
+                reset_at: None,
+            }),
+        );
+
+        assert_eq!(
+            bars.iter().map(|bar| bar.name.as_str()).collect::<Vec<_>>(),
+            vec!["5h Usage", "7d Usage"]
+        );
+        assert_eq!(
+            bars.iter().map(|bar| bar.value).collect::<Vec<_>>(),
+            vec![90.0, 55.0]
+        );
     }
 }

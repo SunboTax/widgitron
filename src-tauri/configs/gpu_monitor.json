@@ -9,5 +9,5 @@
             "use_slurm": null
         }
     ],
-    "update_interval": 5
+    "update_interval": 2
 }

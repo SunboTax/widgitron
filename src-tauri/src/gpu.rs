@@ -13,11 +13,63 @@ use tauri::{AppHandle, Emitter};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use crate::{config_store, secrets};
 use crate::models::{AppConfig, GlobalState, GpuConfig, GpuInfo, ServerConfig, ServerGpuData};
+use crate::{config_store, secrets};
 
 const GPU_CACHE_FILE: &str = "gpu_data_cache.json";
+/// After this many consecutive SSH/worker failures, drop cached GPU rows instead of
+/// forever showing stale values as if the host were still reachable.
+const GPU_STALE_CACHE_MAX_FAILURES: u32 = 2;
+/// Minimum seconds between full squeue refreshes (job list + queue panel).
+const SLURM_SQUEUE_INTERVAL_SECS: i64 = 10;
+/// After this many consecutive squeue failures, drop retained Slurm job state.
+const SLURM_SQUEUE_STALE_MAX_FAILURES: u32 = 2;
 
+fn clear_job_gpus_from_list(
+    gpu_list: &mut Vec<GpuInfo>,
+    job_id: &str,
+    node: Option<&str>,
+) {
+    gpu_list.retain(|g| {
+        if g.job_id.as_deref() != Some(job_id) {
+            return true;
+        }
+        match node {
+            Some(n) => g.node.as_deref() != Some(n),
+            None => false,
+        }
+    });
+}
+
+fn prune_slurm_maps_for_missing_jobs(
+    nodelists: &mut HashMap<String, String>,
+    times: &mut HashMap<String, String>,
+    steps: &mut HashMap<String, Vec<crate::models::SlurmStep>>,
+    active_job_ids: &[String],
+) {
+    nodelists.retain(|jid, _| active_job_ids.iter().any(|active| active == jid));
+    times.retain(|jid, _| active_job_ids.iter().any(|active| active == jid));
+    steps.retain(|jid, _| active_job_ids.iter().any(|active| active == jid));
+}
+
+fn apply_offline_gpu_state(
+    gpu_data: &mut ServerGpuData,
+    err_msg: &str,
+    keep_cached: bool,
+) {
+    gpu_data.is_online = false;
+    if keep_cached && !gpu_data.gpu_list.is_empty() {
+        gpu_data.error = Some(format!("{} (showing cached data)", err_msg));
+    } else {
+        gpu_data.gpu_list.clear();
+        gpu_data.slurm_steps = None;
+        gpu_data.slurm_nodelists = None;
+        gpu_data.slurm_times = None;
+        gpu_data.slurm_queue_jobs = None;
+        gpu_data.error = Some(err_msg.to_string());
+    }
+    gpu_data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
+}
 
 pub fn read_gpu_config(app: &AppHandle) -> GpuConfig {
     let mut config = config_store::read_config::<GpuConfig>(app, "gpu_monitor.json");
@@ -49,7 +101,11 @@ fn decrypt_gpu_config_secrets(config: &mut GpuConfig) {
                 match secrets::decrypt_secret(password) {
                     Ok(decrypted) => *password = decrypted,
                     Err(err) => {
-                        log::warn!("Failed to decrypt SSH password for {}: {}", server.host, err);
+                        log::warn!(
+                            "Failed to decrypt SSH password for {}: {}",
+                            server.host,
+                            err
+                        );
                         password.clear();
                     }
                 }
@@ -78,7 +134,11 @@ fn user_home_dir() -> Option<PathBuf> {
         }
     }
     let expanded = shellexpand::tilde("~").to_string();
-    if expanded.starts_with('~') { None } else { Some(PathBuf::from(expanded)) }
+    if expanded.starts_with('~') {
+        None
+    } else {
+        Some(PathBuf::from(expanded))
+    }
 }
 
 fn ssh_pattern_matches(pattern: &str, host: &str) -> bool {
@@ -104,7 +164,9 @@ fn read_ssh_config_file_for_host(host: &str) -> Option<SshConfigHost> {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let Some(key) = parts.next() else { continue; };
+        let Some(key) = parts.next() else {
+            continue;
+        };
         let value = parts.collect::<Vec<_>>().join(" ");
         if key.eq_ignore_ascii_case("Host") {
             current_matches = value
@@ -139,7 +201,9 @@ fn parse_ssh_resolved_config(content: &str) -> Option<SshConfigHost> {
             continue;
         }
         let mut parts = line.splitn(2, char::is_whitespace);
-        let Some(key) = parts.next() else { continue; };
+        let Some(key) = parts.next() else {
+            continue;
+        };
         let value = parts.next().unwrap_or("").trim();
         if value.is_empty() {
             continue;
@@ -159,7 +223,7 @@ fn parse_ssh_resolved_config(content: &str) -> Option<SshConfigHost> {
         || cfg.user.is_some()
         || cfg.port.is_some()
         || !cfg.identity_files.is_empty())
-        .then_some(cfg)
+    .then_some(cfg)
 }
 
 fn read_openssh_config_for_host(host: &str) -> Option<SshConfigHost> {
@@ -270,7 +334,10 @@ fn run_openssh_command(
     cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
-        .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30).max(1)))
+        .arg(format!(
+            "ConnectTimeout={}",
+            timeout.as_secs().min(30).max(1)
+        ))
         .arg("-T");
 
     if !server.use_ssh_config.unwrap_or(false) {
@@ -304,7 +371,11 @@ fn run_openssh_command(
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("ssh {} timed out after {}s", target, timeout.as_secs()));
+                    return Err(format!(
+                        "ssh {} timed out after {}s",
+                        target,
+                        timeout.as_secs()
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -375,6 +446,7 @@ fn gpu_update_payload_changed(previous: Option<&ServerGpuData>, next: &ServerGpu
                 || prev.slurm_steps != next.slurm_steps
                 || prev.slurm_nodelists != next.slurm_nodelists
                 || prev.slurm_times != next.slurm_times
+                || prev.slurm_queue_jobs != next.slurm_queue_jobs
         }
         None => true,
     }
@@ -502,7 +574,11 @@ pub fn ssh_authenticate(sess: &mut Session, s: &ServerConfig) -> Result<(), Stri
         Ok(_) => Ok(()),
         Err(agent_err) => {
             errors.push(format!("ssh-agent: {}", agent_err));
-            Err(format!("Authentication failed for user '{}'. Tried {}", user, errors.join("; ")))
+            Err(format!(
+                "Authentication failed for user '{}'. Tried {}",
+                user,
+                errors.join("; ")
+            ))
         }
     }
 }
@@ -665,6 +741,7 @@ pub fn start_ssh_monitor_task(
                                         slurm_steps: None,
                                         slurm_nodelists: None,
                                         slurm_times: None,
+                                        slurm_queue_jobs: None,
                                     });
                                     data.is_online = true;
                                     data.error = None;
@@ -780,6 +857,7 @@ pub fn start_ssh_monitor_task(
                                     slurm_steps: None,
                                     slurm_nodelists: None,
                                     slurm_times: None,
+                                    slurm_queue_jobs: None,
                                 });
 
                                 data.is_online = true;
@@ -811,6 +889,10 @@ pub fn start_ssh_monitor_task(
                 }
                 Ok(Err(err_msg)) => {
                     log::warn!("SSH monitor task for {} failed: {}", server.host, err_msg);
+                    // Stream death for a Slurm job usually means the job ended (or the
+                    // allocate node is gone). Drop that job's rows instead of forever
+                    // resurfacing them as "online cached" GPUs.
+                    let mut emitted: Option<ServerGpuData> = None;
                     if let Ok(mut state_gpu) = state.gpu_data.lock() {
                         let entry =
                             state_gpu
@@ -824,15 +906,38 @@ pub fn start_ssh_monitor_task(
                                     slurm_steps: None,
                                     slurm_nodelists: None,
                                     slurm_times: None,
+                                    slurm_queue_jobs: None,
                                 });
-                        let has_cached_gpus = !entry.gpu_list.is_empty();
-                        entry.is_online = has_cached_gpus;
-                        entry.error = Some(if has_cached_gpus {
-                            format!("{} (showing cached data)", err_msg)
+                        if let Some(ref job_id) = jid {
+                            clear_job_gpus_from_list(
+                                &mut entry.gpu_list,
+                                job_id,
+                                target_node.as_deref(),
+                            );
+                            if let Some(maps) = entry.slurm_steps.as_mut() {
+                                maps.remove(job_id);
+                            }
+                            if let Some(maps) = entry.slurm_nodelists.as_mut() {
+                                maps.remove(job_id);
+                            }
+                            if let Some(maps) = entry.slurm_times.as_mut() {
+                                maps.remove(job_id);
+                            }
+                            entry.is_online = true;
+                            entry.error = None;
                         } else {
-                            err_msg.clone()
-                        });
+                            // Non-slurm / login-node stream died: mark offline and drop rows.
+                            apply_offline_gpu_state(entry, &err_msg, false);
+                        }
                         entry.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
+                        emitted = Some(entry.clone());
+                    }
+                    if let Some(gpu_data) = emitted {
+                        emit_gpu_update_if_changed(&app, state.as_ref(), &gpu_data);
+                    }
+                    // Job monitors should exit after clearing; main worker restarts if needed.
+                    if jid.is_some() {
+                        break;
                     }
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 }
@@ -902,7 +1007,7 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                     let state_inner = state.clone();
                     let server_inner = server.clone();
                     let smi_cmd_inner = smi_cmd.to_string();
-                    let update_interval = config.update_interval.unwrap_or(5);
+                    let update_interval = config.update_interval.unwrap_or(2).max(1);
 
                     let handle = tokio::spawn(async move {
                         log::info!(
@@ -910,12 +1015,15 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                             server_inner.host
                         );
                         let mut session: Option<Session> = None;
-                        let mut last_squeue_update = Utc::now() - Duration::from_secs(60);
+                        let mut last_squeue_update = Utc::now() - Duration::from_secs(SLURM_SQUEUE_INTERVAL_SECS as u64);
                         let mut slurm_job_ids: Vec<String> = Vec::new();
                         let mut slurm_nodelists: HashMap<String, String> = HashMap::new();
                         let mut slurm_times: HashMap<String, String> = HashMap::new();
                         let mut slurm_steps: HashMap<String, Vec<crate::models::SlurmStep>> =
                             HashMap::new();
+                        let mut slurm_queue_jobs: Vec<crate::models::SlurmQueueJob> = Vec::new();
+                        let mut consecutive_failures: u32 = 0;
+                        let mut consecutive_squeue_failures: u32 = 0;
 
                         loop {
                             let res = tokio::task::spawn_blocking({
@@ -928,14 +1036,18 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                 let mut nodelists = slurm_nodelists.clone();
                                 let mut times = slurm_times.clone();
                                 let mut steps = slurm_steps.clone();
-                                let squeue_needed = (Utc::now() - last_squeue_update).num_seconds() >= 30;
+                                let mut queue_jobs = slurm_queue_jobs.clone();
+                                let squeue_needed = (Utc::now() - last_squeue_update).num_seconds() >= SLURM_SQUEUE_INTERVAL_SECS;
+                                let squeue_fail_budget = consecutive_squeue_failures;
 
                                 move || -> Result<(
                                     Option<Session>,
                                     Vec<String>,
                                     HashMap<String, String>,
                                     HashMap<String, String>,
-                                    HashMap<String, Vec<crate::models::SlurmStep>>
+                                    HashMap<String, Vec<crate::models::SlurmStep>>,
+                                    Vec<crate::models::SlurmQueueJob>,
+                                    Option<bool>,
                                 ), String> {
                                     let mut gpu_data = ServerGpuData {
                                         host: s.host.clone(),
@@ -946,7 +1058,9 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                         slurm_steps: None,
                                         slurm_nodelists: None,
                                         slurm_times: None,
+                                        slurm_queue_jobs: None,
                                     };
+                                    let mut squeue_outcome: Option<bool> = None;
 
                                     if s.host == "localhost" || s.host == "127.0.0.1" {
                                         let local_smi_args = ["--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"];
@@ -1005,24 +1119,13 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                         }
 
                                         if let Some(err) = local_smi_error {
-                                            gpu_data.is_online = false;
-                                            if let Some(cached) = cached_snapshot {
-                                                if !cached.gpu_list.is_empty() {
-                                                    gpu_data.gpu_list = cached.gpu_list;
-                                                    gpu_data.last_update = cached.last_update;
-                                                    gpu_data.error = Some(format!(
-                                                        "{} (showing cached data)",
-                                                        err
-                                                    ));
-                                                } else {
-                                                    gpu_data.error = Some(err);
-                                                }
+                                            if let Some(cached) = cached_snapshot.filter(|c| !c.gpu_list.is_empty())
+                                            {
+                                                gpu_data.gpu_list = cached.gpu_list;
+                                                gpu_data.last_update = cached.last_update;
+                                                apply_offline_gpu_state(&mut gpu_data, &err, true);
                                             } else {
-                                                gpu_data.error = Some(err);
-                                            }
-                                            if gpu_data.last_update.is_none() {
-                                                gpu_data.last_update =
-                                                    Some(Utc::now().format("%H:%M:%S").to_string());
+                                                apply_offline_gpu_state(&mut gpu_data, &err, false);
                                             }
                                         }
 
@@ -1031,7 +1134,7 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                         }
                                         let _ = app_task.emit("gpu_update", gpu_data);
 
-                                        Ok((None, vec![], HashMap::new(), HashMap::new(), HashMap::new()))
+                                        Ok((None, vec![], HashMap::new(), HashMap::new(), HashMap::new(), vec![], None))
                                     } else if s.use_ssh_config.unwrap_or(false) && !s.use_slurm.unwrap_or(false) {
                                         let s_out = run_openssh_command(&s, &smi, Duration::from_secs(30))?;
                                         let parsed = parse_nvidia_smi_output(&s_out);
@@ -1050,7 +1153,8 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                         }
                                         emit_gpu_update_if_changed(&app_task, state_task.as_ref(), &gpu_data);
 
-                                        Ok((None, vec![], HashMap::new(), HashMap::new(), HashMap::new()))                                    } else {
+                                        Ok((None, vec![], HashMap::new(), HashMap::new(), HashMap::new(), vec![], None))
+                                    } else {
                                         // SSH Logic
                                         let sess = reuse_or_connect_ssh_session(sess_opt, &s)?;
 
@@ -1093,34 +1197,71 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                      }
                                                  }
                                                  if !squeue_success {
+                                                     let failures = squeue_fail_budget.saturating_add(1);
+                                                     squeue_outcome = Some(false);
                                                      log::warn!(
-                                                         "squeue query failed for {}, retaining cached Slurm state",
-                                                         s.host
+                                                         "squeue query failed for {} (streak {}), managing retained Slurm state",
+                                                         s.host,
+                                                         failures
                                                      );
-                                                     let has_cached_jobs = !job_ids.is_empty();
-                                                     if let Ok(data) = state_task.gpu_data.lock() {
-                                                         if let Some(cached) = data.get(&s.host) {
-                                                             let has_cached_gpus =
-                                                                 !cached.gpu_list.is_empty();
-                                                             if has_cached_gpus || has_cached_jobs {
-                                                                 gpu_data.gpu_list =
-                                                                     cached.gpu_list.clone();
-                                                                 gpu_data.slurm_nodelists =
-                                                                     cached.slurm_nodelists.clone();
-                                                                 gpu_data.slurm_times =
-                                                                     cached.slurm_times.clone();
-                                                                 gpu_data.slurm_steps =
-                                                                     cached.slurm_steps.clone();
-                                                                 gpu_data.is_online = has_cached_gpus;
-                                                                 gpu_data.error = Some(
-                                                                     "squeue failed (showing cached job data)"
+                                                     if failures >= SLURM_SQUEUE_STALE_MAX_FAILURES {
+                                                         // Stale job IDs make finished jobs look alive. Drop them.
+                                                         job_ids.clear();
+                                                         nodelists.clear();
+                                                         times.clear();
+                                                         steps.clear();
+                                                         queue_jobs.clear();
+                                                         if let Ok(mut data) = state_task.gpu_data.lock() {
+                                                             if let Some(cached) = data.get_mut(&s.host) {
+                                                                 cached.gpu_list.retain(|g| g.job_id.is_none());
+                                                                cached.slurm_steps = None;
+                                                                cached.slurm_nodelists = None;
+                                                                cached.slurm_times = None;
+                                                                cached.slurm_queue_jobs = None;
+                                                                cached.error = Some(
+                                                                     "squeue failed repeatedly — cleared stale job cache"
                                                                          .to_string(),
                                                                  );
-                                                                 gpu_data.last_update = Some(
+                                                                 cached.last_update = Some(
                                                                      Utc::now()
                                                                          .format("%H:%M:%S")
                                                                          .to_string(),
                                                                  );
+                                                             }
+                                                         }
+                                                     } else {
+                                                         let has_cached_jobs = !job_ids.is_empty();
+                                                         if let Ok(data) = state_task.gpu_data.lock() {
+                                                             if let Some(cached) = data.get(&s.host) {
+                                                                 let has_cached_gpus =
+                                                                     !cached.gpu_list.is_empty();
+                                                                 if has_cached_gpus || has_cached_jobs {
+                                                                     gpu_data.gpu_list =
+                                                                         cached.gpu_list.clone();
+                                                                     gpu_data.slurm_nodelists =
+                                                                         cached.slurm_nodelists.clone();
+                                                                     gpu_data.slurm_times =
+                                                                         cached.slurm_times.clone();
+                                                                    gpu_data.slurm_steps =
+                                                                        cached.slurm_steps.clone();
+                                                                    gpu_data.slurm_queue_jobs =
+                                                                        cached.slurm_queue_jobs.clone();
+                                                                    gpu_data.is_online = false;
+                                                                     gpu_data.error = Some(
+                                                                         "squeue failed (showing cached job data)"
+                                                                             .to_string(),
+                                                                     );
+                                                                     gpu_data.last_update = Some(
+                                                                         Utc::now()
+                                                                             .format("%H:%M:%S")
+                                                                             .to_string(),
+                                                                     );
+                                                                 } else if !has_cached_jobs {
+                                                                     return Err(
+                                                                         "Failed to query squeue. SSH session may be dead."
+                                                                             .to_string(),
+                                                                     );
+                                                                 }
                                                              } else if !has_cached_jobs {
                                                                  return Err(
                                                                      "Failed to query squeue. SSH session may be dead."
@@ -1133,12 +1274,15 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                                      .to_string(),
                                                              );
                                                          }
-                                                     } else if !has_cached_jobs {
-                                                         return Err(
-                                                             "Failed to query squeue. SSH session may be dead."
-                                                                 .to_string(),
-                                                         );
                                                      }
+                                                 } else {
+                                                     squeue_outcome = Some(true);
+                                                     prune_slurm_maps_for_missing_jobs(
+                                                         &mut nodelists,
+                                                         &mut times,
+                                                         &mut steps,
+                                                         &job_ids,
+                                                     );
                                                  }
                                              }
 
@@ -1262,6 +1406,42 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                             }
                                                         }
                                                         steps = new_steps;
+                                                    }
+                                                }
+
+                                                if s.show_squeue_list.unwrap_or(false) && squeue_needed {
+                                                    queue_jobs.clear();
+                                                    let list_cmd = if s.squeue_all_users.unwrap_or(false) {
+                                                        "squeue -h -o \"%A|%j|%u|%T|%M|%R\"".to_string()
+                                                    } else {
+                                                        format!(
+                                                            "squeue --me -h -o \"%A|%j|%u|%T|%M|%R\" 2>/dev/null || squeue -u $(whoami) -h -o \"%A|%j|%u|%T|%M|%R\" || squeue -u {} -h -o \"%A|%j|%u|%T|%M|%R\"",
+                                                            user
+                                                        )
+                                                    };
+                                                    if let Ok(mut channel) = sess.channel_session() {
+                                                        if channel.exec(&list_cmd).is_ok() {
+                                                            let mut list_out = String::new();
+                                                            if channel.read_to_string(&mut list_out).is_ok() {
+                                                                for line in list_out.lines() {
+                                                                    let line = line.trim();
+                                                                    if line.is_empty() {
+                                                                        continue;
+                                                                    }
+                                                                    let parts: Vec<&str> = line.split('|').collect();
+                                                                    if parts.len() >= 6 {
+                                                                        queue_jobs.push(crate::models::SlurmQueueJob {
+                                                                            id: parts[0].to_string(),
+                                                                            name: parts[1].to_string(),
+                                                                            user: parts[2].to_string(),
+                                                                            state: parts[3].to_string(),
+                                                                            time: parts[4].to_string(),
+                                                                            nodelist: parts[5].to_string(),
+                                                                        });
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
 
@@ -1457,32 +1637,47 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                  );
                                              }
                                              if let Some(err) = smi_error {
+                                                 // Only keep login-node smi cache on transient query
+                                                 // failures. Never resurrect finished Slurm job rows
+                                                 // after a successful empty squeue.
+                                                 let allow_job_cache = matches!(squeue_outcome, Some(false) | None)
+                                                     && !job_ids.is_empty();
                                                  if gpu_data.gpu_list.is_empty() {
-                                                     if let Some(cached) = cached_snapshot {
-                                                         if !cached.gpu_list.is_empty() {
-                                                             gpu_data.gpu_list = cached.gpu_list;
-                                                             gpu_data.slurm_nodelists =
-                                                                 cached.slurm_nodelists.clone();
-                                                             gpu_data.slurm_times =
-                                                                 cached.slurm_times.clone();
-                                                             gpu_data.slurm_steps =
-                                                                 cached.slurm_steps.clone();
-                                                             gpu_data.is_online = true;
-                                                             gpu_data.error = Some(format!(
-                                                                 "{} (showing cached job data)",
-                                                                 err
-                                                             ));
-                                                             gpu_data.last_update = cached
-                                                                 .last_update
-                                                                 .clone()
-                                                                 .or_else(|| {
-                                                                     Some(Utc::now().format("%H:%M:%S").to_string())
-                                                                 });
+                                                     if allow_job_cache {
+                                                         if let Some(cached) = cached_snapshot {
+                                                             if !cached.gpu_list.is_empty() {
+                                                                 gpu_data.gpu_list = cached.gpu_list;
+                                                                 gpu_data.slurm_nodelists =
+                                                                     cached.slurm_nodelists.clone();
+                                                                 gpu_data.slurm_times =
+                                                                     cached.slurm_times.clone();
+                                                                    gpu_data.slurm_steps =
+                                                                        cached.slurm_steps.clone();
+                                                                    gpu_data.slurm_queue_jobs =
+                                                                        cached.slurm_queue_jobs.clone();
+                                                                    gpu_data.is_online = false;
+                                                                 gpu_data.error = Some(format!(
+                                                                     "{} (showing cached job data)",
+                                                                     err
+                                                                 ));
+                                                                 gpu_data.last_update = cached
+                                                                     .last_update
+                                                                     .clone()
+                                                                     .or_else(|| {
+                                                                         Some(Utc::now().format("%H:%M:%S").to_string())
+                                                                     });
+                                                             } else {
+                                                                 gpu_data.error = Some(err);
+                                                             }
                                                          } else {
                                                              gpu_data.error = Some(err);
                                                          }
                                                      } else {
-                                                         gpu_data.error = Some(err);
+                                                         gpu_data.is_online = true;
+                                                         gpu_data.error = None;
+                                                         gpu_data.last_update = Some(
+                                                             Utc::now().format("%H:%M:%S").to_string(),
+                                                         );
                                                      }
                                                  }
                                              }
@@ -1490,18 +1685,31 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                         let mut emitted_gpu_data = gpu_data.clone();
                                         if let Ok(mut data) = state_task.gpu_data.lock() {
                                              if s.use_slurm.unwrap_or(false) {
-                                                 let existing_gpu_list = data
-                                                     .get(&s.host)
-                                                     .map(|current| current.gpu_list.clone())
-                                                     .unwrap_or_default();
-                                                 if !existing_gpu_list.is_empty() {
-                                                     gpu_data.gpu_list = existing_gpu_list;
+                                                 // Prefer freshly computed / cleaned state — do not
+                                                 // blindly restore an older gpu_list over an empty
+                                                 // post-job-end snapshot.
+                                                 if matches!(squeue_outcome, Some(true)) && job_ids.is_empty() {
+                                                     if let Some(entry) = data.get_mut(&s.host) {
+                                                         entry.gpu_list.retain(|g| g.job_id.is_none());
+                                                     }
+                                                     gpu_data.gpu_list.retain(|g| g.job_id.is_none());
                                                  }
-                                                 gpu_data.is_online = !gpu_data.gpu_list.is_empty() || gpu_data.is_online;
+                                                 gpu_data.is_online = true;
                                                  gpu_data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
                                                  gpu_data.slurm_nodelists = Some(nodelists.clone());
                                                  gpu_data.slurm_times = Some(times.clone());
                                                  gpu_data.slurm_steps = Some(steps.clone());
+                                                 if s.show_squeue_list.unwrap_or(false) {
+                                                     gpu_data.slurm_queue_jobs = Some(queue_jobs.clone());
+                                                 } else {
+                                                     gpu_data.slurm_queue_jobs = None;
+                                                 }
+                                                 if gpu_data.error.as_ref().is_some_and(|e| {
+                                                     e.contains("showing cached")
+                                                 }) && matches!(squeue_outcome, Some(true))
+                                                 {
+                                                     gpu_data.error = None;
+                                                 }
                                              }
                                              data.insert(s.host.clone(), gpu_data.clone());
                                              emitted_gpu_data = gpu_data.clone();
@@ -1511,19 +1719,29 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                          log::debug!("Main Worker for {} emitting update", s.host);
                                         emit_gpu_update_if_changed(&app_task, state_task.as_ref(), &emitted_gpu_data);
 
-                                         Ok((Some(sess), job_ids, nodelists, times, steps))
+                                         Ok((Some(sess), job_ids, nodelists, times, steps, queue_jobs, squeue_outcome))
                                      }
                                  }
                              }).await;
 
                             match res {
-                                Ok(Ok((sess, jobs, nodelists, times, steps))) => {
+                                Ok(Ok((sess, jobs, nodelists, times, steps, queue_jobs, squeue_ok))) => {
                                     session = sess;
                                     slurm_job_ids = jobs;
                                     slurm_nodelists = nodelists;
                                     slurm_times = times;
                                     slurm_steps = steps;
-                                    if (Utc::now() - last_squeue_update).num_seconds() >= 30 {
+                                    slurm_queue_jobs = queue_jobs;
+                                    consecutive_failures = 0;
+                                    match squeue_ok {
+                                        Some(true) => consecutive_squeue_failures = 0,
+                                        Some(false) => {
+                                            consecutive_squeue_failures =
+                                                consecutive_squeue_failures.saturating_add(1);
+                                        }
+                                        None => {}
+                                    }
+                                    if (Utc::now() - last_squeue_update).num_seconds() >= SLURM_SQUEUE_INTERVAL_SECS {
                                         last_squeue_update = Utc::now();
                                     }
                                 }
@@ -1533,6 +1751,8 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                         server_inner.host
                                     );
                                     session = None;
+                                    consecutive_failures =
+                                        consecutive_failures.saturating_add(1);
 
                                     {
                                         let mut monitors = state_inner
@@ -1564,20 +1784,23 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                             slurm_steps: None,
                                             slurm_nodelists: None,
                                             slurm_times: None,
+                                            slurm_queue_jobs: None,
                                         });
-                                    gpu_data.is_online = false;
-                                    if gpu_data.gpu_list.is_empty() {
-                                        gpu_data.error = Some(
-                                            "SSH connection failed or disconnected".to_string(),
-                                        );
-                                    } else {
-                                        gpu_data.error = Some(
-                                            "SSH connection failed (showing cached data)"
-                                                .to_string(),
-                                        );
+                                    let keep_cached = consecutive_failures
+                                        < GPU_STALE_CACHE_MAX_FAILURES
+                                        && !gpu_data.gpu_list.is_empty();
+                                    apply_offline_gpu_state(
+                                        &mut gpu_data,
+                                        "SSH connection failed or disconnected",
+                                        keep_cached,
+                                    );
+                                    if !keep_cached {
+                                        slurm_job_ids.clear();
+                                        slurm_nodelists.clear();
+                                        slurm_times.clear();
+                                        slurm_steps.clear();
+                                        slurm_queue_jobs.clear();
                                     }
-                                    gpu_data.last_update =
-                                        Some(Utc::now().format("%H:%M:%S").to_string());
 
                                     if let Ok(mut data) = state_inner.gpu_data.lock() {
                                         data.insert(server_inner.host.clone(), gpu_data.clone());

@@ -1,7 +1,7 @@
-use tauri::{AppHandle, Emitter};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
 
 static UPDATE_CHECK_CACHE: std::sync::OnceLock<Mutex<Option<(Instant, UpdateInfo)>>> =
     std::sync::OnceLock::new();
@@ -56,7 +56,7 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
 
     let current_version = app.package_info().version.to_string();
     log::info!("Checking for updates. Current version: {}", current_version);
-    
+
     let client = reqwest::Client::builder()
         .user_agent("widgitron-updater")
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -65,24 +65,34 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
         .map_err(|e| format!("Failed to create HTTP client: {:?}", e))?;
 
     let url = "https://api.github.com/repos/starkmomo/widgitron/releases/latest";
-    let response = client.get(url)
+    let response = client
+        .get(url)
         .send()
         .await
         .map_err(|e| format!("Failed to fetch release info: {:?}", e))?;
 
     if !response.status().is_success() {
-        return Err(format!("GitHub API returned status code: {}", response.status()));
+        return Err(format!(
+            "GitHub API returned status code: {}",
+            response.status()
+        ));
     }
 
-    let release: GithubRelease = response.json()
+    let release: GithubRelease = response
+        .json()
         .await
         .map_err(|e| format!("Failed to parse release JSON: {:?}", e))?;
 
     let latest_tag = release.tag_name.clone();
     let cleaned_latest = latest_tag.strip_prefix('v').unwrap_or(&latest_tag);
-    let cleaned_current = current_version.strip_prefix('v').unwrap_or(&current_version);
+    let cleaned_current = current_version
+        .strip_prefix('v')
+        .unwrap_or(&current_version);
 
-    let has_update = match (semver::Version::parse(cleaned_latest), semver::Version::parse(cleaned_current)) {
+    let has_update = match (
+        semver::Version::parse(cleaned_latest),
+        semver::Version::parse(cleaned_current),
+    ) {
         (Ok(latest), Ok(current)) => latest > current,
         _ => cleaned_latest != cleaned_current,
     };
@@ -94,16 +104,27 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
 
     if has_update {
         // Find Windows asset: prioritize _x64-setup.exe, then -setup.exe, then .exe, then .msi
-        let windows_asset = release.assets.iter()
+        let windows_asset = release
+            .assets
+            .iter()
             .find(|a| a.name.ends_with("_x64-setup.exe"))
-            .or_else(|| release.assets.iter().find(|a| a.name.ends_with("-setup.exe")))
+            .or_else(|| {
+                release
+                    .assets
+                    .iter()
+                    .find(|a| a.name.ends_with("-setup.exe"))
+            })
             .or_else(|| release.assets.iter().find(|a| a.name.ends_with(".exe")))
             .or_else(|| release.assets.iter().find(|a| a.name.ends_with(".msi")));
 
         if let Some(asset) = windows_asset {
             download_url = Some(asset.browser_download_url.clone());
             asset_name = Some(asset.name.clone());
-            log::info!("Found Windows update asset: {} ({})", asset.name, asset.browser_download_url);
+            log::info!(
+                "Found Windows update asset: {} ({})",
+                asset.name,
+                asset.browser_download_url
+            );
         } else {
             log::warn!("No suitable Windows installation asset found in release");
         }
@@ -126,22 +147,37 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
 }
 
 #[tauri::command]
-pub async fn download_and_install_update(app: AppHandle, download_url: String, asset_name: String) -> Result<(), String> {
-    log::info!("Starting download of update: {} from {}", asset_name, download_url);
+pub async fn download_and_install_update(
+    app: AppHandle,
+    download_url: String,
+    asset_name: String,
+) -> Result<(), String> {
+    log::info!(
+        "Starting download of update: {} from {}",
+        asset_name,
+        download_url
+    );
     tauri::async_runtime::spawn(async move {
         if let Err(e) = perform_download_and_install(&app, &download_url, &asset_name).await {
             log::error!("OTA update download or installation failed: {}", e);
-            let _ = app.emit("ota_download_progress", ProgressPayload {
-                state: "error".into(),
-                progress: 0,
-                error: Some(e),
-            });
+            let _ = app.emit(
+                "ota_download_progress",
+                ProgressPayload {
+                    state: "error".into(),
+                    progress: 0,
+                    error: Some(e),
+                },
+            );
         }
     });
     Ok(())
 }
 
-async fn perform_download_and_install(app: &AppHandle, download_url: &str, asset_name: &str) -> Result<(), String> {
+async fn perform_download_and_install(
+    app: &AppHandle,
+    download_url: &str,
+    asset_name: &str,
+) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent("widgitron-updater")
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -149,13 +185,17 @@ async fn perform_download_and_install(app: &AppHandle, download_url: &str, asset
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {:?}", e))?;
 
-    let mut response = client.get(download_url)
+    let mut response = client
+        .get(download_url)
         .send()
         .await
         .map_err(|e| format!("Failed to download update file: {:?}", e))?;
 
     if !response.status().is_success() {
-        return Err(format!("Download request failed with status: {}", response.status()));
+        return Err(format!(
+            "Download request failed with status: {}",
+            response.status()
+        ));
     }
 
     let total_size = response.content_length().unwrap_or(0);
@@ -169,16 +209,23 @@ async fn perform_download_and_install(app: &AppHandle, download_url: &str, asset
         .map_err(|e| format!("Failed to create destination file: {:?}", e))?;
 
     // Emit initial progress
-    let _ = app.emit("ota_download_progress", ProgressPayload {
-        state: "downloading".into(),
-        progress: 0,
-        error: None,
-    });
+    let _ = app.emit(
+        "ota_download_progress",
+        ProgressPayload {
+            state: "downloading".into(),
+            progress: 0,
+            error: None,
+        },
+    );
 
     let mut downloaded: u64 = 0;
     let mut last_emitted_percentage = 0u8;
 
-    while let Some(chunk) = response.chunk().await.map_err(|e| format!("Error receiving chunk: {:?}", e))? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("Error receiving chunk: {:?}", e))?
+    {
         use std::io::Write;
         file.write_all(&chunk)
             .map_err(|e| format!("Error writing chunk to file: {:?}", e))?;
@@ -189,11 +236,14 @@ async fn perform_download_and_install(app: &AppHandle, download_url: &str, asset
             let percentage = ((downloaded as f64 / total_size as f64) * 100.0) as u8;
             if percentage > last_emitted_percentage {
                 last_emitted_percentage = percentage;
-                let _ = app.emit("ota_download_progress", ProgressPayload {
-                    state: "downloading".into(),
-                    progress: percentage,
-                    error: None,
-                });
+                let _ = app.emit(
+                    "ota_download_progress",
+                    ProgressPayload {
+                        state: "downloading".into(),
+                        progress: percentage,
+                        error: None,
+                    },
+                );
             }
         }
     }
@@ -203,11 +253,14 @@ async fn perform_download_and_install(app: &AppHandle, download_url: &str, asset
     log::info!("Download completed successfully. Launching installer...");
 
     // Emit completion event
-    let _ = app.emit("ota_download_progress", ProgressPayload {
-        state: "completed".into(),
-        progress: 100,
-        error: None,
-    });
+    let _ = app.emit(
+        "ota_download_progress",
+        ProgressPayload {
+            state: "completed".into(),
+            progress: 100,
+            error: None,
+        },
+    );
 
     // Execute the installer
     run_installer(&installer_path)?;

@@ -13,6 +13,7 @@ import type {
   QuotaConfigUpdatePayload,
   QuotaMonitorStatusPayload,
   QuotaUpdatePayload,
+  SidebarStateUpdatePayload,
   ThemeUpdatePayload,
   UnitPayload,
   WidgetVisibilityChangedPayload,
@@ -36,6 +37,7 @@ export interface TauriEventMap {
   arxiv_discarded_update: UnitPayload;
   ota_download_progress: OtaDownloadProgressPayload;
   quota_monitor_status: QuotaMonitorStatusPayload;
+  sidebar_state_update: SidebarStateUpdatePayload;
   paper_error: BackendServiceErrorPayload;
   arxiv_error: BackendServiceErrorPayload;
 }
@@ -63,6 +65,7 @@ export const TAURI_EVENT_NAMES = [
   "arxiv_discarded_update",
   "ota_download_progress",
   "quota_monitor_status",
+  "sidebar_state_update",
   "paper_error",
   "arxiv_error",
 ] as const satisfies readonly TauriEvent[];

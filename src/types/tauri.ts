@@ -15,6 +15,14 @@ export interface ToggleWidgetResponse {
   visible: boolean;
 }
 
+export interface SidebarDockState {
+  edge: "left" | "top" | "right" | "bottom";
+  pinned: boolean;
+  expanded: boolean;
+  dragging: boolean;
+  preview_edge: SidebarDockState["edge"] | null;
+}
+
 export interface UpdateInfo {
   has_update: boolean;
   current_version: string;
@@ -89,6 +97,7 @@ export interface TauriCommandMap {
   save_arxiv_config: void;
   save_quota_config: void;
   save_app_config: void;
+  set_widget_always_on_top: AppConfig;
   save_theme_config: void;
   download_and_install_update: void;
   create_widget: void;
@@ -105,6 +114,9 @@ export interface TauriCommandMap {
   show_sidebar: void;
   hide_sidebar: void;
   toggle_sidebar: void;
+  get_sidebar_state: SidebarDockState;
+  set_sidebar_pinned: SidebarDockState;
+  begin_sidebar_drag: SidebarDockState;
   exit_app: void;
   set_desktop_mode: void;
   log_frontend_error: void;
@@ -140,6 +152,7 @@ export const TAURI_COMMAND_NAMES = [
   "save_arxiv_config",
   "save_quota_config",
   "save_app_config",
+  "set_widget_always_on_top",
   "save_theme_config",
   "download_and_install_update",
   "create_widget",
@@ -156,6 +169,9 @@ export const TAURI_COMMAND_NAMES = [
   "show_sidebar",
   "hide_sidebar",
   "toggle_sidebar",
+  "get_sidebar_state",
+  "set_sidebar_pinned",
+  "begin_sidebar_drag",
   "exit_app",
   "set_desktop_mode",
   "log_frontend_error",
@@ -195,6 +211,7 @@ export interface TauriCommandArgs {
   save_arxiv_config: { config: ArxivConfig };
   save_quota_config: { config: QuotaConfig };
   save_app_config: { config: AppConfig };
+  set_widget_always_on_top: { label: string; pinned: boolean };
   save_theme_config: { config: WidgetThemeConfig };
   toggle_widget: { id: string; title: string };
   create_widget: { id: string; title: string };
@@ -218,6 +235,9 @@ export interface TauriCommandArgs {
   show_sidebar: undefined;
   hide_sidebar: undefined;
   toggle_sidebar: undefined;
+  get_sidebar_state: undefined;
+  set_sidebar_pinned: { pinned: boolean };
+  begin_sidebar_drag: undefined;
   exit_app: undefined;
   open_log_dir: undefined;
   open_config_dir: undefined;

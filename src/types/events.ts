@@ -9,7 +9,7 @@ import type {
   QuotaItem,
   ServerGpuData,
 } from "./config";
-import type { OtaDownloadProgress } from "./tauri";
+import type { OtaDownloadProgress, SidebarDockState } from "./tauri";
 import type { WidgetThemeConfig } from "./theme";
 
 export type AppConfigUpdatePayload = AppConfig;
@@ -19,6 +19,7 @@ export type GpuConfigUpdatePayload = GpuConfig;
 export type PaperConfigUpdatePayload = PaperConfig;
 export type ThemeUpdatePayload = WidgetThemeConfig;
 export type OtaDownloadProgressPayload = OtaDownloadProgress;
+export type SidebarStateUpdatePayload = SidebarDockState;
 
 export type GpuUpdatePayload = ServerGpuData;
 export type PaperUpdatePayload = PaperDeadlineInfo[];

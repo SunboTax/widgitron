@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::AppHandle;
 
@@ -108,47 +108,8 @@ fn antigravity_db_path(app_name: &str) -> Option<PathBuf> {
     }
 }
 
-fn temp_vscdb_copy_path() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "ag_vscdb_{}_{}.db",
-        chrono::Utc::now().timestamp_millis(),
-        std::process::id()
-    ))
-}
-
 fn read_vscdb_key(db_path: &Path, target_key: &str) -> Result<Option<String>, String> {
-    if !db_path.exists() {
-        return Ok(None);
-    }
-
-    let temp_path = temp_vscdb_copy_path();
-    std::fs::copy(db_path, &temp_path)
-        .map_err(|e| format!("Failed to copy Antigravity state database: {}", e))?;
-
-    let res = (|| {
-        let conn = rusqlite::Connection::open(&temp_path)
-            .map_err(|e| format!("Failed to open Antigravity database: {}", e))?;
-        let mut stmt = conn
-            .prepare("SELECT value FROM ItemTable WHERE key = ?")
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-        let mut rows = stmt
-            .query([target_key])
-            .map_err(|e| format!("Query failed: {}", e))?;
-        if let Some(row) = rows
-            .next()
-            .map_err(|e| format!("Error reading row: {}", e))?
-        {
-            let val: String = row
-                .get(0)
-                .map_err(|e| format!("Failed to get column value: {}", e))?;
-            Ok(Some(val))
-        } else {
-            Ok(None)
-        }
-    })();
-
-    let _ = std::fs::remove_file(&temp_path);
-    res
+    crate::sqlite_state::read_text_key(db_path, target_key)
 }
 
 fn read_varint(bytes: &[u8], mut pos: usize) -> Option<(u64, usize)> {
@@ -285,7 +246,7 @@ fn now_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 struct AntigravityOAuthConfig {
     #[serde(default)]
     client_id: String,
@@ -345,7 +306,12 @@ fn antigravity_install_roots() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        for name in ["Antigravity", "Antigravity IDE", "Google Antigravity", "antigravity"] {
+            for name in [
+                "Antigravity",
+                "Antigravity IDE",
+                "Google Antigravity",
+                "antigravity",
+            ] {
                 roots.push(PathBuf::from(&local).join("Programs").join(name));
             }
             for name in ["Antigravity", "Antigravity IDE", "Google Antigravity"] {
@@ -447,7 +413,10 @@ fn resolve_google_oauth_credentials(app: &AppHandle) -> Result<(String, String),
     }
 }
 
-async fn refresh_google_access_token(app: &AppHandle, refresh_token: &str) -> Result<String, String> {
+async fn refresh_google_access_token(
+    app: &AppHandle,
+    refresh_token: &str,
+) -> Result<String, String> {
     let (client_id, client_secret) = resolve_google_oauth_credentials(app)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -508,8 +477,9 @@ async fn fetch_cloud_models(access_token: &str) -> Result<Value, String> {
                     .await
                     .map_err(|e| format!("Failed to parse Cloud Code response: {}", e));
             }
-            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                || resp.status() == reqwest::StatusCode::FORBIDDEN =>
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN =>
             {
                 return Err("Google OAuth token expired or invalid".to_string());
             }
@@ -560,9 +530,7 @@ fn parse_cloud_model_quotas(data: &Value) -> Vec<ModelQuota> {
             _ => continue,
         };
 
-        let remaining_fraction = quota_info
-            .get("remainingFraction")
-            .and_then(|v| v.as_f64());
+        let remaining_fraction = quota_info.get("remainingFraction").and_then(|v| v.as_f64());
         let reset_time = quota_info
             .get("resetTime")
             .and_then(|v| v.as_str())
@@ -593,7 +561,10 @@ fn parse_cloud_model_quotas(data: &Value) -> Vec<ModelQuota> {
     models
 }
 
-async fn resolve_access_token(app: &AppHandle, candidates: &[OAuthTokens]) -> Result<String, String> {
+async fn resolve_access_token(
+    app: &AppHandle,
+    candidates: &[OAuthTokens],
+) -> Result<String, String> {
     let now = now_epoch_seconds();
     let mut access_tokens = Vec::new();
 
@@ -636,7 +607,10 @@ async fn resolve_access_token(app: &AppHandle, candidates: &[OAuthTokens]) -> Re
         }
     }
 
-    Err("No valid Antigravity Google OAuth credentials found. Sign in via Antigravity IDE.".to_string())
+    Err(
+        "No valid Antigravity Google OAuth credentials found. Sign in via Antigravity IDE."
+            .to_string(),
+    )
 }
 
 /// Fetch Antigravity quota via Google Cloud Code API using stored OAuth credentials.
@@ -644,15 +618,17 @@ pub async fn fetch_antigravity_via_cloud(app: &AppHandle) -> Result<QuotaSnapsho
     let candidates = load_oauth_token_candidates();
     if candidates.is_empty() {
         return Err(
-            "Antigravity OAuth credentials not found. Sign in via Antigravity IDE once.".to_string(),
+            "Antigravity OAuth credentials not found. Sign in via Antigravity IDE once."
+                .to_string(),
         );
     }
 
     let access_token = resolve_access_token(app, &candidates).await?;
     let data = fetch_cloud_models(&access_token).await?;
     let models = parse_cloud_model_quotas(&data);
-    
-    let tier_name = data.get("userTier")
+
+    let tier_name = data
+        .get("userTier")
         .or_else(|| data.get("userStatus").and_then(|us| us.get("userTier")))
         .and_then(|ut| ut.get("name"))
         .and_then(|n| n.as_str())

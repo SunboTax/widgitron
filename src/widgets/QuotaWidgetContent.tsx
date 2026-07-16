@@ -46,7 +46,7 @@ function renderQuotaAlert(
   );
 }
 
-export function QuotaWidgetContent() {
+export function QuotaWidgetContent({ hideHeader = false }: { hideHeader?: boolean }) {
   const [quotas, setQuotas] = useState<QuotaItem[]>([]);
   const currentTheme = useWidgetTheme("quota");
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -312,32 +312,33 @@ export function QuotaWidgetContent() {
 
   return (
     <div className="h-full flex flex-col select-none" style={{ color: mainText }}>
-      {/* Header */}
-      <div className="flex items-center justify-between mb-3 border-b border-white/5 pb-2">
-        <div className="flex items-center gap-2">
-          <Gauge size={16} style={{ color: accent }} className="animate-pulse" />
-          <span className="text-xs font-black uppercase tracking-widest" style={{ color: subText }}>
-            Quota Monitor
-          </span>
-          {quotaHeaderHint && (
-            <span
-              className="text-[7px] font-black uppercase tracking-widest"
-              style={{ color: quotaHardErrorCount > 0 ? danger : warning }}
-            >
-              {quotaHeaderHint}
+      {!hideHeader && (
+        <div className="flex items-center justify-between mb-3 border-b border-white/5 pb-2">
+          <div className="flex items-center gap-2">
+            <Gauge size={16} style={{ color: accent }} className="animate-pulse" />
+            <span className="text-xs font-black uppercase tracking-widest" style={{ color: subText }}>
+              Quota Monitor
             </span>
-          )}
+            {quotaHeaderHint && (
+              <span
+                className="text-[8px] font-black uppercase tracking-widest"
+                style={{ color: quotaHardErrorCount > 0 ? danger : warning }}
+              >
+                {quotaHeaderHint}
+              </span>
+            )}
+          </div>
+          <button
+            onClick={handleRefresh}
+            disabled={isRefreshing || !serviceEnabled}
+            className="p-1 hover:bg-white/10 rounded-md transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{ color: subText }}
+            title="Refresh Quotas"
+          >
+            <RefreshCw size={12} className={isRefreshing ? "animate-spin" : "hover:rotate-45 transition-transform"} />
+          </button>
         </div>
-        <button
-          onClick={handleRefresh}
-          disabled={isRefreshing || !serviceEnabled}
-          className="p-1 hover:bg-white/10 rounded-md transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-          style={{ color: subText }}
-          title="Refresh Quotas"
-        >
-          <RefreshCw size={12} className={isRefreshing ? "animate-spin" : "hover:rotate-45 transition-transform"} />
-        </button>
-      </div>
+      )}
 
       <ServiceErrorBanners
         backendError={quotaBackendError}

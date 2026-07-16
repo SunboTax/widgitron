@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/starkmomo/widgitron/releases">
-    <img src="https://img.shields.io/badge/Version-v0.2.4-8B5CF6?style=flat-square&labelColor=2E1065&logo=github&logoColor=white" alt="Version" />
+    <img src="https://img.shields.io/badge/Version-v0.2.5-8B5CF6?style=flat-square&labelColor=2E1065&logo=github&logoColor=white" alt="Version" />
   </a>
   <a href="https://www.rust-lang.org/">
     <img src="https://img.shields.io/badge/Rust-1.75%2B-F97316?style=flat-square&logo=rust&logoColor=white&labelColor=431407" alt="Rust" />
@@ -43,14 +43,13 @@ Widgitron is a modern, cross-platform dashboard built with **Tauri**, **Rust**, 
 ## 🗺️ Roadmap
 
 ### ✅ Completed
-- [x] Tauri 2.0 & Rust backend migration
-- [x] Modern React-based Glassmorphism UI
 - [x] GPU monitoring (Persistent SSH)
 - [x] Slurm integration & Job ID tracking
 - [x] Paper deadline countdown widget
 - [x] Advanced widget theme customization
 - [x] Arxiv Radar: paper card with swipe gestures
 - [x] Agent quota monitor widget (Codex, Cursor, etc.)
+- [x] Dockable sidebar hub
 
 
 ## 🚀 Quick Start

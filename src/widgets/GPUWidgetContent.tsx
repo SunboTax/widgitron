@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Cpu, Activity, RefreshCw } from "lucide-react";
+import { Cpu, Activity, RefreshCw, List } from "lucide-react";
 import { useWidgetTheme } from "../hooks/useWidgetTheme";
 import { hexToRgba } from "../utils/color";
 import { orderGpuServersByConfig, sortGpuJobGroups } from "../utils/gpuDisplay";
@@ -11,7 +11,7 @@ import { LIVE_DATA_SECTION, refetchSectionLiveData } from "../utils/sectionLiveD
 import { gpuRefreshCachedLabel, messageShowsCached } from "../utils/cachedLabels";
 import { CopyButton } from "../components/CopyButton";
 import { ServiceErrorBanners } from "../components/ServiceErrorBanners";
-import type { GpuConfig, GpuInfo, ServerGpuData, SlurmStep } from "../types/config";
+import type { GpuConfig, GpuInfo, ServerConfig, ServerGpuData, SlurmQueueJob, SlurmStep } from "../types/config";
 import { tauriInvoke } from "../utils/tauriInvoke";
 import { tauriListen } from "../utils/tauriListen";
 
@@ -69,7 +69,14 @@ function formatSlurmTime(totalSeconds: number): string {
   return res;
 }
 
-export function GPUWidgetContent() {
+function slurmStateColor(state: string, colors: { success: string; warning: string; subText: string }) {
+  const normalized = state.trim().toUpperCase();
+  if (normalized === "RUNNING") return colors.success;
+  if (normalized === "PENDING") return colors.warning;
+  return colors.subText;
+}
+
+export function GPUWidgetContent({ hideHeader = false }: { hideHeader?: boolean }) {
   const [serverData, setServerData] = useState<ServerGpuData[]>([]);
   const currentTheme = useWidgetTheme("gpu");
   const [durations, setDurations] = useState<Record<string, number>>({});
@@ -302,32 +309,51 @@ export function GPUWidgetContent() {
     }
   };
 
+  const updateGpuServerField = async (
+    host: string,
+    field: keyof ServerConfig,
+    value: ServerConfig[keyof ServerConfig]
+  ) => {
+    const servers = (gpuConfig.servers || []).map((server) =>
+      server.host === host ? { ...server, [field]: value } : server
+    );
+    const next = { ...gpuConfig, servers };
+    try {
+      await tauriInvoke("save_gpu_config", { config: next });
+      setGpuConfig(next);
+    } catch (e) {
+      console.error("Failed to save GPU server setting", e);
+    }
+  };
+
   return (
     <div className="h-full flex flex-col" style={{ color: mainText }}>
-      <div className="flex items-center justify-between gap-2 mb-4">
-        <div className="flex items-center gap-2">
-          <Cpu size={16} style={{ color: accent }} />
-          <span className="text-xs font-black uppercase tracking-widest" style={{ color: subText }}>
-            GPU Monitor
-          </span>
-        </div>
-        <div className="flex items-center gap-2">
-          {gpuHeaderHint && (
-            <span className="text-[8px] font-black uppercase tracking-widest" style={{ color: warning }}>
-              {gpuHeaderHint}
+      {!hideHeader && (
+        <div className="flex items-center justify-between gap-2 mb-4">
+          <div className="flex items-center gap-2">
+            <Cpu size={16} style={{ color: accent }} />
+            <span className="text-xs font-black uppercase tracking-widest" style={{ color: subText }}>
+              GPU Monitor
             </span>
-          )}
-          <button
-            onClick={handleRefresh}
-            disabled={isRefreshing || !serviceEnabled}
-            className="p-1 hover:bg-white/10 rounded-md transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-            style={{ color: subText }}
-            title="Restart GPU workers"
-          >
-            <RefreshCw size={12} className={isRefreshing ? "animate-spin" : "hover:rotate-45 transition-transform"} />
-          </button>
+          </div>
+          <div className="flex items-center gap-2">
+            {gpuHeaderHint && (
+              <span className="text-[8px] font-black uppercase tracking-widest" style={{ color: warning }}>
+                {gpuHeaderHint}
+              </span>
+            )}
+            <button
+              onClick={handleRefresh}
+              disabled={isRefreshing || !serviceEnabled}
+              className="p-1 hover:bg-white/10 rounded-md transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              style={{ color: subText }}
+              title="Restart GPU workers"
+            >
+              <RefreshCw size={12} className={isRefreshing ? "animate-spin" : "hover:rotate-45 transition-transform"} />
+            </button>
+          </div>
         </div>
-      </div>
+      )}
       <ServiceErrorBanners
         refreshOnly
         refreshError={refreshError}
@@ -353,6 +379,11 @@ export function GPUWidgetContent() {
           orderedServerData.map((server, idx) => {
             const hasCachedGpus = Array.isArray(server.gpu_list) && server.gpu_list.length > 0;
             const showStaleOffline = !server.is_online && hasCachedGpus;
+            const serverConfig = (gpuConfig.servers || []).find((entry) => entry.host === server.host);
+            const slurmEnabled = serverConfig?.use_slurm === true;
+            const showSqueueList = slurmEnabled && serverConfig?.show_squeue_list === true;
+            const squeueAllUsers = serverConfig?.squeue_all_users === true;
+            const queueJobs = showSqueueList ? server.slurm_queue_jobs || [] : [];
 
             const groups: Record<string, GpuInfo[]> = {};
             server.gpu_list.forEach((gpu) => {
@@ -368,7 +399,7 @@ export function GPUWidgetContent() {
               >
                 <div
                   className={`flex items-center border-l-2 border-white/10 pl-2 ${
-                    isCompact ? "justify-between" : "justify-start gap-2"
+                    isCompact ? "justify-between gap-2" : "justify-between gap-2"
                   }`}
                 >
                   <div className="flex items-center gap-2 min-w-0">
@@ -379,9 +410,68 @@ export function GPUWidgetContent() {
                       {server.host}
                     </span>
                   </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {slurmEnabled && (
+                      <>
+                        <button
+                          type="button"
+                          data-no-drag="true"
+                          onClick={() =>
+                            updateGpuServerField(server.host, "show_squeue_list", !showSqueueList)
+                          }
+                          className={`px-1.5 py-0.5 rounded border text-[7px] font-black uppercase tracking-widest transition-colors ${
+                            showSqueueList ? "border-emerald-500/30" : "border-white/10 opacity-60"
+                          }`}
+                          style={{
+                            color: showSqueueList ? success : subText,
+                            backgroundColor: showSqueueList ? `${success}12` : "transparent",
+                          }}
+                          title="Toggle squeue task list"
+                        >
+                          <span className="inline-flex items-center gap-1">
+                            <List size={9} />
+                            Queue
+                          </span>
+                        </button>
+                        {showSqueueList && (
+                          <div className="flex items-center gap-0.5" data-no-drag="true">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateGpuServerField(server.host, "squeue_all_users", false)
+                              }
+                              className={`px-1 py-0.5 rounded text-[7px] font-black uppercase tracking-widest border ${
+                                !squeueAllUsers ? "border-emerald-500/30" : "border-white/10 opacity-50"
+                              }`}
+                              style={{
+                                color: !squeueAllUsers ? success : subText,
+                                backgroundColor: !squeueAllUsers ? `${success}12` : "transparent",
+                              }}
+                            >
+                              Mine
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateGpuServerField(server.host, "squeue_all_users", true)
+                              }
+                              className={`px-1 py-0.5 rounded text-[7px] font-black uppercase tracking-widest border ${
+                                squeueAllUsers ? "border-emerald-500/30" : "border-white/10 opacity-50"
+                              }`}
+                              style={{
+                                color: squeueAllUsers ? success : subText,
+                                backgroundColor: squeueAllUsers ? `${success}12` : "transparent",
+                              }}
+                            >
+                              All
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    )}
                   {server.is_online ? (
                     <span
-                      className={`text-[7px] font-black uppercase shrink-0 ${
+                      className={`text-[8px] font-black uppercase shrink-0 ${
                         isCompact ? "" : "rounded border px-1.5 py-0.5"
                       }`}
                       style={{
@@ -394,7 +484,7 @@ export function GPUWidgetContent() {
                     </span>
                   ) : showStaleOffline ? (
                     <span
-                      className={`text-[7px] font-black uppercase shrink-0 ${
+                      className={`text-[8px] font-black uppercase shrink-0 ${
                         isCompact ? "" : "rounded border px-1.5 py-0.5"
                       }`}
                       style={{
@@ -407,7 +497,7 @@ export function GPUWidgetContent() {
                     </span>
                   ) : (
                     <span
-                      className={`text-[7px] font-black uppercase shrink-0 ${
+                      className={`text-[8px] font-black uppercase shrink-0 ${
                         isCompact ? "" : "rounded border px-1.5 py-0.5"
                       }`}
                       style={{
@@ -419,6 +509,7 @@ export function GPUWidgetContent() {
                       Offline
                     </span>
                   )}
+                  </div>
                 </div>
 
                 {server.error && (
@@ -448,12 +539,12 @@ export function GPUWidgetContent() {
                             {(server.slurm_nodelists?.[jobId] || server.slurm_times?.[jobId]) && (
                               <div className="flex items-center gap-1.5 shrink-0 select-none">
                                 {server.slurm_nodelists?.[jobId] && (
-                                  <span className="opacity-60 font-mono text-[7px] text-right truncate max-w-[120px]" title={server.slurm_nodelists[jobId]}>
+                                  <span className="opacity-60 font-mono text-[8px] text-right truncate max-w-[120px]" title={server.slurm_nodelists[jobId]}>
                                     {server.slurm_nodelists[jobId]}
                                   </span>
                                 )}
                                 {server.slurm_times?.[jobId] && (
-                                  <span className="opacity-80 font-mono text-[7px] text-right shrink-0" style={{ color: accent }} title="Job Run Time">
+                                  <span className="opacity-80 font-mono text-[8px] text-right shrink-0" style={{ color: accent }} title="Job Run Time">
                                     {formatSlurmTime(durations[jobId] ?? parseSlurmTime(server.slurm_times[jobId]))}
                                   </span>
                                 )}
@@ -479,10 +570,10 @@ export function GPUWidgetContent() {
                                 />
                                 {/* Text Overlay */}
                                 <div className="relative z-10 flex flex-col items-center justify-center text-center leading-normal">
-                                  <span className="text-[7.5px] font-black tracking-tighter" style={{ color: mainText }}>
+                                  <span className="text-[8px] font-black tracking-tighter" style={{ color: mainText }}>
                                     {(gpu.mem_used / 1024).toFixed(0)}G
                                   </span>
-                                  <span className="text-[6.5px] font-bold tracking-tighter opacity-80" style={{ color: subText }}>
+                                  <span className="text-[8px] font-bold tracking-tighter opacity-80" style={{ color: subText }}>
                                     {(gpu.power || 0).toFixed(0)}W
                                   </span>
                                 </div>
@@ -503,7 +594,7 @@ export function GPUWidgetContent() {
                                 return (
                                   <div
                                     key={sIdx}
-                                    className="flex items-center justify-between text-[7px] bg-white/5 px-2 py-0.5 rounded border border-white/5 font-mono"
+                                    className="flex items-center justify-between text-[8px] bg-white/5 px-2 py-0.5 rounded border border-white/5 font-mono"
                                   >
                                     <div className="flex items-center gap-1.5 min-w-0 flex-1">
                                       <span style={{ color: accent }} className="shrink-0">{shortStepId}</span>
@@ -550,7 +641,7 @@ export function GPUWidgetContent() {
                                 />
                               </div>
                               <div
-                                className="flex justify-between items-center gap-1 text-[7px] font-bold tracking-tighter tabular-nums"
+                                className="flex justify-between items-center gap-1 text-[8px] font-bold tracking-tighter tabular-nums"
                                 style={{ color: subText }}
                               >
                                 <span>{(gpu.mem_used / 1024).toFixed(0)}G</span>
@@ -583,12 +674,12 @@ export function GPUWidgetContent() {
                               {(server.slurm_nodelists?.[jobId] || server.slurm_times?.[jobId]) && (
                                 <div className="flex items-center gap-1.5 shrink-0 select-none">
                                   {server.slurm_nodelists?.[jobId] && (
-                                    <span className="opacity-60 font-mono text-[7px] text-right truncate max-w-[120px]" title={server.slurm_nodelists[jobId]}>
+                                    <span className="opacity-60 font-mono text-[8px] text-right truncate max-w-[120px]" title={server.slurm_nodelists[jobId]}>
                                       {server.slurm_nodelists[jobId]}
                                     </span>
                                   )}
                                   {server.slurm_times?.[jobId] && (
-                                    <span className="opacity-80 font-mono text-[7px] text-right shrink-0" style={{ color: accent }} title="Job Run Time">
+                                    <span className="opacity-80 font-mono text-[8px] text-right shrink-0" style={{ color: accent }} title="Job Run Time">
                                       {formatSlurmTime(durations[jobId] ?? parseSlurmTime(server.slurm_times[jobId]))}
                                     </span>
                                   )}
@@ -603,7 +694,7 @@ export function GPUWidgetContent() {
                                   return (
                                     <div
                                       key={sIdx}
-                                      className="flex items-center justify-between text-[7px] bg-white/5 px-2 py-0.5 rounded border border-white/5 font-mono"
+                                      className="flex items-center justify-between text-[8px] bg-white/5 px-2 py-0.5 rounded border border-white/5 font-mono"
                                     >
                                       <div className="flex items-center gap-1.5 min-w-0 flex-1">
                                         <span style={{ color: accent }} className="shrink-0">{shortStepId}</span>
@@ -624,6 +715,59 @@ export function GPUWidgetContent() {
                     </>
                   )}
                 </div>
+
+                {showSqueueList && (
+                  <div className="pl-2 space-y-1">
+                    <div
+                      className="flex items-center justify-between text-[8px] font-black uppercase tracking-widest"
+                      style={{ color: subText }}
+                    >
+                      <span className="inline-flex items-center gap-1">
+                        <List size={10} style={{ color: accent }} />
+                        Squeue ({squeueAllUsers ? "all users" : "mine"})
+                      </span>
+                      <span className="opacity-60">{queueJobs.length} jobs</span>
+                    </div>
+                    {queueJobs.length > 0 ? (
+                      <div className="space-y-0.5 max-h-32 overflow-y-auto custom-scrollbar">
+                        {queueJobs.map((job: SlurmQueueJob) => (
+                          <div
+                            key={`${job.id}-${job.user}`}
+                            className="flex items-center justify-between gap-2 text-[8px] bg-white/5 px-2 py-0.5 rounded border border-white/5 font-mono"
+                          >
+                            <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                              <span style={{ color: accent }} className="shrink-0">
+                                {job.id}
+                              </span>
+                              <span className="font-bold opacity-80 truncate" title={job.name}>
+                                {job.name}
+                              </span>
+                              {squeueAllUsers && (
+                                <span className="opacity-60 shrink-0">{job.user}</span>
+                              )}
+                              <span
+                                className="shrink-0 uppercase text-[7px] font-black tracking-wider"
+                                style={{ color: slurmStateColor(job.state, { success, warning, subText }) }}
+                              >
+                                {job.state}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2 opacity-60 shrink-0">
+                              <span className="truncate max-w-[100px]" title={job.nodelist}>
+                                {job.nodelist}
+                              </span>
+                              <span>{formatSlurmTime(parseSlurmTime(job.time))}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-[8px] italic opacity-60 px-1" style={{ color: subText }}>
+                        No jobs in queue
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })
@@ -641,7 +785,7 @@ export function GPUWidgetContent() {
             </span>
           </div>
         ) : (
-          <div className="w-full text-xs italic text-center mt-4" style={{ color: subText }}>
+          <div className="w-full text-[9px] italic text-center mt-4" style={{ color: subText }}>
             Waiting for backend...
           </div>
         )}

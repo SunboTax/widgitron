@@ -35,7 +35,10 @@ mod models;
 mod ota;
 mod quota;
 mod secrets;
+mod sidebar_dock;
 mod sidebar_hotkey;
+mod sqlite_state;
+mod ui_scale;
 mod utils;
 mod vscode_secrets;
 mod widget_layout;
@@ -64,6 +67,7 @@ pub fn run() {
             commands::get_paper_config,
             commands::get_app_config,
             commands::save_app_config,
+            commands::set_widget_always_on_top,
             commands::get_deadlines,
             commands::refresh_paper_deadlines,
             commands::get_gpu_data,
@@ -72,6 +76,9 @@ pub fn run() {
             commands::show_sidebar,
             commands::hide_sidebar,
             commands::toggle_sidebar,
+            commands::get_sidebar_state,
+            commands::set_sidebar_pinned,
+            commands::begin_sidebar_drag,
             commands::exit_app,
             commands::get_theme_config,
             commands::save_theme_config,
@@ -307,6 +314,9 @@ pub fn run() {
                 handle.clone(),
                 app_config.sidebar_hotkey.clone(),
             );
+            if let Err(err) = sidebar_dock::start(handle.clone(), &app_config) {
+                log::warn!("Failed to initialize sidebar docking: {}", err);
+            }
 
             // Ensure Main Window is visible (or hidden based on config)
             if let Some(main_win) = handle.get_webview_window("main") {
@@ -382,11 +392,6 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             let label = window.label().to_string();
-            if label == "sidebar" && matches!(event, tauri::WindowEvent::Resized(_)) {
-                commands::persist_sidebar_width(&window.app_handle(), window);
-                return;
-            }
-
             if label == "main"
                 && matches!(
                     event,
@@ -404,10 +409,7 @@ pub fn run() {
 
             match event {
                 tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
-                    widget_layout::schedule_layout_persist(
-                        window.app_handle().clone(),
-                        label,
-                    );
+                    widget_layout::schedule_layout_persist(window.app_handle().clone(), label);
                 }
                 tauri::WindowEvent::CloseRequested { .. } => {
                     let _ = widget_layout::persist_layout_now(&window.app_handle(), &label);

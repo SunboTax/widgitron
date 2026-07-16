@@ -89,52 +89,8 @@ pub fn get_vscode_user_dir(app_name: &str) -> Option<PathBuf> {
     }
 }
 
-fn temp_vscdb_copy_path(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{}_{}_{}.db",
-        prefix,
-        chrono::Utc::now().timestamp_millis(),
-        std::process::id()
-    ))
-}
-
 fn read_vscdb_plaintext_key(db_path: &Path, target_key: &str) -> Result<Option<String>, String> {
-    if !db_path.exists() {
-        return Ok(None);
-    }
-
-    let temp_path = temp_vscdb_copy_path("vscdb_plain");
-
-    std::fs::copy(db_path, &temp_path)
-        .map_err(|e| format!("Failed to copy state database: {}", e))?;
-
-    let res = (|| {
-        let conn = rusqlite::Connection::open(&temp_path)
-            .map_err(|e| format!("Failed to open database: {}", e))?;
-
-        let mut stmt = conn
-            .prepare("SELECT value FROM ItemTable WHERE key = ?")
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let mut rows = stmt
-            .query([target_key])
-            .map_err(|e| format!("Query failed: {}", e))?;
-
-        if let Some(row) = rows
-            .next()
-            .map_err(|e| format!("Error reading row: {}", e))?
-        {
-            let val: String = row
-                .get(0)
-                .map_err(|e| format!("Failed to get column value: {}", e))?;
-            Ok(Some(val))
-        } else {
-            Ok(None)
-        }
-    })();
-
-    let _ = std::fs::remove_file(&temp_path);
-    res
+    crate::sqlite_state::read_text_key(db_path, target_key)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -155,8 +111,7 @@ fn decrypt_v10_secret(raw: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
     let nonce = Nonce::from_slice(&raw[3..15]);
     let ciphertext = &raw[15..];
 
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Invalid AES key: {}", e))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("Invalid AES key: {}", e))?;
 
     cipher
         .decrypt(nonce, ciphertext)
@@ -359,7 +314,7 @@ fn read_vscdb_secret(
 fn dpapi_decrypt(data: &[u8]) -> Result<Vec<u8>, String> {
     use windows::Win32::Foundation::LocalFree;
     use windows::Win32::Security::Cryptography::{
-        CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
 
     let mut input = CRYPT_INTEGER_BLOB {
@@ -380,8 +335,7 @@ fn dpapi_decrypt(data: &[u8]) -> Result<Vec<u8>, String> {
         )
         .map_err(|e| format!("DPAPI decrypt failed: {}", e))?;
 
-        let decrypted =
-            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let decrypted = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
         let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(output.pbData as _)));
         Ok(decrypted)
     }
@@ -459,7 +413,10 @@ fn pick_github_session(
 }
 
 fn get_preferred_copilot_account(app_name: &str) -> Option<String> {
-    let db_path = get_vscode_user_dir(app_name)?.join("User").join("globalStorage").join("state.vscdb");
+    let db_path = get_vscode_user_dir(app_name)?
+        .join("User")
+        .join("globalStorage")
+        .join("state.vscdb");
     read_vscdb_plaintext_key(&db_path, "github.copilot-github")
         .ok()
         .flatten()
@@ -547,7 +504,8 @@ pub fn read_vscode_copilot_github_token() -> Result<(String, Option<String>), St
     }
 
     Err(
-        "GitHub token not found in VS Code. Sign in via VS Code Accounts menu (GitHub).".to_string(),
+        "GitHub token not found in VS Code. Sign in via VS Code Accounts menu (GitHub)."
+            .to_string(),
     )
 }
 

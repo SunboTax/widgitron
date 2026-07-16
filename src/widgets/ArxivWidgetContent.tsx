@@ -3,7 +3,7 @@ import { Activity, Check, ChevronDown } from "lucide-react";
 import { motion, AnimatePresence, type Variants } from "framer-motion";
 import type { ArxivConfig, ArxivPaper } from "../types/config";
 import { useWidgetTheme } from "../hooks/useWidgetTheme";
-import { hexToRgba } from "../utils/color";
+import { hexToRgba, isLightColor } from "../utils/color";
 import { handleWidgetAppConfigUpdate } from "../utils/widgetLifecycle";
 import { listenBackendServiceError } from "../utils/backendServiceError";
 import { listenServiceUpdateEvents } from "../utils/serviceUpdateEvents";
@@ -15,6 +15,11 @@ import { tauriInvoke } from "../utils/tauriInvoke";
 import { tauriListen } from "../utils/tauriListen";
 
 type SwipeDirection = "left" | "right" | "up";
+
+type ArxivWidgetContentProps = {
+  hideHeader?: boolean;
+  appearance?: "light" | "dark";
+};
 
 const paperCardVariants: Variants = {
   initial: { scale: 0.9, opacity: 0, y: 20 },
@@ -28,7 +33,10 @@ const paperCardVariants: Variants = {
   }),
 };
 
-export function ArxivWidgetContent() {
+export function ArxivWidgetContent({
+  hideHeader = false,
+  appearance,
+}: ArxivWidgetContentProps) {
   const [papers, setPapers] = useState<ArxivPaper[]>([]);
   const [arxivConfig, setArxivConfig] = useState<ArxivConfig>({});
   const [arxivBackendError, setArxivBackendError] = useState<string | null>(null);
@@ -204,19 +212,31 @@ export function ArxivWidgetContent() {
   const accent = getC("Accent", "#ec4899");
   const mainText = getT("Main Text", "#ffffff");
   const subText = getT("Sub Text", "#94a3b8");
+  const isLightAppearance = appearance
+    ? appearance === "light"
+    : isLightColor(currentTheme.bg_color);
+  const keywordMenuText = isLightAppearance ? "#475569" : subText;
+  const keywordMenuBorder = isLightAppearance
+    ? "rgba(100, 116, 139, 0.28)"
+    : "rgba(148, 163, 184, 0.24)";
+  const keywordMenuCheckboxBorder = isLightAppearance
+    ? "rgba(71, 85, 105, 0.42)"
+    : "rgba(148, 163, 184, 0.38)";
 
 
   return (
-    <div className={`h-full flex flex-col p-2 select-none`} style={{ color: mainText }}>
-      <div className="flex items-center gap-2 mb-4">
-        <Activity size={16} style={{ color: accent }} className="pointer-events-none" />
-        <span
-          className="text-xs font-black uppercase tracking-widest pointer-events-none"
-          style={{ color: subText }}
-        >
-          Arxiv Radar
-        </span>
-      </div>
+    <div className="h-full flex flex-col select-none" style={{ color: mainText }}>
+      {!hideHeader && (
+        <div className="flex items-center gap-2 mb-4">
+          <Activity size={16} style={{ color: accent }} className="pointer-events-none" />
+          <span
+            className="text-xs font-black uppercase tracking-widest pointer-events-none"
+            style={{ color: subText }}
+          >
+            Arxiv Radar
+          </span>
+        </div>
+      )}
 
       <ServiceErrorBanners
         backendError={arxivBackendError}
@@ -242,9 +262,15 @@ export function ArxivWidgetContent() {
             onClick={() => setKeywordMenuOpen((open) => !open)}
             className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-[8px] font-black uppercase tracking-widest border transition-colors"
             style={{
-              borderColor: keywordMenuOpen ? accent : `${subText}33`,
-              backgroundColor: keywordMenuOpen ? `${accent}18` : "rgba(255,255,255,0.04)",
-              color: selectedKeywords.length > 0 ? accent : subText,
+              borderColor: keywordMenuOpen ? accent : keywordMenuBorder,
+              backgroundColor: keywordMenuOpen
+                ? isLightAppearance
+                  ? "rgba(236, 72, 153, 0.08)"
+                  : "rgba(236, 72, 153, 0.12)"
+                : isLightAppearance
+                  ? "rgba(255, 255, 255, 0.62)"
+                  : "rgba(255, 255, 255, 0.04)",
+              color: selectedKeywords.length > 0 ? accent : keywordMenuText,
             }}
             title={selectedKeywords.length === 0 ? "All keywords" : selectedKeywords.map(formatArxivKeywordLabel).join(", ")}
           >
@@ -262,10 +288,15 @@ export function ArxivWidgetContent() {
           </button>
           {keywordMenuOpen && (
             <div
-              className="absolute left-0 right-0 top-full z-50 mt-1 max-h-40 overflow-y-auto rounded-lg border shadow-2xl backdrop-blur-md"
+              className="absolute left-0 right-0 top-full z-50 mt-1 max-h-40 overflow-y-auto rounded-lg border backdrop-blur-xl"
               style={{
-                borderColor: `${subText}33`,
-                backgroundColor: "rgba(15, 23, 42, 0.94)",
+                borderColor: keywordMenuBorder,
+                backgroundColor: isLightAppearance
+                  ? "rgba(255, 255, 255, 0.94)"
+                  : "rgba(15, 23, 42, 0.94)",
+                boxShadow: isLightAppearance
+                  ? "0 8px 24px rgba(15, 23, 42, 0.12)"
+                  : "0 8px 24px rgba(0, 0, 0, 0.24)",
               }}
             >
               <button
@@ -275,12 +306,17 @@ export function ArxivWidgetContent() {
                   setCurrentIndex(0);
                   setKeywordMenuOpen(false);
                 }}
-                className="w-full flex items-center gap-2 px-2.5 py-2 text-left text-[8px] font-black uppercase tracking-widest hover:bg-white/10 transition-colors"
-                style={{ color: selectedKeywords.length === 0 ? accent : subText }}
+                className={`w-full flex items-center gap-2 px-2.5 py-2 text-left text-[8px] font-black uppercase tracking-widest transition-colors ${
+                  isLightAppearance ? "hover:bg-slate-900/5" : "hover:bg-white/10"
+                }`}
+                style={{ color: selectedKeywords.length === 0 ? accent : keywordMenuText }}
               >
                 <span
                   className="w-3 h-3 rounded border flex items-center justify-center shrink-0"
-                  style={{ borderColor: selectedKeywords.length === 0 ? accent : `${subText}55` }}
+                  style={{
+                    borderColor:
+                      selectedKeywords.length === 0 ? accent : keywordMenuCheckboxBorder,
+                  }}
                 >
                   {selectedKeywords.length === 0 && <Check size={9} />}
                 </span>
@@ -300,13 +336,15 @@ export function ArxivWidgetContent() {
                       );
                       setCurrentIndex(0);
                     }}
-                    className="w-full flex items-center gap-2 px-2.5 py-2 text-left text-[8px] font-black uppercase tracking-widest hover:bg-white/10 transition-colors"
-                    style={{ color: active ? accent : subText }}
+                    className={`w-full flex items-center gap-2 px-2.5 py-2 text-left text-[8px] font-black uppercase tracking-widest transition-colors ${
+                      isLightAppearance ? "hover:bg-slate-900/5" : "hover:bg-white/10"
+                    }`}
+                    style={{ color: active ? accent : keywordMenuText }}
                     title={keyword}
                   >
                     <span
                       className="w-3 h-3 rounded border flex items-center justify-center shrink-0"
-                      style={{ borderColor: active ? accent : `${subText}55` }}
+                      style={{ borderColor: active ? accent : keywordMenuCheckboxBorder }}
                     >
                       {active && <Check size={9} />}
                     </span>
@@ -348,11 +386,11 @@ export function ArxivWidgetContent() {
                 if (definition === "exit") setExitDirection(undefined);
               }}
               data-no-drag="true"
-              className="absolute inset-0 bg-white/5 rounded-2xl border border-white/10 p-5 flex flex-col shadow-2xl backdrop-blur-md cursor-grab active:cursor-grabbing overflow-hidden"
+              className="absolute inset-0 bg-white/5 rounded-2xl border border-white/10 p-5 flex flex-col shadow-[0_2px_8px_rgba(15,23,42,0.10)] backdrop-blur-md cursor-grab active:cursor-grabbing overflow-hidden"
             >
-              <h3 className="text-sm font-bold mb-3 leading-relaxed">{currentPaper.title}</h3>
+              <h3 className="text-[10px] font-bold mb-3 leading-relaxed">{currentPaper.title}</h3>
               <p
-                className="text-[10px] opacity-60 mb-4 line-clamp-10 leading-relaxed"
+                className="text-[9px] opacity-60 mb-4 line-clamp-10 leading-relaxed"
                 style={{ color: subText }}
               >
                 {currentPaper.summary}
@@ -392,8 +430,8 @@ export function ArxivWidgetContent() {
                 <Check size={32} className="text-emerald-500" />
               </div>
               <div className="space-y-1">
-                <div className="text-sm font-bold">All caught up!</div>
-                <p className="text-[10px] text-slate-500">Check back later for new papers in CS.</p>
+                <div className="text-[10px] font-bold">All caught up!</div>
+                <p className="text-[9px] text-slate-500">Check back later for new papers in CS.</p>
               </div>
             </div>
           )}

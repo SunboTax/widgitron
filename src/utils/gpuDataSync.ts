@@ -1,5 +1,5 @@
 import type { Dispatch, SetStateAction } from "react";
-import type { GpuInfo, ServerGpuData, SlurmStep } from "../types/config";
+import type { GpuInfo, ServerGpuData, SlurmQueueJob, SlurmStep } from "../types/config";
 import { tauriListen } from "./tauriListen";
 
 function gpuInfoEqual(a: GpuInfo, b: GpuInfo): boolean {
@@ -13,6 +13,27 @@ function gpuInfoEqual(a: GpuInfo, b: GpuInfo): boolean {
     a.job_id === b.job_id &&
     a.node === b.node
   );
+}
+
+function slurmQueueJobEqual(a: SlurmQueueJob, b: SlurmQueueJob): boolean {
+  return (
+    a.id === b.id &&
+    a.name === b.name &&
+    a.user === b.user &&
+    a.state === b.state &&
+    a.time === b.time &&
+    a.nodelist === b.nodelist
+  );
+}
+
+function slurmQueueJobsEqual(
+  a: SlurmQueueJob[] | null | undefined,
+  b: SlurmQueueJob[] | null | undefined
+): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  if (a.length !== b.length) return false;
+  return a.every((job, index) => slurmQueueJobEqual(job, b[index]));
 }
 
 function slurmStepEqual(a: SlurmStep, b: SlurmStep): boolean {
@@ -77,7 +98,8 @@ export function gpuServerDataEqual(
   return (
     recordOfStringsEqual(a.slurm_nodelists, b.slurm_nodelists) &&
     recordOfStringsEqual(a.slurm_times, b.slurm_times) &&
-    recordOfStepsEqual(a.slurm_steps, b.slurm_steps)
+    recordOfStepsEqual(a.slurm_steps, b.slurm_steps) &&
+    slurmQueueJobsEqual(a.slurm_queue_jobs, b.slurm_queue_jobs)
   );
 }
 

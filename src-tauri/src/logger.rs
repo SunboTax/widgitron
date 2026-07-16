@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::Mutex;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tauri::AppHandle;
 use tauri::Manager;
 
@@ -62,7 +62,9 @@ impl log::Log for SimpleLogger {
 
 /// Keep only the most recent `keep` log files, deleting older ones.
 fn prune_old_logs(log_dir: &PathBuf, keep: usize) {
-    let Ok(entries) = std::fs::read_dir(log_dir) else { return };
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
 
     let mut log_files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
@@ -97,9 +99,10 @@ fn write_crash_log(log_path: &PathBuf, line: &str) {
 }
 
 pub fn init(app: &AppHandle) -> Result<PathBuf, String> {
-    let log_dir = app.path().app_log_dir().unwrap_or_else(|_| {
-        std::env::current_dir().unwrap_or_default().join("logs")
-    });
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join("logs"));
     std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
 
     // Each startup gets its own timestamped log file
@@ -129,16 +132,12 @@ pub fn init(app: &AppHandle) -> Result<PathBuf, String> {
             "Box<Any>"
         };
 
-        let location = info.location()
+        let location = info
+            .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".into());
 
-        let panic_log = format!(
-            "[{}] [PANIC] [{}] {}\n",
-            timestamp,
-            location,
-            message
-        );
+        let panic_log = format!("[{}] [PANIC] [{}] {}\n", timestamp, location, message);
 
         write_crash_log(&log_path_clone, &panic_log);
         default_hook(info);

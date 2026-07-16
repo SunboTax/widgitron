@@ -1,9 +1,9 @@
-use std::time::Duration;
 use chrono::{DateTime, Datelike, Local, TimeZone};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-use crate::models::{AppConfig, ArxivConfig, ArxivPaper, GlobalState};
 use crate::config_store;
+use crate::models::{AppConfig, ArxivConfig, ArxivPaper, GlobalState};
 
 const ARXIV_PAGE_SIZE: usize = 100;
 const ARXIV_MIN_PAPERS_PER_KEYWORD: usize = 10;
@@ -135,7 +135,10 @@ fn sort_papers_by_updated_desc(papers: &mut [ArxivPaper]) {
     papers.sort_by(|a, b| paper_updated_at(b).cmp(&paper_updated_at(a)));
 }
 
-fn parse_arxiv_response(xml: &str, keywords: &[String]) -> Result<(Vec<ArxivPaper>, Option<usize>), String> {
+fn parse_arxiv_response(
+    xml: &str,
+    keywords: &[String],
+) -> Result<(Vec<ArxivPaper>, Option<usize>), String> {
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -179,11 +182,9 @@ fn parse_arxiv_response(xml: &str, keywords: &[String]) -> Result<(Vec<ArxivPape
                 } else if in_entry {
                     if name == "author" {
                         in_author = true;
-                    }
-                    else if name == "name" && in_author {
+                    } else if name == "name" && in_author {
                         current_paper.authors.push(String::new());
-                    }
-                    else if name == "link" {
+                    } else if name == "link" {
                         let mut is_pdf = false;
                         let mut href = String::new();
                         for attr in e.attributes() {
@@ -191,16 +192,23 @@ fn parse_arxiv_response(xml: &str, keywords: &[String]) -> Result<(Vec<ArxivPape
                                 let key = a.key.local_name();
                                 let k = String::from_utf8_lossy(key.as_ref());
                                 let v = String::from_utf8_lossy(a.value.as_ref());
-                                if k == "title" && v == "pdf" { is_pdf = true; }
-                                if k == "href" { href = v.into_owned(); }
+                                if k == "title" && v == "pdf" {
+                                    is_pdf = true;
+                                }
+                                if k == "href" {
+                                    href = v.into_owned();
+                                }
                             }
                         }
-                        if is_pdf { current_paper.link = href.replace("http://", "https://"); }
-                        else if current_paper.link.is_empty() { current_paper.link = href.replace("http://", "https://"); }
+                        if is_pdf {
+                            current_paper.link = href.replace("http://", "https://");
+                        } else if current_paper.link.is_empty() {
+                            current_paper.link = href.replace("http://", "https://");
+                        }
                     }
                 }
                 current_tag = name;
-            },
+            }
             Ok(Event::Empty(e)) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 if in_entry && name == "link" {
@@ -211,45 +219,57 @@ fn parse_arxiv_response(xml: &str, keywords: &[String]) -> Result<(Vec<ArxivPape
                             let key = a.key.local_name();
                             let k = String::from_utf8_lossy(key.as_ref());
                             let v = String::from_utf8_lossy(a.value.as_ref());
-                            if k == "title" && v == "pdf" { is_pdf = true; }
-                            if k == "href" { href = v.into_owned(); }
+                            if k == "title" && v == "pdf" {
+                                is_pdf = true;
+                            }
+                            if k == "href" {
+                                href = v.into_owned();
+                            }
                         }
                     }
-                    if is_pdf { current_paper.link = href.replace("http://", "https://"); }
-                    else if current_paper.link.is_empty() { current_paper.link = href.replace("http://", "https://"); }
+                    if is_pdf {
+                        current_paper.link = href.replace("http://", "https://");
+                    } else if current_paper.link.is_empty() {
+                        current_paper.link = href.replace("http://", "https://");
+                    }
                 }
-            },
+            }
             Ok(Event::End(e)) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 if name == "entry" {
                     in_entry = false;
-                    current_paper.matched_keywords = matched_keywords_for_paper(&current_paper, keywords);
+                    current_paper.matched_keywords =
+                        matched_keywords_for_paper(&current_paper, keywords);
                     papers.push(current_paper.clone());
                 } else if name == "author" {
                     in_author = false;
                 }
                 current_tag = String::new();
-            },
+            }
             Ok(Event::Text(e)) => {
                 let text = String::from_utf8_lossy(e.as_ref()).into_owned();
                 if in_entry {
                     match current_tag.as_str() {
                         "id" => current_paper.id += &text,
-                        "title" => current_paper.title += &text.replace("\n", " ").replace("  ", " "),
-                        "summary" => current_paper.summary += &text.replace("\n", " ").replace("  ", " "),
+                        "title" => {
+                            current_paper.title += &text.replace("\n", " ").replace("  ", " ")
+                        }
+                        "summary" => {
+                            current_paper.summary += &text.replace("\n", " ").replace("  ", " ")
+                        }
                         "published" => current_paper.published += &text,
                         "updated" => current_paper.updated += &text,
                         "name" if in_author => {
                             if let Some(last) = current_paper.authors.last_mut() {
                                 *last += &text.trim();
                             }
-                        },
+                        }
                         _ => {}
                     }
                 } else if current_tag == "totalResults" {
                     total_results = text.trim().parse::<usize>().ok();
                 }
-            },
+            }
             _ => {}
         }
         buf.clear();
@@ -370,15 +390,9 @@ pub async fn perform_arxiv_fetch(
     let mut papers = Vec::new();
 
     if kws.is_empty() {
-        papers = fetch_papers_for_query(
-            &client,
-            &cat_query,
-            kws,
-            today_start,
-            tomorrow_start,
-            None,
-        )
-        .await?;
+        papers =
+            fetch_papers_for_query(&client, &cat_query, kws, today_start, tomorrow_start, None)
+                .await?;
     } else {
         for keyword in get_unique_keywords(kws) {
             if let Some(keyword_query) = arxiv_keyword_query(&keyword) {
@@ -397,15 +411,15 @@ pub async fn perform_arxiv_fetch(
         }
         sort_papers_by_updated_desc(&mut papers);
     }
-    
+
     // Filter out seen papers
     let seen = config_store::read_config::<Vec<String>>(app, "arxiv_seen.json");
-    
+
     papers.retain(|p| !seen.iter().any(|s| s == p.id.trim()));
-    
+
     // Save to cache file
     let _ = config_store::write_config(app, "arxiv_cache.json", &papers);
-    
+
     {
         if let Ok(mut state_papers) = state.arxiv_papers.lock() {
             *state_papers = papers.clone();
@@ -413,7 +427,7 @@ pub async fn perform_arxiv_fetch(
     }
     let _ = app.emit("arxiv_update", &papers);
     let _ = app.emit("arxiv_error", "");
-    
+
     Ok(papers)
 }
 
@@ -422,7 +436,8 @@ pub async fn start_arxiv_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
     {
         if let Ok(mut state_papers) = state.arxiv_papers.lock() {
             if state_papers.is_empty() {
-                let cached_papers = config_store::read_config::<Vec<ArxivPaper>>(&app, "arxiv_cache.json");
+                let cached_papers =
+                    config_store::read_config::<Vec<ArxivPaper>>(&app, "arxiv_cache.json");
                 if !cached_papers.is_empty() {
                     *state_papers = cached_papers;
                 }
@@ -439,7 +454,7 @@ pub async fn start_arxiv_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
     loop {
         let app_config = config_store::read_config::<AppConfig>(&app, "app_config.json");
         let config = config_store::read_config::<ArxivConfig>(&app, "arxiv_config.json");
-        
+
         let interval = config.update_interval;
 
         if !app_config.arxiv_enabled.unwrap_or(true) {
@@ -449,10 +464,12 @@ pub async fn start_arxiv_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
             // Clear cache file too
             let _ = config_store::write_config(&app, "arxiv_cache.json", &Vec::<ArxivPaper>::new());
             let _ = app.emit("arxiv_update", Vec::<ArxivPaper>::new());
-            
+
             for _ in 0..interval {
                 let ac = config_store::read_config::<AppConfig>(&app, "app_config.json");
-                if ac.arxiv_enabled.unwrap_or(true) { break; }
+                if ac.arxiv_enabled.unwrap_or(true) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             is_startup = false;
@@ -466,9 +483,12 @@ pub async fn start_arxiv_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
             if let Ok(metadata) = std::fs::metadata(&cache_path) {
                 if let Ok(modified) = metadata.modified() {
                     if let Ok(elapsed) = modified.elapsed() {
-                        if elapsed < Duration::from_secs(1800) { // 30 minutes
+                        if elapsed < Duration::from_secs(1800) {
+                            // 30 minutes
                             skip_fetch = true;
-                            log::info!("Arxiv cache is fresh (< 30m). Skipping initial fetch on startup.");
+                            log::info!(
+                                "Arxiv cache is fresh (< 30m). Skipping initial fetch on startup."
+                            );
                         }
                     }
                 }
@@ -482,14 +502,21 @@ pub async fn start_arxiv_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
                     backoff_secs = 60;
                 }
                 Err(e) => {
-                    log::error!("Error fetching Arxiv: {}. Retrying in {}s.", e, backoff_secs);
+                    log::error!(
+                        "Error fetching Arxiv: {}. Retrying in {}s.",
+                        e,
+                        backoff_secs
+                    );
                     let _ = app.emit("arxiv_error", e.clone());
                     let cached_papers = {
                         if let Ok(state_papers) = state.arxiv_papers.lock() {
                             if !state_papers.is_empty() {
                                 state_papers.clone()
                             } else {
-                                config_store::read_config::<Vec<ArxivPaper>>(&app, "arxiv_cache.json")
+                                config_store::read_config::<Vec<ArxivPaper>>(
+                                    &app,
+                                    "arxiv_cache.json",
+                                )
                             }
                         } else {
                             config_store::read_config::<Vec<ArxivPaper>>(&app, "arxiv_cache.json")
@@ -512,10 +539,16 @@ pub async fn start_arxiv_monitor(app: AppHandle, state: std::sync::Arc<GlobalSta
         for _ in 0..loops {
             tokio::time::sleep(Duration::from_secs(check_interval)).await;
             let ac = config_store::read_config::<AppConfig>(&app, "app_config.json");
-            if !ac.arxiv_enabled.unwrap_or(true) { break; }
-            
-            let current_config = config_store::read_config::<ArxivConfig>(&app, "arxiv_config.json");
-            if current_config.keywords != last_config.keywords || current_config.categories != last_config.categories || current_config.update_interval != last_config.update_interval {
+            if !ac.arxiv_enabled.unwrap_or(true) {
+                break;
+            }
+
+            let current_config =
+                config_store::read_config::<ArxivConfig>(&app, "arxiv_config.json");
+            if current_config.keywords != last_config.keywords
+                || current_config.categories != last_config.categories
+                || current_config.update_interval != last_config.update_interval
+            {
                 break;
             }
         }

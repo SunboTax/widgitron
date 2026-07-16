@@ -14,7 +14,7 @@ import { deadlineInstanceKey, deadlineTitleEquals } from "../utils/deadlineKeys"
 import { tauriInvoke } from "../utils/tauriInvoke";
 import { tauriListen } from "../utils/tauriListen";
 
-export function DeadlineWidgetContent() {
+export function DeadlineWidgetContent({ hideHeader = false }: { hideHeader?: boolean }) {
   const [deadlines, setDeadlines] = useState<PaperDeadlineInfo[]>([]);
   const [paperConfig, setPaperConfig] = useState<PaperConfig>({});
   const [paperBackendError, setPaperBackendError] = useState<string | null>(null);
@@ -161,23 +161,25 @@ export function DeadlineWidgetContent() {
 
   return (
     <div className="h-full flex flex-col" style={{ color: mainText }}>
-      <div className="flex items-center justify-between gap-2 mb-4">
-        <div className="flex items-center gap-2">
-          <Trophy size={16} style={{ color: highlight }} />
-          <span className="text-xs font-black uppercase tracking-widest" style={{ color: subText }}>
-            Deadlines
-          </span>
+      {!hideHeader && (
+        <div className="flex items-center justify-between gap-2 mb-4">
+          <div className="flex items-center gap-2">
+            <Trophy size={16} style={{ color: highlight }} />
+            <span className="text-xs font-black uppercase tracking-widest" style={{ color: subText }}>
+              Deadlines
+            </span>
+          </div>
+          <button
+            onClick={handleRefresh}
+            disabled={isRefreshing || !serviceEnabled}
+            className="p-1 hover:bg-white/10 rounded-md transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{ color: subText }}
+            title="Refresh Deadlines"
+          >
+            <RefreshCw size={12} className={isRefreshing ? "animate-spin" : "hover:rotate-45 transition-transform"} />
+          </button>
         </div>
-        <button
-          onClick={handleRefresh}
-          disabled={isRefreshing || !serviceEnabled}
-          className="p-1 hover:bg-white/10 rounded-md transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-          style={{ color: subText }}
-          title="Refresh Deadlines"
-        >
-          <RefreshCw size={12} className={isRefreshing ? "animate-spin" : "hover:rotate-45 transition-transform"} />
-        </button>
-      </div>
+      )}
 
       <ServiceErrorBanners
         backendError={paperBackendError}

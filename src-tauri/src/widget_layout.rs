@@ -2,16 +2,20 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{
     AppHandle, Manager, Monitor, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow,
 };
 
-use crate::{config_store, models::AppConfig};
+use crate::{config_store, models::AppConfig, ui_scale};
 
 const WIDGET_LAYOUTS_FILE: &str = "widget_layouts.json";
 const SAVE_DEBOUNCE_MS: u64 = 300;
+// Applying a saved layout and changing a widget's parent both emit native
+// move/resize events. Keep those events out of the user-layout debounce so a
+// transient DPI-adjusted size cannot overwrite the normalized layout.
+const PROGRAMMATIC_LAYOUT_SETTLE_MS: u64 = 900;
 const MONITOR_POLL_INTERVAL_MS: u64 = 2000;
 const MIN_WIDGET_WIDTH: u32 = 220;
 const MIN_WIDGET_HEIGHT: u32 = 180;
@@ -42,6 +46,7 @@ pub struct WidgetLayoutStore {
 #[derive(Default)]
 pub struct WidgetLayoutSaveState {
     pub pending: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
+    pub suppress_events_until: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,7 +80,10 @@ pub fn spawn_monitor_watchdog(app: AppHandle) {
                     next_signature
                 );
                 if let Err(err) = restore_widgets_after_monitor_change(&app).await {
-                    log::warn!("Failed to restore widget layouts after monitor change: {}", err);
+                    log::warn!(
+                        "Failed to restore widget layouts after monitor change: {}",
+                        err
+                    );
                 }
                 last_signature = next_signature;
             }
@@ -83,8 +91,65 @@ pub fn spawn_monitor_watchdog(app: AppHandle) {
     });
 }
 
+/// Ignore native move/resize notifications caused by an internal layout or
+/// desktop-parent transition. Existing debounced writes are cancelled as well,
+/// because they can otherwise run after the transition and save its temporary
+/// dimensions as a user resize.
+pub fn suppress_layout_event_persist(app: &AppHandle, label: &str) {
+    if !is_tracked_widget(label) {
+        return;
+    }
+
+    let state = app.state::<WidgetLayoutSaveState>();
+    let until = Instant::now() + Duration::from_millis(PROGRAMMATIC_LAYOUT_SETTLE_MS);
+    {
+        let mut suppressed = match state.suppress_events_until.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!("Widget layout suppression mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
+        let entry = suppressed.entry(label.to_string()).or_insert(until);
+        if *entry < until {
+            *entry = until;
+        }
+    }
+
+    let mut pending = match state.pending.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("WidgetLayoutSaveState mutex poisoned, recovering");
+            poisoned.into_inner()
+        }
+    };
+    if let Some(handle) = pending.remove(label) {
+        handle.abort();
+    }
+}
+
+fn layout_event_persist_is_suppressed(app: &AppHandle, label: &str) -> bool {
+    let state = app.state::<WidgetLayoutSaveState>();
+    let mut suppressed = match state.suppress_events_until.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    match suppressed.get(label).copied() {
+        Some(until) if until > now => true,
+        Some(_) => {
+            suppressed.remove(label);
+            false
+        }
+        None => false,
+    }
+}
+
 pub fn schedule_layout_persist(app: AppHandle, label: String) {
-    if !is_tracked_widget(&label) {
+    if !is_tracked_widget(&label)
+        || crate::desktop::is_desktop_mode(&app, &label)
+        || layout_event_persist_is_suppressed(&app, &label)
+    {
         return;
     }
 
@@ -105,9 +170,17 @@ pub fn schedule_layout_persist(app: AppHandle, label: String) {
     let label_clone = label.clone();
     let handle = tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(SAVE_DEBOUNCE_MS)).await;
-        if let Some(win) = app_clone.get_webview_window(&label_clone) {
-            if let Err(err) = persist_layout_for_window(&app_clone, &win, &label_clone) {
-                log::warn!("Failed to persist widget layout for {}: {}", label_clone, err);
+        if !crate::desktop::is_desktop_mode(&app_clone, &label_clone)
+            && !layout_event_persist_is_suppressed(&app_clone, &label_clone)
+        {
+            if let Some(win) = app_clone.get_webview_window(&label_clone) {
+                if let Err(err) = persist_layout_for_window(&app_clone, &win, &label_clone) {
+                    log::warn!(
+                        "Failed to persist widget layout for {}: {}",
+                        label_clone,
+                        err
+                    );
+                }
             }
         }
         let state = app_clone.state::<WidgetLayoutSaveState>();
@@ -122,7 +195,7 @@ pub fn schedule_layout_persist(app: AppHandle, label: String) {
 }
 
 pub fn persist_layout_now(app: &AppHandle, label: &str) -> Result<(), String> {
-    if !is_tracked_widget(label) {
+    if !is_tracked_widget(label) || crate::desktop::is_desktop_mode(app, label) {
         return Ok(());
     }
     if let Some(win) = app.get_webview_window(label) {
@@ -131,11 +204,78 @@ pub fn persist_layout_now(app: &AppHandle, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn ensure_widget_layout(app: &AppHandle, label: &str) -> Result<(), String> {
+/// Restores zoom and physical bounds while preserving the widget's current
+/// desktop-embedded state. A desktop child window must be made top-level for
+/// the update, otherwise Windows may apply the parent DPI scale a second time.
+pub fn restore_widget_layout_preserving_desktop_mode(
+    app: &AppHandle,
+    label: &str,
+) -> Result<(), String> {
     let Some(win) = app.get_webview_window(label) else {
         return Ok(());
     };
-    ensure_widget_layout_for_window(app, &win, label)
+    with_top_level_widget_layout(app, label, || {
+        ensure_widget_layout_for_window(app, &win, label)
+    })
+}
+
+pub fn persist_open_widget_layouts_at_scale(app: &AppHandle, scale: f64) {
+    for label in TRACKED_WIDGET_IDS {
+        let Some(win) = app.get_webview_window(label) else {
+            continue;
+        };
+        if let Err(err) = with_top_level_widget_layout(app, label, || {
+            persist_layout_for_window_at_scale(app, &win, label, scale)
+        }) {
+            log::warn!(
+                "Failed to preserve widget layout for {} before scaling: {}",
+                label,
+                err
+            );
+        }
+    }
+}
+
+pub fn apply_scale_to_open_widgets(app: &AppHandle, scale: f64) {
+    for label in TRACKED_WIDGET_IDS {
+        let Some(win) = app.get_webview_window(label) else {
+            continue;
+        };
+        if let Err(err) = with_top_level_widget_layout(app, label, || {
+            ensure_widget_layout_for_window_at_scale(app, &win, label, scale)
+        }) {
+            log::warn!("Failed to apply UI scale to {}: {}", label, err);
+        }
+    }
+}
+
+/// Desktop-locked widgets are Win32 child windows. Apply geometry updates only
+/// while they are top-level windows, otherwise Windows can apply the desktop
+/// parent's DPI transform a second time and make a scale change visibly larger.
+fn with_top_level_widget_layout<T>(
+    app: &AppHandle,
+    label: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    suppress_layout_event_persist(app, label);
+    let was_desktop_embedded = crate::desktop::is_desktop_mode(app, label);
+    if was_desktop_embedded {
+        crate::desktop::set_desktop_mode_now(app, label, false)?;
+    }
+
+    let result = operation();
+
+    if was_desktop_embedded {
+        if let Err(err) = crate::desktop::set_desktop_mode_now(app, label, true) {
+            log::warn!(
+                "Failed to restore desktop mode for {} after layout update: {}",
+                label,
+                err
+            );
+        }
+    }
+
+    result
 }
 
 pub fn ensure_widget_layout_for_window(
@@ -143,9 +283,21 @@ pub fn ensure_widget_layout_for_window(
     win: &WebviewWindow,
     label: &str,
 ) -> Result<(), String> {
+    let config = config_store::read_config::<AppConfig>(app, "app_config.json");
+    ensure_widget_layout_for_window_at_scale(app, win, label, ui_scale::from_config(&config))
+}
+
+fn ensure_widget_layout_for_window_at_scale(
+    app: &AppHandle,
+    win: &WebviewWindow,
+    label: &str,
+    scale: f64,
+) -> Result<(), String> {
     if !is_tracked_widget(label) {
         return Ok(());
     }
+
+    suppress_layout_event_persist(app, label);
 
     let mut store = read_layout_store(app);
     let active_key = store.active_monitor_by_widget.get(label).cloned();
@@ -175,7 +327,8 @@ pub fn ensure_widget_layout_for_window(
         .or_else(|| default_layout_for_widget(label))
         .ok_or_else(|| format!("No default widget layout for {}", label))?;
 
-    apply_layout_to_window(win, &target_monitor, layout)?;
+    ui_scale::apply_to_window(win, scale)?;
+    apply_layout_to_window(win, &target_monitor, layout, scale)?;
 
     store
         .monitors
@@ -187,7 +340,11 @@ pub fn ensure_widget_layout_for_window(
         .insert(label.to_string(), target_key.clone());
     write_layout_store(app, &store)?;
 
-    log::info!("Applied widget layout for {} on monitor '{}'", label, target_key);
+    log::info!(
+        "Applied widget layout for {} on monitor '{}'",
+        label,
+        target_key
+    );
     Ok(())
 }
 
@@ -198,8 +355,6 @@ async fn restore_widgets_after_monitor_change(app: &AppHandle) -> Result<(), Str
     }
 
     let available_keys = available_monitor_keys(app)?;
-    let app_config = config_store::read_config::<AppConfig>(app, "app_config.json");
-
     for label in TRACKED_WIDGET_IDS {
         let Some(source_key) = store.active_monitor_by_widget.get(label) else {
             continue;
@@ -211,22 +366,7 @@ async fn restore_widgets_after_monitor_change(app: &AppHandle) -> Result<(), Str
             continue;
         }
 
-        let pinned = app_config
-            .always_on_top
-            .as_ref()
-            .and_then(|map| map.get(label))
-            .copied()
-            .unwrap_or(false);
-
-        if !pinned {
-            let _ = crate::desktop::set_desktop_mode(app.clone(), label.to_string(), false).await;
-        }
-
-        ensure_widget_layout(app, label)?;
-
-        if !pinned {
-            let _ = crate::desktop::set_desktop_mode(app.clone(), label.to_string(), true).await;
-        }
+        restore_widget_layout_preserving_desktop_mode(app, label)?;
     }
 
     Ok(())
@@ -236,6 +376,16 @@ fn persist_layout_for_window(
     app: &AppHandle,
     win: &WebviewWindow,
     label: &str,
+) -> Result<(), String> {
+    let config = config_store::read_config::<AppConfig>(app, "app_config.json");
+    persist_layout_for_window_at_scale(app, win, label, ui_scale::from_config(&config))
+}
+
+fn persist_layout_for_window_at_scale(
+    app: &AppHandle,
+    win: &WebviewWindow,
+    label: &str,
+    scale: f64,
 ) -> Result<(), String> {
     let Some(monitor) = resolve_window_monitor(app, win)? else {
         return Ok(());
@@ -248,8 +398,30 @@ fn persist_layout_for_window(
     }
 
     let key = monitor_key(&monitor);
-    let layout = physical_to_normalized(position, size, &monitor);
     let mut store = read_layout_store(app);
+    let stored_layout = store
+        .monitors
+        .get(&key)
+        .and_then(|widgets| widgets.get(label))
+        .copied()
+        .or_else(|| {
+            store
+                .active_monitor_by_widget
+                .get(label)
+                .and_then(|active_key| store.monitors.get(active_key))
+                .and_then(|widgets| widgets.get(label))
+                .copied()
+        });
+
+    if let Some(stored_layout) = stored_layout {
+        let (expected_position, expected_size) =
+            normalized_to_physical(stored_layout, &monitor, scale);
+        if geometry_matches(position, size, expected_position, expected_size) {
+            return Ok(());
+        }
+    }
+
+    let layout = physical_to_normalized(position, size, &monitor, scale);
     store
         .monitors
         .entry(key.clone())
@@ -268,8 +440,9 @@ fn apply_layout_to_window(
     win: &WebviewWindow,
     monitor: &Monitor,
     layout: NormalizedWidgetLayout,
+    scale: f64,
 ) -> Result<(), String> {
-    let (position, size) = normalized_to_physical(layout, monitor);
+    let (position, size) = normalized_to_physical(layout, monitor, scale);
     win.set_size(Size::Physical(size))
         .map_err(|e| e.to_string())?;
     win.set_position(Position::Physical(position))
@@ -278,51 +451,43 @@ fn apply_layout_to_window(
 }
 
 fn default_layout_for_widget(label: &str) -> Option<NormalizedWidgetLayout> {
-    // Tuned against the reference screenshot:
-    // top edges align, the two middle cards share one column,
-    // and horizontal/vertical gaps are kept visually consistent.
-    let top = 0.024;
-    let column_gap = 0.011;
-    let row_gap = 0.016;
+    // First-run desktop layout: a left-aligned four-panel grid. It matches
+    // the visual default (GPU / Arxiv above Quota / Deadlines) while leaving
+    // the right side of the desktop free for normal work.
+    let left = 0.018;
+    let top = 0.028;
+    let column_gap = 0.014;
+    let row_gap = 0.018;
+    let cell_width = 0.350;
+    let cell_height = 0.450;
 
-    let gpu_x = 0.453;
-    let gpu_width = 0.182;
-
-    let middle_x = gpu_x + gpu_width + column_gap;
-    let middle_width = 0.164;
-
-    let quota_x = middle_x + middle_width + column_gap;
-    let quota_width = 0.168;
-
-    let tall_height = 0.748;
-    let deadline_height = 0.347;
-    let arxiv_y = top + deadline_height + row_gap;
-    let arxiv_height = (top + tall_height) - arxiv_y;
+    let right = left + cell_width + column_gap;
+    let bottom = top + cell_height + row_gap;
 
     match label {
         "widget-gpu-default" => Some(NormalizedWidgetLayout {
-            x: gpu_x,
+            x: left,
             y: top,
-            width: gpu_width,
-            height: tall_height,
-        }),
-        "widget-deadlines-default" => Some(NormalizedWidgetLayout {
-            x: middle_x,
-            y: top,
-            width: middle_width,
-            height: deadline_height,
+            width: cell_width,
+            height: cell_height,
         }),
         "widget-arxiv-default" => Some(NormalizedWidgetLayout {
-            x: middle_x,
-            y: arxiv_y,
-            width: middle_width,
-            height: arxiv_height,
+            x: right,
+            y: top,
+            width: cell_width,
+            height: cell_height,
         }),
         "widget-quota-default" => Some(NormalizedWidgetLayout {
-            x: quota_x,
-            y: top,
-            width: quota_width,
-            height: tall_height,
+            x: left,
+            y: bottom,
+            width: cell_width,
+            height: cell_height,
+        }),
+        "widget-deadlines-default" => Some(NormalizedWidgetLayout {
+            x: right,
+            y: bottom,
+            width: cell_width,
+            height: cell_height,
         }),
         _ => None,
     }
@@ -332,31 +497,37 @@ fn physical_to_normalized(
     position: PhysicalPosition<i32>,
     size: PhysicalSize<u32>,
     monitor: &Monitor,
+    scale: f64,
 ) -> NormalizedWidgetLayout {
     let area = monitor_work_area(monitor);
     let width = area.width.max(1) as f64;
     let height = area.height.max(1) as f64;
+    let scale = ui_scale::sanitize(Some(scale));
 
     sanitize_layout(NormalizedWidgetLayout {
         x: (position.x - area.x) as f64 / width,
         y: (position.y - area.y) as f64 / height,
-        width: size.width as f64 / width,
-        height: size.height as f64 / height,
+        width: size.width as f64 / scale / width,
+        height: size.height as f64 / scale / height,
     })
 }
 
 fn normalized_to_physical(
     layout: NormalizedWidgetLayout,
     monitor: &Monitor,
+    scale: f64,
 ) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
     let area = monitor_work_area(monitor);
     let layout = sanitize_layout(layout);
+    let scale = ui_scale::sanitize(Some(scale));
+    let min_width = ((MIN_WIDGET_WIDTH as f64 * scale).round() as u32).max(1);
+    let min_height = ((MIN_WIDGET_HEIGHT as f64 * scale).round() as u32).max(1);
 
-    let width = ((layout.width * area.width as f64).round() as u32)
-        .max(MIN_WIDGET_WIDTH)
+    let width = ((layout.width * area.width as f64 * scale).round() as u32)
+        .max(min_width)
         .min(area.width.max(1));
-    let height = ((layout.height * area.height as f64).round() as u32)
-        .max(MIN_WIDGET_HEIGHT)
+    let height = ((layout.height * area.height as f64 * scale).round() as u32)
+        .max(min_height)
         .min(area.height.max(1));
 
     let desired_x = area.x + (layout.x * area.width as f64).round() as i32;
@@ -371,6 +542,18 @@ fn normalized_to_physical(
         PhysicalPosition::new(x, y),
         PhysicalSize::new(width, height),
     )
+}
+
+fn geometry_matches(
+    actual_position: PhysicalPosition<i32>,
+    actual_size: PhysicalSize<u32>,
+    expected_position: PhysicalPosition<i32>,
+    expected_size: PhysicalSize<u32>,
+) -> bool {
+    actual_position.x.abs_diff(expected_position.x) <= 2
+        && actual_position.y.abs_diff(expected_position.y) <= 2
+        && actual_size.width.abs_diff(expected_size.width) <= 2
+        && actual_size.height.abs_diff(expected_size.height) <= 2
 }
 
 fn sanitize_layout(layout: NormalizedWidgetLayout) -> NormalizedWidgetLayout {
@@ -395,7 +578,10 @@ fn monitor_signature(app: &AppHandle) -> Result<String, String> {
         .map(|monitor| {
             let key = monitor_key(&monitor);
             let area = monitor_work_area(&monitor);
-            format!("{}@{},{}:{}x{}", key, area.x, area.y, area.width, area.height)
+            format!(
+                "{}@{},{}:{}x{}",
+                key, area.x, area.y, area.width, area.height
+            )
         })
         .collect::<Vec<_>>()
         .join("|"))
@@ -489,4 +675,29 @@ fn read_layout_store(app: &AppHandle) -> WidgetLayoutStore {
 
 fn write_layout_store(app: &AppHandle, store: &WidgetLayoutStore) -> Result<(), String> {
     config_store::write_config(app, WIDGET_LAYOUTS_FILE, store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_layout_is_a_left_aligned_two_by_two_grid() {
+        let gpu = default_layout_for_widget("widget-gpu-default").unwrap();
+        let arxiv = default_layout_for_widget("widget-arxiv-default").unwrap();
+        let quota = default_layout_for_widget("widget-quota-default").unwrap();
+        let deadlines = default_layout_for_widget("widget-deadlines-default").unwrap();
+
+        assert_eq!(gpu.x, quota.x);
+        assert_eq!(arxiv.x, deadlines.x);
+        assert!(gpu.x < arxiv.x);
+        assert_eq!(gpu.y, arxiv.y);
+        assert_eq!(quota.y, deadlines.y);
+        assert!(gpu.y < quota.y);
+
+        for layout in [gpu, arxiv, quota, deadlines] {
+            assert_eq!(layout.width, gpu.width);
+            assert_eq!(layout.height, gpu.height);
+        }
+    }
 }

@@ -1,11 +1,12 @@
-use std::fs;
-use std::sync::Mutex;
+use crate::models::{AppConfig, WidgetThemeConfig, WidgetVisibilityPayload};
+use crate::utils::get_config_path;
 use once_cell::sync::Lazy;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::Value;
+use std::fs;
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
-use crate::utils::get_config_path;
-use crate::models::{AppConfig, WidgetThemeConfig, WidgetVisibilityPayload};
 
 static CONFIG_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -19,9 +20,37 @@ fn config_lock() -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
+fn merge_json(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (key, value) in overlay_map {
+                match base_map.get_mut(key) {
+                    Some(existing) => merge_json(existing, value),
+                    None => {
+                        base_map.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base_slot, overlay_value) => {
+            *base_slot = overlay_value.clone();
+        }
+    }
+}
+
+fn recover_config_via_soft_merge<T: DeserializeOwned + Default + Serialize>(
+    content: &str,
+) -> Option<T> {
+    let overlay: Value = serde_json::from_str(content).ok()?;
+    let mut merged = serde_json::to_value(T::default()).ok()?;
+    merge_json(&mut merged, &overlay);
+    serde_json::from_value(merged).ok()
+}
+
 /// Read configuration of type T. If the file doesn't exist, returns default value.
-/// If parsing fails, logs error, renames file to <filename>.corrupt.json, and returns default value.
-pub fn read_config<T: DeserializeOwned + Default>(app: &AppHandle, filename: &str) -> T {
+/// On parse failure, soft-merges known fields onto defaults so upgrades do not wipe
+/// user settings; only falls back to a full default (+ corrupt backup) if recovery fails.
+pub fn read_config<T: DeserializeOwned + Default + Serialize>(app: &AppHandle, filename: &str) -> T {
     let _guard = config_lock();
     let path = get_config_path(app, filename);
     if !path.exists() {
@@ -29,50 +58,69 @@ pub fn read_config<T: DeserializeOwned + Default>(app: &AppHandle, filename: &st
     }
 
     match fs::read_to_string(&path) {
-        Ok(content) => {
-            match serde_json::from_str::<T>(&content) {
-                Ok(config) => config,
-                Err(e) => {
-                    log::error!(
-                        "Failed to parse config file '{}': {}. Backing up and returning defaults.",
+        Ok(content) => match serde_json::from_str::<T>(&content) {
+            Ok(config) => config,
+            Err(e) => {
+                if let Some(recovered) = recover_config_via_soft_merge::<T>(&content) {
+                    log::warn!(
+                        "Config '{}' had incompatible fields ({}). Recovered via soft merge.",
                         filename,
                         e
                     );
-                    let backup_path = path.with_extension("corrupt.json");
-                    let _ = fs::rename(&path, &backup_path);
-                    T::default()
+                    if let Ok(pretty) = serde_json::to_string_pretty(&recovered) {
+                        let _ = fs::write(&path, pretty);
+                    }
+                    return recovered;
                 }
+                log::error!(
+                    "Failed to parse config file '{}': {}. Backing up and returning defaults.",
+                    filename,
+                    e
+                );
+                let backup_path = path.with_extension("corrupt.json");
+                let _ = fs::rename(&path, &backup_path);
+                T::default()
             }
-        }
+        },
         Err(e) => {
-            log::error!("Failed to read config file '{}': {}. Returning defaults.", filename, e);
+            log::error!(
+                "Failed to read config file '{}': {}. Returning defaults.",
+                filename,
+                e
+            );
             T::default()
         }
     }
 }
 
 /// Write configuration of type T atomically.
-pub fn write_config<T: Serialize>(app: &AppHandle, filename: &str, config: &T) -> Result<(), String> {
+pub fn write_config<T: Serialize>(
+    app: &AppHandle,
+    filename: &str,
+    config: &T,
+) -> Result<(), String> {
     let _guard = config_lock();
     let path = get_config_path(app, filename);
-    
+
     let content = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    
-    let parent = path.parent().ok_or_else(|| "No parent directory for config path".to_string())?;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "No parent directory for config path".to_string())?;
     let temp_filename = format!("{}.tmp", filename);
     let temp_path = parent.join(temp_filename);
-    
+
     // Write to temp file
     fs::write(&temp_path, &content).map_err(|e| format!("Failed to write to temp file: {}", e))?;
-    
+
     // On Windows, rename fails if destination exists.
     if path.exists() {
         fs::remove_file(&path).map_err(|e| format!("Failed to remove old config file: {}", e))?;
     }
-    
+
     // Move temp file to actual file path
     fs::rename(&temp_path, &path).map_err(|e| format!("Failed to rename config file: {}", e))?;
-    
+
     Ok(())
 }
 
@@ -87,7 +135,10 @@ pub fn read_theme_config(app: &AppHandle) -> WidgetThemeConfig {
     let config_str = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
-            log::error!("Failed to read widget_themes.json: {}. Returning default theme config.", e);
+            log::error!(
+                "Failed to read widget_themes.json: {}. Returning default theme config.",
+                e
+            );
             return WidgetThemeConfig::default();
         }
     };
@@ -98,7 +149,7 @@ pub fn read_theme_config(app: &AppHandle) -> WidgetThemeConfig {
             // Sync default themes and assignments if missing
             let defaults = WidgetThemeConfig::default();
             config.themes.retain(|t| !t.id.ends_with("-transparent"));
-            
+
             for default_theme in defaults.themes {
                 if !config.themes.iter().any(|t| t.id == default_theme.id) {
                     config.themes.push(default_theme);
@@ -108,7 +159,10 @@ pub fn read_theme_config(app: &AppHandle) -> WidgetThemeConfig {
             // Sync missing default assignments
             for (widget_id, default_theme_id) in defaults.assignments {
                 if !config.assignments.contains_key(&widget_id)
-                    || config.assignments.get(&widget_id).map_or(true, |s| s.is_empty())
+                    || config
+                        .assignments
+                        .get(&widget_id)
+                        .map_or(true, |s| s.is_empty())
                 {
                     config.assignments.insert(widget_id, default_theme_id);
                 }
@@ -142,7 +196,7 @@ pub fn read_theme_config(app: &AppHandle) -> WidgetThemeConfig {
                         Ok(mut migrated) => {
                             let defaults = WidgetThemeConfig::default();
                             migrated.themes.retain(|t| !t.id.ends_with("-transparent"));
-                            
+
                             for default_theme in defaults.themes {
                                 if !migrated.themes.iter().any(|t| t.id == default_theme.id) {
                                     migrated.themes.push(default_theme);
@@ -151,12 +205,15 @@ pub fn read_theme_config(app: &AppHandle) -> WidgetThemeConfig {
 
                             for (widget_id, default_theme_id) in defaults.assignments {
                                 if !migrated.assignments.contains_key(&widget_id)
-                                    || migrated.assignments.get(&widget_id).map_or(true, |s| s.is_empty())
+                                    || migrated
+                                        .assignments
+                                        .get(&widget_id)
+                                        .map_or(true, |s| s.is_empty())
                                 {
                                     migrated.assignments.insert(widget_id, default_theme_id);
                                 }
                             }
-                            
+
                             // Save migrated config atomically
                             if let Some(parent) = path.parent() {
                                 let temp_path = parent.join("widget_themes.json.tmp");
@@ -214,10 +271,7 @@ pub fn list_corrupt_config_files(app: &AppHandle) -> Vec<String> {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.ends_with(".corrupt.json") {
                 files.push(name.to_string());
             }

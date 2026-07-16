@@ -10,14 +10,25 @@ export interface AppConfig {
   quota_enabled?: boolean;
   hide_on_startup?: boolean;
   arxiv_proxy?: string;
+  global_scale?: number;
   sidebar_hotkey?: string;
+  sidebar_edge?: "left" | "top" | "right" | "bottom";
+  sidebar_pinned?: boolean;
+  sidebar_hide_widget_headers?: boolean;
+  sidebar_monitor_x?: number;
+  sidebar_monitor_y?: number;
   sidebar_theme?: SidebarThemeConfig;
   sidebar_width?: number;
+  sidebar_length?: number;
   sidebar_widgets?: Record<string, boolean>;
   sidebar_layout?: Record<string, number>;
   sidebar_order?: string[];
   sidebar_tile_sizes?: Record<string, string>;
   sidebar_tile_layout?: Record<string, SidebarTileLayoutConfig>;
+  /** 1–10. Lower = harder to open from the screen edge (default 4). */
+  sidebar_reveal_sensitivity?: number;
+  /** 1–10. Higher = hides sooner after the pointer leaves (default 8). */
+  sidebar_hide_sensitivity?: number;
   active_widgets?: Record<string, boolean>;
 }
 
@@ -28,13 +39,44 @@ export interface SidebarTileLayoutConfig {
   h?: number;
 }
 
-export interface SidebarThemeConfig {
+export type SidebarThemePresetId = "midnight" | "light";
+
+/** `transparent` remains readable so existing profiles migrate to Light. */
+export type SidebarThemeKind = SidebarThemePresetId | "transparent" | "custom";
+
+export interface SidebarThemeDefinition {
+  id: string;
+  name: string;
+  preset?: SidebarThemeKind;
   background?: string;
   header?: string;
   quota?: string;
   gpu?: string;
   deadlines?: string;
   arxiv?: string;
+  background_opacity?: number;
+  header_opacity?: number;
+  card_opacity?: number;
+  blur?: number;
+}
+
+export interface SidebarThemeConfig {
+  /** Legacy selected preset, retained for existing profiles. */
+  preset?: SidebarThemeKind;
+  /** The selected built-in or user-created theme id. */
+  active_theme_id?: string;
+  /** User-created editable copies. Built-in themes are always available. */
+  themes?: SidebarThemeDefinition[];
+  background?: string;
+  header?: string;
+  quota?: string;
+  gpu?: string;
+  deadlines?: string;
+  arxiv?: string;
+  background_opacity?: number;
+  header_opacity?: number;
+  card_opacity?: number;
+  blur?: number;
 }
 
 export interface ServerConfig {
@@ -46,6 +88,8 @@ export interface ServerConfig {
   key_file?: string;
   use_ssh_config?: boolean;
   use_slurm?: boolean;
+  show_squeue_list?: boolean;
+  squeue_all_users?: boolean;
 }
 
 export interface GpuConfig {
@@ -124,6 +168,15 @@ export interface SlurmStep {
   command: string;
 }
 
+export interface SlurmQueueJob {
+  id: string;
+  name: string;
+  user: string;
+  state: string;
+  time: string;
+  nodelist: string;
+}
+
 export interface ServerGpuData {
   host: string;
   is_online: boolean;
@@ -133,6 +186,7 @@ export interface ServerGpuData {
   slurm_steps?: Record<string, SlurmStep[]> | null;
   slurm_nodelists?: Record<string, string> | null;
   slurm_times?: Record<string, string> | null;
+  slurm_queue_jobs?: SlurmQueueJob[] | null;
 }
 
 export interface PaperDeadlineInfo {

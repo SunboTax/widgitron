@@ -3,10 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-use crate::models::{
-    AppConfig, GlobalState, PaperConfig, PaperDeadlineInfo, YamlConfItem,
-};
 use crate::config_store;
+use crate::models::{AppConfig, GlobalState, PaperConfig, PaperDeadlineInfo, YamlConfItem};
 
 const DEADLINES_CACHE_FILE: &str = "paper_deadlines_cache.json";
 
@@ -45,10 +43,11 @@ fn normalize_title(title: &str) -> String {
 
 fn is_subscribed_title(title: &str, config: &PaperConfig) -> bool {
     let normalized = normalize_title(title);
-    config
-        .subscribed_titles
-        .as_ref()
-        .is_some_and(|titles| titles.iter().any(|item| normalize_title(item) == normalized))
+    config.subscribed_titles.as_ref().is_some_and(|titles| {
+        titles
+            .iter()
+            .any(|item| normalize_title(item) == normalized)
+    })
 }
 
 fn restore_and_emit_cached_deadlines(app: &AppHandle, state: &Arc<GlobalState>, error: &str) {
@@ -76,7 +75,10 @@ fn restore_and_emit_cached_deadlines(app: &AppHandle, state: &Arc<GlobalState>, 
     let _ = app.emit("paper_update", &cached);
 }
 
-pub fn hydrate_deadlines_from_cache(app: &AppHandle, state: &GlobalState) -> Vec<PaperDeadlineInfo> {
+pub fn hydrate_deadlines_from_cache(
+    app: &AppHandle,
+    state: &GlobalState,
+) -> Vec<PaperDeadlineInfo> {
     let cached = load_deadlines_cache(app);
     if cached.is_empty() {
         return Vec::new();
@@ -91,7 +93,10 @@ pub fn hydrate_deadlines_from_cache(app: &AppHandle, state: &GlobalState) -> Vec
     }
 }
 
-pub fn build_deadlines_from_yaml(text: &str, config: &PaperConfig) -> Result<Vec<PaperDeadlineInfo>, String> {
+pub fn build_deadlines_from_yaml(
+    text: &str,
+    config: &PaperConfig,
+) -> Result<Vec<PaperDeadlineInfo>, String> {
     let items: Vec<YamlConfItem> =
         serde_yaml::from_str(text).map_err(|e| format!("Failed to parse deadline data: {}", e))?;
     let mut config = config.clone();
@@ -108,8 +113,14 @@ pub fn build_deadlines_from_yaml(text: &str, config: &PaperConfig) -> Result<Vec
         let core_val = core_rank.clone().unwrap_or_else(|| "N".to_string());
         let sub = item.sub.unwrap_or_else(|| "Unknown".to_string());
 
-        let has_ccf_filter = config.filter_by_rank.as_ref().map_or(false, |v| !v.is_empty());
-        let has_core_filter = config.filter_by_core.as_ref().map_or(false, |v| !v.is_empty());
+        let has_ccf_filter = config
+            .filter_by_rank
+            .as_ref()
+            .map_or(false, |v| !v.is_empty());
+        let has_core_filter = config
+            .filter_by_core
+            .as_ref()
+            .map_or(false, |v| !v.is_empty());
 
         let matches_ccf = !has_ccf_filter
             || config
@@ -135,9 +146,9 @@ pub fn build_deadlines_from_yaml(text: &str, config: &PaperConfig) -> Result<Vec
 
         if !subscribed {
             if let Some(allowed) = &config.filter_by_sub {
-            if !allowed.is_empty() && !allowed.contains(&sub) {
-                continue;
-            }
+                if !allowed.is_empty() && !allowed.contains(&sub) {
+                    continue;
+                }
             }
         }
 
@@ -212,11 +223,7 @@ pub async fn fetch_and_update_paper_deadlines(
         .build()
         .unwrap_or_default();
     let url = "https://ccfddl.github.io/conference/allconf.yml";
-    let res = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let res = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         return Err(format!(
             "Paper deadline API returned HTTP status {}",
@@ -228,9 +235,10 @@ pub async fn fetch_and_update_paper_deadlines(
         *last = Some(text.clone());
     }
     let config_clone = config.clone();
-    let deadlines = tokio::task::spawn_blocking(move || build_deadlines_from_yaml(&text, &config_clone))
-        .await
-        .map_err(|e| format!("Deadline parse task failed: {}", e))??;
+    let deadlines =
+        tokio::task::spawn_blocking(move || build_deadlines_from_yaml(&text, &config_clone))
+            .await
+            .map_err(|e| format!("Deadline parse task failed: {}", e))??;
     apply_deadline_fetch_success(app, state, deadlines.clone());
     Ok(deadlines)
 }
@@ -246,8 +254,8 @@ pub fn process_deadlines(
     let state_inner = state.clone();
 
     // Offload heavy YAML parsing and processing to blocking thread
-    tokio::task::spawn_blocking(move || {
-        match build_deadlines_from_yaml(&text, &config_inner) {
+    tokio::task::spawn_blocking(
+        move || match build_deadlines_from_yaml(&text, &config_inner) {
             Ok(deadlines) => {
                 apply_deadline_fetch_success(&app_inner, state_inner.as_ref(), deadlines);
             }
@@ -255,8 +263,8 @@ pub fn process_deadlines(
                 log::error!("Error parsing Paper Deadlines YAML: {}", e);
                 restore_and_emit_cached_deadlines(&app_inner, &state_inner, &e);
             }
-        }
-    });
+        },
+    );
 }
 
 // --- Paper Deadline Polling Task ---
@@ -288,7 +296,11 @@ pub async fn start_paper_monitor(app: AppHandle, state: Arc<GlobalState>) {
             if let Ok(mut state_deadlines) = state.deadlines.lock() {
                 state_deadlines.clear();
             }
-            let _ = config_store::write_config(&app, DEADLINES_CACHE_FILE, &Vec::<PaperDeadlineInfo>::new());
+            let _ = config_store::write_config(
+                &app,
+                DEADLINES_CACHE_FILE,
+                &Vec::<PaperDeadlineInfo>::new(),
+            );
             let _ = app.emit("paper_update", Vec::<PaperDeadlineInfo>::new());
             let _ = app.emit("paper_error", "");
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -346,21 +358,13 @@ pub async fn start_paper_monitor(app: AppHandle, state: Arc<GlobalState>) {
                     continue;
                 }
                 if let Ok(text) = res.text().await {
-                    log::info!(
-                        "Fetched Paper Deadlines YAML ({} bytes)",
-                        text.len()
-                    );
+                    log::info!("Fetched Paper Deadlines YAML ({} bytes)", text.len());
                     {
                         if let Ok(mut last) = state.last_yaml.lock() {
                             *last = Some(text.clone());
                         }
                     }
-                    process_deadlines(
-                        app.clone(),
-                        state.clone(),
-                        config.clone(),
-                        text,
-                    );
+                    process_deadlines(app.clone(), state.clone(), config.clone(), text);
                     backoff_secs = 60;
                 }
             }

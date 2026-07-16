@@ -56,9 +56,8 @@ fn platform_encrypt(data: &[u8]) -> Result<Vec<u8>, String> {
         )
         .map_err(|e| format!("DPAPI encrypt failed: {}", e))?;
 
-        let encrypted =
-            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
-        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        let encrypted = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
         let _ = LocalFree(Some(HLOCAL(output.pbData as _)));
         Ok(encrypted)
     }
@@ -88,9 +87,8 @@ fn platform_decrypt(data: &[u8]) -> Result<Vec<u8>, String> {
         )
         .map_err(|e| format!("DPAPI decrypt failed: {}", e))?;
 
-        let decrypted =
-            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
-        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        let decrypted = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
         let _ = LocalFree(Some(HLOCAL(output.pbData as _)));
         Ok(decrypted)
     }

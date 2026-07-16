@@ -50,7 +50,7 @@ import { isLiveDataSection, LIVE_DATA_SECTION, refetchSectionLiveDataForSection,
 import { fetchArxivSavedPapers, fetchArxivDiscardedPapers, loadArxivArchiveLists } from "./utils/arxivArchive";
 import { formatArxivKeywordLabel, groupArxivPapersByKeyword } from "./utils/arxivKeywords";
 import type { AppConfig, ArxivConfig, ArxivPaper, GpuConfig, GpuInfo, PaperConfig, PaperDeadlineInfo, QuotaBarDisplay, QuotaConfig, QuotaItem, ServerGpuData } from "./types/config";
-import type { UpdateInfo } from "./types/tauri";
+import type { SidebarDockState, UpdateInfo } from "./types/tauri";
 import { resolveWidgetTheme } from "./utils/widgetTheme";
 import { CACHED_LABELS, cachedLabelWhen, gpuRefreshCachedLabel, messageShowsCached } from "./utils/cachedLabels";
 import { SidebarLink } from "./components/SidebarLink";
@@ -63,6 +63,26 @@ import { WidgetPreviewCard } from "./components/WidgetPreviewCard";
 import { CopyButton } from "./components/CopyButton";
 import { DeadlineCountdown } from "./components/DeadlineCountdown";
 import { deadlineInstanceKey } from "./utils/deadlineKeys";
+import { resolveSidebarTheme, type ResolvedSidebarTheme } from "./utils/sidebarTheme";
+import {
+  compactSidebarTileLayout,
+  findSidebarInsertionGuide,
+  insertSidebarTileAtGuide,
+  reconcileSidebarTileVisibility,
+  resolveSidebarTileCollisions,
+  resizeSidebarTileRect,
+  sidebarRectsOverlap,
+  sidebarRowsFromLayout,
+  sidebarTileWithinBounds,
+  SIDEBAR_TILE_GAP,
+  SIDEBAR_TILE_MIN_HEIGHT,
+  SIDEBAR_TILE_MIN_WIDTH_RATIO,
+  type SidebarCollisionAxis,
+  type SidebarInsertionGuide,
+  type SidebarSectionKey,
+  type SidebarResizeDirection,
+  type SidebarTileRect,
+} from "./utils/sidebarTileLayout";
 import { GPUWidgetContent } from "./widgets/GPUWidgetContent";
 import { DeadlineWidgetContent } from "./widgets/DeadlineWidgetContent";
 import { ArxivWidgetContent } from "./widgets/ArxivWidgetContent";
@@ -135,32 +155,13 @@ const PROVIDER_LOGOS: Record<string, string> = {
   "claude-code": "/icons/claude-code.svg",
 };
 
-const DEFAULT_SIDEBAR_THEME = {
-  background: "#050814",
-  header: "#080d1d",
-  quota: "#06b6d4",
-  gpu: "#3b82f6",
-  deadlines: "#f59e0b",
-  arxiv: "#ec4899",
-};
-
-type SidebarSectionKey = "quota" | "gpu" | "deadlines" | "arxiv";
-
 const DEFAULT_SIDEBAR_ORDER: SidebarSectionKey[] = ["quota", "gpu", "deadlines", "arxiv"];
 
-const SIDEBAR_TILE_GAP = 8;
-const SIDEBAR_TILE_MIN_WIDTH_RATIO = 0.32;
-const SIDEBAR_TILE_MIN_HEIGHT = 152;
 const LEGACY_SIDEBAR_GRID_COLUMNS = 4;
 const LEGACY_SIDEBAR_GRID_GAP = 8;
 const LEGACY_SIDEBAR_GRID_ROW_HEIGHT = 72;
-
-type SidebarTileRect = {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-};
+const SIDEBAR_WINDOW_RESIZE_GUTTER = 16;
+const SIDEBAR_SCROLL_BOTTOM_GAP = 12;
 
 const DEFAULT_SIDEBAR_TILE_LAYOUT: Record<SidebarSectionKey, SidebarTileRect> = {
   quota: { x: 0, y: 0, w: 1, h: 152 },
@@ -172,10 +173,29 @@ const DEFAULT_SIDEBAR_TILE_LAYOUT: Record<SidebarSectionKey, SidebarTileRect> = 
 type SidebarSectionDefinition = {
   key: SidebarSectionKey;
   title: string;
-  icon: ReactNode;
   accentColor: string;
   content: ReactNode;
 };
+
+type NativeResizeDirection =
+  | "North"
+  | "South"
+  | "East"
+  | "West";
+
+const SIDEBAR_RESIZE_HANDLES: Array<{
+  direction: SidebarResizeDirection;
+  className: string;
+}> = [
+  { direction: "n", className: "top-0 left-2 right-2 h-1.5 cursor-n-resize" },
+  { direction: "s", className: "bottom-0 left-2 right-2 h-1.5 cursor-s-resize" },
+  { direction: "e", className: "right-0 top-2 bottom-2 w-1.5 cursor-e-resize" },
+  { direction: "w", className: "left-0 top-2 bottom-2 w-1.5 cursor-w-resize" },
+  { direction: "ne", className: "right-0 top-0 w-2.5 h-2.5 cursor-ne-resize" },
+  { direction: "nw", className: "left-0 top-0 w-2.5 h-2.5 cursor-nw-resize" },
+  { direction: "sw", className: "left-0 bottom-0 w-2.5 h-2.5 cursor-sw-resize" },
+  { direction: "se", className: "right-0 bottom-0 w-5 h-5 cursor-se-resize" },
+];
 
 const normalizeSidebarOrder = (order?: string[]): SidebarSectionKey[] => {
   const keys = new Set<SidebarSectionKey>(DEFAULT_SIDEBAR_ORDER);
@@ -188,12 +208,9 @@ const normalizeSidebarOrder = (order?: string[]): SidebarSectionKey[] => {
   return normalized;
 };
 
-function sidebarRectsOverlap(a: SidebarTileRect, b: SidebarTileRect) {
-  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-}
-
 const normalizeSidebarTileLayout = (
-  layout?: Record<string, Partial<SidebarTileRect>>
+  layout?: Record<string, Partial<SidebarTileRect>>,
+  keys: SidebarSectionKey[] = DEFAULT_SIDEBAR_ORDER
 ): Record<SidebarSectionKey, SidebarTileRect> => {
   const normalizeRect = (key: SidebarSectionKey): SidebarTileRect => {
     const fallback = DEFAULT_SIDEBAR_TILE_LAYOUT[key];
@@ -264,42 +281,35 @@ const normalizeSidebarTileLayout = (
     arxiv: normalizeRect("arxiv"),
   };
 
+  const visibleKeys = [...new Set(keys)];
   const placed: SidebarSectionKey[] = [];
-  for (const key of DEFAULT_SIDEBAR_ORDER) {
-    while (placed.some((otherKey) => sidebarRectsOverlap(result[key], result[otherKey]))) {
-      result[key] = { ...result[key], y: result[key].y + 1 };
+  for (const key of visibleKeys) {
+    let overlapping = placed.filter((otherKey) =>
+      sidebarRectsOverlap(result[key], result[otherKey])
+    );
+    while (overlapping.length > 0) {
+      result[key] = {
+        ...result[key],
+        y: Math.max(
+          ...overlapping.map(
+            (otherKey) => result[otherKey].y + result[otherKey].h + SIDEBAR_TILE_GAP
+          )
+        ),
+      };
+      overlapping = placed.filter((otherKey) =>
+        sidebarRectsOverlap(result[key], result[otherKey])
+      );
     }
     placed.push(key);
   }
 
-  return result;
-};
-
-const sidebarTileFits = (
-  key: SidebarSectionKey,
-  rect: SidebarTileRect,
-  layout: Record<SidebarSectionKey, SidebarTileRect>,
-  visibleKeys: SidebarSectionKey[]
-) => {
-  if (
-    rect.x < 0 ||
-    rect.y < 0 ||
-    rect.w < SIDEBAR_TILE_MIN_WIDTH_RATIO ||
-    rect.h < SIDEBAR_TILE_MIN_HEIGHT
-  ) {
-    return false;
-  }
-  if (rect.x + rect.w > 1) return false;
-  return visibleKeys.every((otherKey) => {
-    if (otherKey === key) return true;
-    return !sidebarRectsOverlap(rect, layout[otherKey]);
-  });
+  return compactSidebarTileLayout(result, visibleKeys);
 };
 
 function SidebarWidgetSection({
   title,
-  icon,
   accentColor,
+  theme,
   isLight,
   onClose,
   onMoveStart,
@@ -307,74 +317,88 @@ function SidebarWidgetSection({
   children,
 }: {
   title: string;
-  icon: ReactNode;
   accentColor: string;
+  theme: ResolvedSidebarTheme;
   isLight: boolean;
   onClose: () => void;
   onMoveStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
-  onResizeStart: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onResizeStart: (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    direction: SidebarResizeDirection
+  ) => void;
   children: ReactNode;
 }) {
   return (
     <section
-      className="h-full min-h-0 rounded-lg border overflow-hidden shadow-sm flex flex-col relative"
+      className="group/sidebar-tile h-full min-h-0 rounded-md border overflow-hidden flex flex-col relative"
       style={{
-        background: isLight
-          ? `linear-gradient(180deg, ${hexToRgba(accentColor, 0.12)}, rgba(255, 255, 255, 0.96))`
-          : `linear-gradient(180deg, ${hexToRgba(accentColor, 0.1)}, rgba(5, 8, 20, 0.98))`,
-        borderColor: hexToRgba(accentColor, isLight ? 0.34 : 0.26),
+        backgroundColor: isLight
+          ? hexToRgba("#ffffff", theme.card_opacity)
+          : hexToRgba(theme.background, theme.card_opacity),
+        borderColor: hexToRgba(accentColor, isLight ? 0.28 : 0.22),
+        boxShadow: `inset 0 2px 0 ${hexToRgba(accentColor, 0.62)}`,
+        backdropFilter: theme.blur > 0 ? `blur(${Math.min(theme.blur, 18)}px) saturate(135%)` : undefined,
+        WebkitBackdropFilter: theme.blur > 0 ? `blur(${Math.min(theme.blur, 18)}px) saturate(135%)` : undefined,
       }}
     >
       <div
-        className="h-8 shrink-0 px-3 flex items-center justify-between border-b cursor-grab active:cursor-grabbing"
+        className="h-5 shrink-0 px-1.5 flex items-center justify-between border-b cursor-grab active:cursor-grabbing touch-none"
         style={{
-          backgroundColor: hexToRgba(accentColor, isLight ? 0.16 : 0.12),
-          borderColor: hexToRgba(accentColor, isLight ? 0.22 : 0.18),
+          backgroundColor: hexToRgba(
+            accentColor,
+            Math.min(0.16, Math.max(0.05, theme.card_opacity * 0.14))
+          ),
+          borderColor: hexToRgba(accentColor, isLight ? 0.16 : 0.12),
         }}
         onPointerDown={onMoveStart}
       >
-        <div className="flex items-center gap-2 min-w-0">
+        <div className="flex items-center gap-1 min-w-0">
           <GripVertical
-            size={13}
+            size={9}
             className={isLight ? "text-slate-400" : "text-slate-500"}
           />
-          <span style={{ color: accentColor }}>{icon}</span>
-          <h2
-            className={`text-[11px] font-black uppercase tracking-widest truncate ${
-              isLight ? "text-slate-800" : "text-white"
-            }`}
-          >
-            {title}
-          </h2>
+          <span
+            className="w-1.5 h-1.5 rounded-full"
+            style={{ backgroundColor: accentColor }}
+          />
+          <span className="sr-only">Move {title}</span>
         </div>
         <div className="flex items-center gap-1" onPointerDown={(event) => event.stopPropagation()}>
           <button
             type="button"
             onClick={onClose}
-            className={`w-6 h-6 flex items-center justify-center rounded-md transition-colors ${
+            className={`w-4 h-4 flex items-center justify-center rounded opacity-45 group-hover/sidebar-tile:opacity-100 focus:opacity-100 transition-all ${
               isLight
                 ? "text-slate-500 hover:text-red-600 hover:bg-red-50"
                 : "text-slate-500 hover:text-white hover:bg-white/10"
             }`}
             title={`Hide ${title}`}
           >
-            <X size={13} />
+            <X size={10} />
           </button>
         </div>
       </div>
-      <div className="flex-1 min-h-0 p-3 overflow-hidden">{children}</div>
-      <button
-        type="button"
-        onPointerDown={onResizeStart}
-        className={`absolute right-1 bottom-1 w-6 h-6 flex items-center justify-center rounded-md cursor-nwse-resize transition-colors ${
-          isLight
-            ? "text-slate-400 hover:text-slate-800 hover:bg-slate-100"
-            : "text-white/30 hover:text-white hover:bg-white/10"
-        }`}
-        title={`Resize ${title}`}
-      >
-        <Maximize2 size={12} />
-      </button>
+      <div className="flex-1 min-h-0 p-2 overflow-hidden">{children}</div>
+      {SIDEBAR_RESIZE_HANDLES.map((handle) => (
+        <button
+          key={handle.direction}
+          type="button"
+          onPointerDown={(event) => onResizeStart(event, handle.direction)}
+          className={`absolute z-30 touch-none transition-colors ${handle.className} ${
+            handle.direction === "se"
+              ? `flex items-center justify-center rounded-md opacity-55 group-hover/sidebar-tile:opacity-100 ${
+                  isLight
+                    ? "text-slate-500 hover:text-slate-900 hover:bg-slate-100/80"
+                    : "text-white/50 hover:text-white hover:bg-white/10"
+                }`
+              : "opacity-0 hover:opacity-100 hover:bg-blue-400/25"
+          }`}
+          aria-label={`Resize ${title} from ${handle.direction}`}
+          title={`Resize ${title}`}
+        >
+          {handle.direction === "se" ? <Maximize2 size={12} /> : null}
+        </button>
+      ))}
     </section>
   );
 }
@@ -556,9 +580,30 @@ function App() {
   const [sidebarTileLayoutDraft, setSidebarTileLayoutDraft] =
     useState<Record<SidebarSectionKey, SidebarTileRect> | null>(null);
   const [activeSidebarTile, setActiveSidebarTile] = useState<SidebarSectionKey | null>(null);
+  const [sidebarTileDragPreview, setSidebarTileDragPreview] = useState<{
+    key: SidebarSectionKey;
+    rect: SidebarTileRect;
+  } | null>(null);
+  const [sidebarInsertionGuide, setSidebarInsertionGuide] =
+    useState<SidebarInsertionGuide | null>(null);
+  const [sidebarDockState, setSidebarDockState] = useState<SidebarDockState>({
+    edge: "right",
+    pinned: false,
+    expanded: false,
+    dragging: false,
+    preview_edge: null,
+  });
   const sidebarOrderRef = useRef<SidebarSectionKey[]>(DEFAULT_SIDEBAR_ORDER);
   const sidebarBoardRef = useRef<HTMLDivElement | null>(null);
+  const sidebarScrollRef = useRef<HTMLDivElement | null>(null);
   const prevActiveTabRef = useRef(activeTab);
+
+  // Any persisted sidebar layout update (including one made in the Settings
+  // window) supersedes a local drag draft. Keeping an old draft was the cause
+  // of hidden tiles reappearing at stale, overlapping coordinates.
+  useEffect(() => {
+    setSidebarTileLayoutDraft(null);
+  }, [appConfig.sidebar_tile_layout, appConfig.sidebar_widgets, appConfig.sidebar_order]);
 
   useEffect(() => {
     const prevTab = prevActiveTabRef.current;
@@ -714,6 +759,13 @@ function App() {
             setCurrentTheme(resolveWidgetTheme(config, label));
           });
           unlisteners.push(() => uTheme());
+          const uAppConfig = await tauriListen("app_config_update", (event) => {
+            if (!active) return;
+            const nextConfig = event.payload;
+            setAppConfig(nextConfig);
+            setIsPinned(nextConfig.always_on_top?.[label] ?? false);
+          });
+          unlisteners.push(() => uAppConfig());
           return;
         }
 
@@ -1049,6 +1101,44 @@ function App() {
     await tauriInvoke("save_app_config", { config });
   };
 
+  const saveSidebarWidgetVisibility = async (key: SidebarSectionKey, visible: boolean) => {
+    const sidebarWidgets = appConfig.sidebar_widgets || {};
+    const currentOrder = normalizeSidebarOrder(appConfig.sidebar_order);
+    const currentVisibleKeys = currentOrder.filter(
+      (candidateKey) => sidebarWidgets[candidateKey] !== false
+    );
+    const alreadyVisible = currentVisibleKeys.includes(key);
+    if (alreadyVisible === visible) return;
+
+    // Re-enabled widgets are intentionally ordered last so their freshly
+    // allocated tile becomes the new bottom row rather than revisiting a
+    // historic coordinate near the top of the board.
+    const nextOrder = visible
+      ? [...currentOrder.filter((candidateKey) => candidateKey !== key), key]
+      : currentOrder;
+    const nextWidgets = { ...sidebarWidgets, [key]: visible };
+    const nextVisibleKeys = nextOrder.filter(
+      (candidateKey) => nextWidgets[candidateKey] !== false
+    );
+    const sourceLayout =
+      sidebarTileLayoutDraft ??
+      normalizeSidebarTileLayout(appConfig.sidebar_tile_layout, currentVisibleKeys);
+    const nextLayout = reconcileSidebarTileVisibility(
+      sourceLayout,
+      currentVisibleKeys,
+      nextVisibleKeys
+    );
+
+    sidebarOrderRef.current = nextOrder;
+    setSidebarTileLayoutDraft(nextLayout);
+    await onSaveApp({
+      ...appConfig,
+      sidebar_order: nextOrder,
+      sidebar_tile_layout: nextLayout,
+      sidebar_widgets: nextWidgets,
+    });
+  };
+
   const handleMasterServiceToggle = createMasterServiceToggleHandler({
     appConfig,
     onSaveApp,
@@ -1225,12 +1315,14 @@ function App() {
         await tauriInvoke("set_desktop_mode", { label: targetLabel, enabled: true });
       }
 
+      const nextConfig = await tauriInvoke("set_widget_always_on_top", {
+        label: targetLabel,
+        pinned: next,
+      });
+      setAppConfig(nextConfig);
       if (targetLabel === windowLabel) {
         setIsPinned(next);
       }
-
-      const nextStates = { ...(appConfig.always_on_top || {}), [targetLabel]: next };
-      await onSaveApp({ ...appConfig, always_on_top: nextStates });
     } catch (e) {
       console.error(e);
     }
@@ -1259,6 +1351,12 @@ function App() {
     if (e.button === 0 && !target.closest('[data-no-drag="true"]')) {
       try {
         console.log("Start dragging");
+        if (windowLabel === "sidebar") {
+          e.preventDefault();
+          const nextState = await tauriInvoke("begin_sidebar_drag");
+          setSidebarDockState(nextState);
+          return;
+        }
         await getCurrentWindow().startDragging();
       } catch (e) {
         console.error("Drag failed", e);
@@ -1277,6 +1375,31 @@ function App() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
+  }, [windowLabel]);
+
+  useEffect(() => {
+    if (windowLabel !== "sidebar") return;
+
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    const initializeDockState = async () => {
+      const stopListening = await tauriListen("sidebar_state_update", (event) => {
+        if (active) setSidebarDockState(event.payload);
+      });
+      if (!active) {
+        stopListening();
+        return;
+      }
+      unlisten = stopListening;
+      const state = await tauriInvoke("get_sidebar_state");
+      if (active) setSidebarDockState(state);
+    };
+    initializeDockState().catch(console.error);
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, [windowLabel]);
 
   // --- CUSTOM TRAY MENU VIEW ---
@@ -1319,79 +1442,178 @@ function App() {
     const openDashboard = async () => {
       await tauriInvoke("show_main");
     };
-    const sidebarTheme = { ...DEFAULT_SIDEBAR_THEME, ...(appConfig.sidebar_theme || {}) };
+    const sidebarTheme = resolveSidebarTheme(appConfig.sidebar_theme);
     const sidebarIsLight = isLightColor(sidebarTheme.background);
-    const sidebarWidgets = appConfig.sidebar_widgets || {};
-    const sidebarOrder = normalizeSidebarOrder(appConfig.sidebar_order);
-    const sidebarTileLayout =
-      sidebarTileLayoutDraft ?? normalizeSidebarTileLayout(appConfig.sidebar_tile_layout);
-    sidebarOrderRef.current = sidebarOrder;
-    const updateSidebarWidget = async (key: string, visible: boolean) => {
-      await onSaveApp({
-        ...appConfig,
-        sidebar_order: sidebarOrderRef.current,
-        sidebar_tile_layout: sidebarTileLayout,
-        sidebar_widgets: {
-          ...sidebarWidgets,
-          [key]: visible,
-        },
-      });
+    const sidebarWindowBorder = sidebarIsLight
+      ? "rgba(203, 213, 225, 0.96)"
+      : "rgba(255, 255, 255, 0.4)";
+    const sidebarHiddenTransform: Record<SidebarDockState["edge"], string> = {
+      left: "translate3d(-100%, 0, 0)",
+      top: "translate3d(0, -100%, 0)",
+      right: "translate3d(100%, 0, 0)",
+      bottom: "translate3d(0, 100%, 0)",
     };
+    const sidebarDockRounding: Record<SidebarDockState["edge"], string> = {
+      left: "rounded-r-lg",
+      top: "rounded-b-lg",
+      right: "rounded-l-lg",
+      bottom: "rounded-t-lg",
+    };
+    // The controls live in an invisible, generous hover target on the free
+    // edge. The compact buttons themselves only appear when the cursor is
+    // nearby, so the sidebar keeps its clean, frameless surface at rest.
+    const sidebarEdgeControlPlacement: Record<SidebarDockState["edge"], string> = {
+      left: "right-0 top-1/2 -translate-y-1/2 h-28 w-10",
+      top: "bottom-0 left-1/2 -translate-x-1/2 h-10 w-28",
+      right: "left-0 top-1/2 -translate-y-1/2 h-28 w-10",
+      bottom: "top-0 left-1/2 -translate-x-1/2 h-10 w-28",
+    };
+    const sidebarPinHandleShape: Record<SidebarDockState["edge"], string> = {
+      left: "h-12 w-7 rounded-l-full border-y border-l",
+      top: "h-7 w-12 rounded-t-full border-x border-t",
+      right: "h-12 w-7 rounded-r-full border-y border-r",
+      bottom: "h-7 w-12 rounded-b-full border-x border-b",
+    };
+    const sidebarPinHandlePosition: Record<SidebarDockState["edge"], string> = {
+      left: "absolute right-0 top-1/2 -translate-y-1/2",
+      top: "absolute bottom-0 left-1/2 -translate-x-1/2",
+      right: "absolute left-0 top-1/2 -translate-y-1/2",
+      bottom: "absolute top-0 left-1/2 -translate-x-1/2",
+    };
+    // Follow the free edge clockwise: right-docked puts Close above Pin,
+    // with the other edges rotating this relationship naturally.
+    const sidebarCloseButtonPosition: Record<SidebarDockState["edge"], string> = {
+      left: "absolute right-0 bottom-0",
+      top: "absolute bottom-0 left-0",
+      right: "absolute left-0 top-0",
+      bottom: "absolute right-0 top-0",
+    };
+    const sidebarEdgeLabels: Record<SidebarDockState["edge"], string> = {
+      left: "left",
+      top: "top",
+      right: "right",
+      bottom: "bottom",
+    };
+    const sidebarDragMessage = sidebarDockState.preview_edge
+      ? "Release to dock on the " + sidebarEdgeLabels[sidebarDockState.preview_edge] + " edge"
+      : "Move toward any screen edge to preview docking";
+    // Keep resize hit targets thin (h-1.5 / w-1.5). The previous h-4 / w-4
+    // strips covered most of the top drag header and stole window moves.
+    const sidebarWindowResizeHandles: Array<{
+      direction: NativeResizeDirection;
+      className: string;
+      cursor: "ns-resize" | "ew-resize";
+      label: string;
+    }> = sidebarDockState.edge === "left" || sidebarDockState.edge === "right"
+      ? [
+          {
+            direction: "North",
+            className: "top-0 left-3 right-3 h-1.5",
+            cursor: "ns-resize",
+            label: "Resize sidebar from top edge",
+          },
+          {
+            direction: "South",
+            className: "bottom-0 left-3 right-3 h-1.5",
+            cursor: "ns-resize",
+            label: "Resize sidebar from bottom edge",
+          },
+        ]
+      : [
+          {
+            direction: "West",
+            className: "left-0 top-3 bottom-3 w-1.5",
+            cursor: "ew-resize",
+            label: "Resize sidebar from left edge",
+          },
+          {
+            direction: "East",
+            className: "right-0 top-3 bottom-3 w-1.5",
+            cursor: "ew-resize",
+            label: "Resize sidebar from right edge",
+          },
+        ];
+    const sidebarWidgets = appConfig.sidebar_widgets || {};
+    const hideSidebarWidgetHeaders = appConfig.sidebar_hide_widget_headers === true;
+    const sidebarOrder = normalizeSidebarOrder(appConfig.sidebar_order);
+    const visibleSidebarKeys = sidebarOrder.filter(
+      (key) => sidebarWidgets[key] !== false
+    );
+    const sidebarTileLayout =
+      sidebarTileLayoutDraft ??
+      normalizeSidebarTileLayout(appConfig.sidebar_tile_layout, visibleSidebarKeys);
+    sidebarOrderRef.current = sidebarOrder;
     const allSidebarSections: SidebarSectionDefinition[] = [
       {
         key: "quota",
         title: "Quota Monitor",
-        icon: <Gauge size={14} />,
         accentColor: sidebarTheme.quota,
-        content: <QuotaWidgetContent />,
+        content: <QuotaWidgetContent hideHeader={hideSidebarWidgetHeaders} />,
       },
       {
         key: "gpu",
         title: "GPU Monitor",
-        icon: <Cpu size={14} />,
         accentColor: sidebarTheme.gpu,
-        content: <GPUWidgetContent />,
+        content: <GPUWidgetContent hideHeader={hideSidebarWidgetHeaders} />,
       },
       {
         key: "deadlines",
         title: "Deadlines",
-        icon: <Trophy size={14} />,
         accentColor: sidebarTheme.deadlines,
-        content: <DeadlineWidgetContent />,
+        content: <DeadlineWidgetContent hideHeader={hideSidebarWidgetHeaders} />,
       },
       {
         key: "arxiv",
         title: "Arxiv Radar",
-        icon: <Activity size={14} />,
         accentColor: sidebarTheme.arxiv,
-        content: <ArxivWidgetContent />,
+        content: (
+          <ArxivWidgetContent
+            hideHeader={hideSidebarWidgetHeaders}
+            appearance={sidebarIsLight ? "light" : "dark"}
+          />
+        ),
       },
     ];
     const sectionByKey = new Map(allSidebarSections.map((section) => [section.key, section]));
-    const sidebarSections = sidebarOrder
+    const sidebarSections = visibleSidebarKeys
       .map((key) => sectionByKey.get(key))
-      .filter((section): section is SidebarSectionDefinition =>
-        Boolean(section && sidebarWidgets[section.key] !== false)
-      );
-    const visibleSidebarKeys = sidebarSections.map((section) => section.key);
+      .filter((section): section is SidebarSectionDefinition => Boolean(section));
+    const dragPreviewBottom = sidebarTileDragPreview
+      ? sidebarTileDragPreview.rect.y + sidebarTileDragPreview.rect.h + 48
+      : 0;
     const boardRows = Math.max(
-      640,
+      480,
+      dragPreviewBottom,
       ...visibleSidebarKeys.map((key) => sidebarTileLayout[key].y + sidebarTileLayout[key].h)
     );
-    const boardHeight = boardRows;
+    // Keep the final tile visibly clear of the window frame. This space belongs
+    // to the scrollable content, so it remains present at the end of the list.
+    const boardHeight = boardRows + SIDEBAR_SCROLL_BOTTOM_GAP;
     const getSidebarGridMetrics = () => {
       const board = sidebarBoardRef.current;
       if (!board) return null;
       return {
+        board,
         width: board.clientWidth,
       };
     };
-    const saveSidebarTileLayout = (nextLayout: Record<SidebarSectionKey, SidebarTileRect>) => {
-      setSidebarTileLayoutDraft(nextLayout);
+    const saveSidebarTileLayout = (
+      nextLayout: Record<SidebarSectionKey, SidebarTileRect>,
+      nextVisibleOrder?: SidebarSectionKey[]
+    ) => {
+      const nextOrder = nextVisibleOrder
+        ? [
+            ...nextVisibleOrder,
+            ...sidebarOrderRef.current.filter((key) => !nextVisibleOrder.includes(key)),
+          ]
+        : sidebarOrderRef.current;
+      const compactedLayout = compactSidebarTileLayout(nextLayout, visibleSidebarKeys);
+      sidebarOrderRef.current = nextOrder;
+      setSidebarTileLayoutDraft(compactedLayout);
       onSaveApp({
         ...appConfig,
-        sidebar_order: sidebarOrderRef.current,
-        sidebar_tile_layout: nextLayout,
+        sidebar_order: nextOrder,
+        sidebar_tile_layout: compactedLayout,
       }).catch(console.error);
     };
     const startSidebarTileMove = (
@@ -1399,47 +1621,108 @@ function App() {
       key: SidebarSectionKey
     ) => {
       const metrics = getSidebarGridMetrics();
-      if (!metrics) return;
+      if (!metrics || event.button !== 0) return;
       event.preventDefault();
       event.stopPropagation();
-      event.currentTarget.setPointerCapture(event.pointerId);
+      const dragTarget = event.currentTarget;
+      const pointerId = event.pointerId;
+      dragTarget.setPointerCapture(pointerId);
       setActiveSidebarTile(key);
 
-      const startX = event.clientX;
-      const startY = event.clientY;
       const startRect = sidebarTileLayout[key];
-      let latestLayout = sidebarTileLayout;
+      const boardRect = metrics.board.getBoundingClientRect();
+      const grabOffsetX = event.clientX - (boardRect.left + startRect.x * metrics.width);
+      const grabOffsetY = event.clientY - (boardRect.top + startRect.y);
+      let latestPreview = startRect;
+      let latestGuide: SidebarInsertionGuide | null = null;
+      setSidebarTileDragPreview({ key, rect: startRect });
+      setSidebarInsertionGuide(null);
 
       const onPointerMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId) return;
+        const scrollContainer = sidebarScrollRef.current;
+        if (scrollContainer) {
+          const scrollRect = scrollContainer.getBoundingClientRect();
+          if (moveEvent.clientY < scrollRect.top + 44) {
+            scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollTop - 18);
+          } else if (moveEvent.clientY > scrollRect.bottom - 44) {
+            scrollContainer.scrollTop += 18;
+          }
+        }
+        const liveBoardRect = metrics.board.getBoundingClientRect();
+        const nextX = (moveEvent.clientX - liveBoardRect.left - grabOffsetX) / metrics.width;
         const nextRect = {
           ...startRect,
-          x: Math.min(1 - startRect.w, Math.max(0, startRect.x + (moveEvent.clientX - startX) / metrics.width)),
-          y: Math.max(0, startRect.y + (moveEvent.clientY - startY)),
+          x: Math.round(Math.min(1 - startRect.w, Math.max(0, nextX)) * 1000) / 1000,
+          y: Math.round(Math.max(0, moveEvent.clientY - liveBoardRect.top - grabOffsetY)),
         };
-        if (!sidebarTileFits(key, nextRect, latestLayout, visibleSidebarKeys)) return;
-        latestLayout = { ...latestLayout, [key]: nextRect };
-        setSidebarTileLayoutDraft(latestLayout);
+        if (!sidebarTileWithinBounds(nextRect)) return;
+        latestPreview = nextRect;
+        latestGuide = findSidebarInsertionGuide(
+          moveEvent.clientX - liveBoardRect.left,
+          moveEvent.clientY - liveBoardRect.top,
+          sidebarTileLayout,
+          visibleSidebarKeys,
+          key,
+          metrics.width
+        );
+        setSidebarTileDragPreview({ key, rect: nextRect });
+        setSidebarInsertionGuide(latestGuide);
       };
 
-      const onPointerUp = () => {
+      const cleanup = () => {
         window.removeEventListener("pointermove", onPointerMove);
         window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerCancel);
+        window.removeEventListener("blur", onWindowBlur);
+        if (dragTarget.hasPointerCapture(pointerId)) {
+          dragTarget.releasePointerCapture(pointerId);
+        }
         setActiveSidebarTile(null);
-        saveSidebarTileLayout(latestLayout);
+        setSidebarTileDragPreview(null);
+        setSidebarInsertionGuide(null);
+      };
+      const onPointerUp = () => {
+        cleanup();
+        if (!latestGuide) {
+          setSidebarTileLayoutDraft(sidebarTileLayout);
+          return;
+        }
+        const inserted = insertSidebarTileAtGuide(
+          sidebarTileLayout,
+          visibleSidebarKeys,
+          key,
+          latestGuide,
+          latestPreview
+        );
+        saveSidebarTileLayout(inserted.layout, inserted.order);
+      };
+      const onPointerCancel = () => {
+        cleanup();
+        setSidebarTileLayoutDraft(sidebarTileLayout);
+      };
+      const onWindowBlur = () => {
+        cleanup();
+        setSidebarTileLayoutDraft(sidebarTileLayout);
       };
 
       window.addEventListener("pointermove", onPointerMove);
-      window.addEventListener("pointerup", onPointerUp, { once: true });
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerCancel);
+      window.addEventListener("blur", onWindowBlur, { once: true });
     };
     const startSidebarTileResize = (
       event: ReactPointerEvent<HTMLButtonElement>,
-      key: SidebarSectionKey
+      key: SidebarSectionKey,
+      direction: SidebarResizeDirection
     ) => {
       const metrics = getSidebarGridMetrics();
-      if (!metrics) return;
+      if (!metrics || event.button !== 0) return;
       event.preventDefault();
       event.stopPropagation();
-      event.currentTarget.setPointerCapture(event.pointerId);
+      const resizeTarget = event.currentTarget;
+      const pointerId = event.pointerId;
+      resizeTarget.setPointerCapture(pointerId);
       setActiveSidebarTile(key);
 
       const startX = event.clientX;
@@ -1448,106 +1731,273 @@ function App() {
       let latestLayout = sidebarTileLayout;
 
       const onPointerMove = (moveEvent: PointerEvent) => {
-        const minWidthRatio = Math.min(0.95, Math.max(SIDEBAR_TILE_MIN_WIDTH_RATIO, 180 / metrics.width));
-        const nextRect = {
-          ...startRect,
-          w: Math.min(
-            1 - startRect.x,
-            Math.max(
-              minWidthRatio,
-              startRect.w + (moveEvent.clientX - startX) / metrics.width
-            )
-          ),
-          h: Math.max(
-            SIDEBAR_TILE_MIN_HEIGHT,
-            startRect.h + (moveEvent.clientY - startY)
-          ),
-        };
-        if (!sidebarTileFits(key, nextRect, latestLayout, visibleSidebarKeys)) return;
-        latestLayout = { ...latestLayout, [key]: nextRect };
+        if (moveEvent.pointerId !== pointerId) return;
+        const deltaXPixels = moveEvent.clientX - startX;
+        const deltaYPixels = moveEvent.clientY - startY;
+        const nextRect = resizeSidebarTileRect(
+          startRect,
+          direction,
+          deltaXPixels,
+          deltaYPixels,
+          metrics.width
+        );
+        if (!sidebarTileWithinBounds(nextRect)) return;
+        const hasHorizontalEdge = direction.includes("e") || direction.includes("w");
+        const hasVerticalEdge = direction.includes("n") || direction.includes("s");
+        const preferredAxis: SidebarCollisionAxis =
+          hasHorizontalEdge && !hasVerticalEdge
+            ? "horizontal"
+            : hasVerticalEdge && !hasHorizontalEdge
+              ? "vertical"
+              : Math.abs(deltaXPixels) > Math.abs(deltaYPixels)
+                ? "horizontal"
+                : "vertical";
+        latestLayout = resolveSidebarTileCollisions(
+          key,
+          nextRect,
+          sidebarTileLayout,
+          visibleSidebarKeys,
+          metrics.width,
+          preferredAxis
+        );
         setSidebarTileLayoutDraft(latestLayout);
       };
 
-      const onPointerUp = () => {
+      const cleanup = () => {
         window.removeEventListener("pointermove", onPointerMove);
         window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerCancel);
+        window.removeEventListener("blur", onWindowBlur);
+        if (resizeTarget.hasPointerCapture(pointerId)) {
+          resizeTarget.releasePointerCapture(pointerId);
+        }
         setActiveSidebarTile(null);
+      };
+      const onPointerUp = () => {
+        cleanup();
+        saveSidebarTileLayout(latestLayout);
+      };
+      const onPointerCancel = () => {
+        cleanup();
+        setSidebarTileLayoutDraft(sidebarTileLayout);
+      };
+      const onWindowBlur = () => {
+        cleanup();
         saveSidebarTileLayout(latestLayout);
       };
 
       window.addEventListener("pointermove", onPointerMove);
-      window.addEventListener("pointerup", onPointerUp, { once: true });
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerCancel);
+      window.addEventListener("blur", onWindowBlur, { once: true });
     };
+
+    const insertionGuideStyle = (() => {
+      if (!sidebarInsertionGuide) return null;
+      const targetRect = sidebarTileLayout[sidebarInsertionGuide.targetKey];
+      const isColumnGuide =
+        sidebarInsertionGuide.placement === "left" ||
+        sidebarInsertionGuide.placement === "right";
+      if (isColumnGuide) {
+        const edge =
+          sidebarInsertionGuide.placement === "left"
+            ? targetRect.x
+            : targetRect.x + targetRect.w;
+        return {
+          left: `calc(${edge * 100}% - 2px)`,
+          top: targetRect.y + 4,
+          width: 3,
+          height: Math.max(24, targetRect.h - 8),
+        };
+      }
+
+      const guideRows = sidebarRowsFromLayout(
+        sidebarTileLayout,
+        visibleSidebarKeys.filter((key) => key !== activeSidebarTile)
+      );
+      const targetRow = guideRows.find((row) =>
+        row.keys.includes(sidebarInsertionGuide.targetKey)
+      );
+      const edge =
+        sidebarInsertionGuide.placement === "above"
+          ? targetRow?.top ?? targetRect.y
+          : targetRow?.bottom ?? targetRect.y + targetRect.h;
+      return {
+        left: 0,
+        top: edge - 2,
+        width: `calc(100% - ${SIDEBAR_TILE_GAP}px)`,
+        height: 3,
+      };
+    })();
 
     return (
       <div
-        className={`absolute inset-0 flex flex-col overflow-hidden border rounded-l-lg shadow-2xl select-none ${
+        className={`absolute inset-0 relative flex flex-col overflow-hidden select-none transition-[transform,box-shadow,outline-color] duration-150 ease-out will-change-transform ${sidebarDockRounding[sidebarDockState.edge]} ${
           sidebarIsLight ? "text-slate-900" : "text-white"
         }`}
         style={{
-          backgroundColor: sidebarTheme.background,
-          borderColor: sidebarIsLight
-            ? hexToRgba(sidebarTheme.header, 0.28)
-            : hexToRgba(sidebarTheme.header, 0.9),
+          backgroundColor: hexToRgba(
+            sidebarTheme.background,
+            sidebarTheme.background_opacity
+          ),
+          backdropFilter:
+            sidebarTheme.blur > 0
+              ? `blur(${sidebarTheme.blur}px) saturate(145%)`
+              : undefined,
+          WebkitBackdropFilter:
+            sidebarTheme.blur > 0
+              ? `blur(${sidebarTheme.blur}px) saturate(145%)`
+              : undefined,
+          border: `1px solid ${sidebarWindowBorder}`,
+          // This is the same inset highlight treatment used by the Dashboard
+          // frame, rendered directly so it remains visible in this transparent
+          // webview without adding a drop shadow.
+          boxShadow: `inset 0 0 0 1px ${sidebarWindowBorder}`,
+          outline: sidebarDockState.dragging ? "2px solid rgba(56, 189, 248, 0.72)" : undefined,
+          outlineOffset: sidebarDockState.dragging ? "-2px" : undefined,
+          transform: sidebarDockState.expanded
+            ? "translate3d(0, 0, 0)"
+            : sidebarHiddenTransform[sidebarDockState.edge],
         }}
       >
-        <header
-          className="h-14 shrink-0 px-4 flex items-center justify-between border-b"
-          style={{
-            backgroundColor: sidebarTheme.header,
-            borderColor: sidebarIsLight
-              ? hexToRgba(sidebarTheme.header, 0.28)
-              : hexToRgba(sidebarTheme.header, 0.9),
-          }}
-          onMouseDown={startDrag}
-          data-tauri-drag-region="true"
+        {sidebarWindowResizeHandles.map((handle) => (
+          <div
+            key={handle.direction}
+            role="separator"
+            aria-label={handle.label}
+            data-no-drag="true"
+            className={`absolute z-[70] bg-transparent transition-colors hover:bg-sky-400/15 ${handle.className}`}
+            style={{ cursor: handle.cursor, touchAction: "none" }}
+            onPointerDown={(event) => {
+              if (event.button !== 0) return;
+              event.preventDefault();
+              event.stopPropagation();
+              getCurrentWindow().startResizeDragging(handle.direction).catch((error) => {
+                console.error("Sidebar resize failed", error);
+              });
+            }}
+          />
+        ))}
+        <div
+          data-no-drag="true"
+          className={`group absolute z-40 ${sidebarEdgeControlPlacement[sidebarDockState.edge]}`}
         >
-          <div className="flex items-center gap-2.5 pointer-events-none min-w-0">
-            <div className="w-8 h-8 rounded-lg overflow-hidden bg-blue-600 shadow-lg shadow-cyan-500/20">
-              <img src="/logo.png" alt="Widgitron" className="w-full h-full object-cover" />
-            </div>
-            <div className="min-w-0">
-              <h1 className="text-sm font-black leading-none truncate">Widgitron Hub</h1>
-              <div
-                className={`text-[9px] font-black uppercase tracking-widest mt-1 ${
-                  sidebarIsLight ? "text-slate-500" : "text-slate-500"
-                }`}
-              >
-                {appConfig.sidebar_hotkey || "Ctrl+Alt+W"}
+          <button
+            type="button"
+            data-no-drag="true"
+            aria-label={sidebarDockState.pinned ? "Unpin sidebar" : "Pin sidebar open"}
+            title={
+              sidebarDockState.pinned
+                ? "Unpin sidebar and enable auto-hide"
+                : "Pin sidebar open"
+            }
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              tauriInvoke("set_sidebar_pinned", { pinned: !sidebarDockState.pinned })
+                .then(setSidebarDockState)
+                .catch(console.error);
+            }}
+            className={`flex shrink-0 items-center justify-center shadow-lg opacity-0 scale-90 transition-all duration-200 group-hover:opacity-100 group-hover:scale-100 hover:brightness-110 focus-visible:opacity-100 focus-visible:scale-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/80 ${sidebarPinHandlePosition[sidebarDockState.edge]} ${sidebarPinHandleShape[sidebarDockState.edge]} ${
+              sidebarIsLight
+                ? "text-slate-600 hover:text-slate-950"
+                : "text-slate-300 hover:text-white"
+            }`}
+            style={{
+              backgroundColor: hexToRgba(
+                sidebarTheme.background,
+                Math.min(1, sidebarTheme.background_opacity + 0.06)
+              ),
+              borderColor: sidebarIsLight
+                ? hexToRgba(sidebarTheme.header, 0.34)
+                : hexToRgba("#ffffff", 0.14),
+              backdropFilter:
+                sidebarTheme.blur > 0
+                  ? `blur(${sidebarTheme.blur}px) saturate(145%)`
+                  : undefined,
+              WebkitBackdropFilter:
+                sidebarTheme.blur > 0
+                  ? `blur(${sidebarTheme.blur}px) saturate(145%)`
+                  : undefined,
+            }}
+          >
+            {sidebarDockState.pinned ? <PinOff size={13} /> : <Pin size={13} />}
+          </button>
+          <button
+            type="button"
+            data-no-drag="true"
+            aria-label="Close sidebar"
+            title="Close sidebar"
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              tauriInvoke("hide_sidebar").catch(console.error);
+            }}
+            className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-red-200/35 bg-red-500/85 text-white shadow-lg opacity-0 scale-90 transition-all duration-200 group-hover:opacity-100 group-hover:scale-100 hover:bg-red-500 focus-visible:opacity-100 focus-visible:scale-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300/90 ${sidebarCloseButtonPosition[sidebarDockState.edge]}`}
+          >
+            <X size={13} strokeWidth={2.5} />
+          </button>
+        </div>
+        {/* Deliberately blank: the parent owns the translucent frosted surface,
+            so this drag strip has no separate tint, blur layer, or divider. */}
+        <header
+          aria-label="Drag sidebar"
+          className="h-4 shrink-0 cursor-grab active:cursor-grabbing"
+          onMouseDown={startDrag}
+        />
+        {sidebarDockState.dragging ? (
+          <div className="absolute inset-2 z-50 pointer-events-none rounded-md border border-dashed border-sky-300/80 bg-sky-400/10">
+            <span
+              className={"absolute left-1/2 top-2 -translate-x-1/2 rounded-full px-2 py-1 text-[8px] font-black uppercase tracking-[0.16em] transition-colors " + (
+                sidebarDockState.preview_edge === "top"
+                  ? "bg-sky-400 text-slate-950 shadow-lg shadow-sky-400/50"
+                  : "bg-slate-950/65 text-sky-100/80"
+              )}
+            >
+              Top
+            </span>
+            <span
+              className={"absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full px-2 py-1 text-[8px] font-black uppercase tracking-[0.16em] transition-colors " + (
+                sidebarDockState.preview_edge === "bottom"
+                  ? "bg-sky-400 text-slate-950 shadow-lg shadow-sky-400/50"
+                  : "bg-slate-950/65 text-sky-100/80"
+              )}
+            >
+              Bottom
+            </span>
+            <span
+              className={"absolute left-2 top-1/2 -translate-y-1/2 rounded-full px-2 py-1 text-[8px] font-black uppercase tracking-[0.16em] transition-colors " + (
+                sidebarDockState.preview_edge === "left"
+                  ? "bg-sky-400 text-slate-950 shadow-lg shadow-sky-400/50"
+                  : "bg-slate-950/65 text-sky-100/80"
+              )}
+            >
+              Left
+            </span>
+            <span
+              className={"absolute right-2 top-1/2 -translate-y-1/2 rounded-full px-2 py-1 text-[8px] font-black uppercase tracking-[0.16em] transition-colors " + (
+                sidebarDockState.preview_edge === "right"
+                  ? "bg-sky-400 text-slate-950 shadow-lg shadow-sky-400/50"
+                  : "bg-slate-950/65 text-sky-100/80"
+              )}
+            >
+              Right
+            </span>
+            <div className="absolute left-1/2 top-1/2 w-[min(19rem,calc(100%-3.5rem))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-sky-200/40 bg-slate-950/85 px-4 py-3 text-center text-white shadow-2xl shadow-slate-950/45">
+              <div className="text-[9px] font-black uppercase tracking-[0.2em] text-sky-300">
+                {sidebarDockState.preview_edge ? "Dock target ready" : "Moving sidebar"}
+              </div>
+              <div className="mt-1 text-[11px] font-bold leading-snug">
+                {sidebarDragMessage}
               </div>
             </div>
           </div>
-
-          <div className="flex items-center gap-1.5" data-no-drag="true">
-            <button
-              type="button"
-              onClick={openDashboard}
-              className={`w-8 h-8 flex items-center justify-center rounded-md border transition-colors ${
-                sidebarIsLight
-                  ? "bg-white border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-50"
-                  : "bg-slate-800 border-slate-600 text-slate-300 hover:text-white hover:bg-slate-700"
-              }`}
-              title="Open dashboard"
-            >
-              <LayoutDashboard size={15} />
-            </button>
-            <button
-              type="button"
-              onClick={handleClose}
-              className={`w-8 h-8 flex items-center justify-center rounded-md border transition-colors ${
-                sidebarIsLight
-                  ? "bg-white border-slate-200 text-slate-600 hover:text-white hover:bg-red-600"
-                  : "bg-slate-800 border-slate-600 text-slate-300 hover:text-white hover:bg-red-600"
-              }`}
-              title="Hide sidebar"
-            >
-              <X size={16} />
-            </button>
-          </div>
-        </header>
+        ) : null}
 
         <div
-          className="flex-1 min-h-0 overflow-y-auto custom-scrollbar p-3"
+          ref={sidebarScrollRef}
+          className="flex-1 min-h-0 overflow-y-auto custom-scrollbar px-2 pt-2"
+          style={{ marginBottom: SIDEBAR_WINDOW_RESIZE_GUTTER }}
           data-no-drag="true"
         >
           {sidebarSections.length > 0 ? (
@@ -1557,7 +2007,10 @@ function App() {
               style={{ height: boardHeight }}
             >
               {sidebarSections.map((section) => {
-                const rect = sidebarTileLayout[section.key];
+                const rect =
+                  sidebarTileDragPreview?.key === section.key
+                    ? sidebarTileDragPreview.rect
+                    : sidebarTileLayout[section.key];
                 const isActive = activeSidebarTile === section.key;
                 return (
                   <div
@@ -1576,18 +2029,28 @@ function App() {
                   >
                     <SidebarWidgetSection
                       title={section.title}
-                      icon={section.icon}
                       accentColor={section.accentColor}
+                      theme={sidebarTheme}
                       isLight={sidebarIsLight}
-                      onClose={() => updateSidebarWidget(section.key, false)}
+                      onClose={() => saveSidebarWidgetVisibility(section.key, false)}
                       onMoveStart={(event) => startSidebarTileMove(event, section.key)}
-                      onResizeStart={(event) => startSidebarTileResize(event, section.key)}
+                      onResizeStart={(event, direction) =>
+                        startSidebarTileResize(event, section.key, direction)
+                      }
                     >
                       {section.content}
                     </SidebarWidgetSection>
                   </div>
                 );
               })}
+              {insertionGuideStyle ? (
+                <div
+                  className="absolute z-40 pointer-events-none rounded-full bg-blue-400 shadow-[0_0_0_1px_rgba(255,255,255,0.75),0_0_14px_rgba(59,130,246,0.9)]"
+                  style={insertionGuideStyle}
+                >
+                  <span className="absolute left-1/2 top-1/2 w-2 h-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-blue-400 ring-2 ring-white/90" />
+                </div>
+              ) : null}
             </div>
           ) : (
             <div
@@ -2689,6 +3152,7 @@ function App() {
                 onSaveArxiv={saveArxivConfig}
                 onSaveQuota={saveQuotaConfig}
                 onSaveApp={onSaveApp}
+                onToggleSidebarWidget={saveSidebarWidgetVisibility}
                 onSaveThemes={onSaveThemes}
                 isAutostart={isAutostart}
                 onToggleAutostart={async () => {

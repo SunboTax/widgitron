@@ -14,6 +14,10 @@ pub struct ServerConfig {
     pub key_file: Option<String>,
     pub use_ssh_config: Option<bool>,
     pub use_slurm: Option<bool>,
+    /// When true, fetch and display the full squeue task list for this host.
+    pub show_squeue_list: Option<bool>,
+    /// When true, show all users' jobs in the squeue list; otherwise only the configured user.
+    pub squeue_all_users: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -27,7 +31,7 @@ impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             servers: vec![],
-            update_interval: Some(5),
+            update_interval: Some(2),
             compact_mode: Some(true),
         }
     }
@@ -106,25 +110,60 @@ pub struct AppConfig {
     pub quota_enabled: Option<bool>,
     pub hide_on_startup: Option<bool>,
     pub arxiv_proxy: Option<String>,
+    pub global_scale: Option<f64>,
     pub sidebar_hotkey: Option<String>,
+    pub sidebar_edge: Option<String>,
+    pub sidebar_pinned: Option<bool>,
+    pub sidebar_hide_widget_headers: Option<bool>,
+    pub sidebar_monitor_x: Option<i32>,
+    pub sidebar_monitor_y: Option<i32>,
     pub sidebar_theme: Option<SidebarThemeConfig>,
     pub sidebar_width: Option<f64>,
+    pub sidebar_length: Option<f64>,
     pub sidebar_widgets: Option<HashMap<String, bool>>,
     pub sidebar_layout: Option<HashMap<String, f64>>,
     pub sidebar_order: Option<Vec<String>>,
     pub sidebar_tile_sizes: Option<HashMap<String, String>>,
     pub sidebar_tile_layout: Option<HashMap<String, SidebarTileLayoutConfig>>,
+    /// 1–10. Lower = harder to open from the screen edge (default 4, current feel).
+    pub sidebar_reveal_sensitivity: Option<u8>,
+    /// 1–10. Higher = hides sooner after the pointer leaves (default 8, current feel).
+    pub sidebar_hide_sensitivity: Option<u8>,
     pub active_widgets: Option<HashMap<String, bool>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SidebarThemeConfig {
+    pub preset: Option<String>,
+    pub active_theme_id: Option<String>,
+    pub themes: Option<Vec<SidebarThemeDefinition>>,
     pub background: Option<String>,
     pub header: Option<String>,
     pub quota: Option<String>,
     pub gpu: Option<String>,
     pub deadlines: Option<String>,
     pub arxiv: Option<String>,
+    pub background_opacity: Option<f64>,
+    pub header_opacity: Option<f64>,
+    pub card_opacity: Option<f64>,
+    pub blur: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SidebarThemeDefinition {
+    pub id: String,
+    pub name: String,
+    pub preset: Option<String>,
+    pub background: Option<String>,
+    pub header: Option<String>,
+    pub quota: Option<String>,
+    pub gpu: Option<String>,
+    pub deadlines: Option<String>,
+    pub arxiv: Option<String>,
+    pub background_opacity: Option<f64>,
+    pub header_opacity: Option<f64>,
+    pub card_opacity: Option<f64>,
+    pub blur: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -211,16 +250,30 @@ impl Default for AppConfig {
             quota_enabled: Some(true),
             hide_on_startup: Some(false),
             arxiv_proxy: None,
+            global_scale: Some(crate::ui_scale::DEFAULT_UI_SCALE),
             sidebar_hotkey: Some(crate::sidebar_hotkey::DEFAULT_SIDEBAR_HOTKEY.into()),
+            sidebar_edge: Some("right".into()),
+            sidebar_pinned: Some(false),
+            sidebar_hide_widget_headers: Some(false),
+            sidebar_monitor_x: None,
+            sidebar_monitor_y: None,
             sidebar_theme: Some(SidebarThemeConfig {
+                preset: Some("midnight".into()),
+                active_theme_id: Some("midnight".into()),
+                themes: Some(Vec::new()),
                 background: Some("#050814".into()),
                 header: Some("#080d1d".into()),
                 quota: Some("#06b6d4".into()),
                 gpu: Some("#3b82f6".into()),
                 deadlines: Some("#f59e0b".into()),
                 arxiv: Some("#ec4899".into()),
+                background_opacity: Some(0.98),
+                header_opacity: Some(0.98),
+                card_opacity: Some(0.96),
+                blur: Some(0.0),
             }),
-            sidebar_width: Some(420.0),
+            sidebar_width: Some(480.0),
+            sidebar_length: None,
             sidebar_widgets: Some(sidebar_widgets),
             sidebar_layout: Some(sidebar_layout),
             sidebar_order: Some(vec![
@@ -231,6 +284,8 @@ impl Default for AppConfig {
             ]),
             sidebar_tile_sizes: Some(sidebar_tile_sizes),
             sidebar_tile_layout: Some(sidebar_tile_layout),
+            sidebar_reveal_sensitivity: Some(crate::sidebar_dock::DEFAULT_REVEAL_SENSITIVITY),
+            sidebar_hide_sensitivity: Some(crate::sidebar_dock::DEFAULT_HIDE_SENSITIVITY),
             active_widgets: Some(HashMap::new()),
         }
     }
@@ -673,6 +728,16 @@ pub struct SlurmStep {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct SlurmQueueJob {
+    pub id: String,
+    pub name: String,
+    pub user: String,
+    pub state: String,
+    pub time: String,
+    pub nodelist: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ServerGpuData {
     pub host: String,
     pub is_online: bool,
@@ -682,6 +747,7 @@ pub struct ServerGpuData {
     pub slurm_steps: Option<HashMap<String, Vec<SlurmStep>>>,
     pub slurm_nodelists: Option<HashMap<String, String>>,
     pub slurm_times: Option<HashMap<String, String>>,
+    pub slurm_queue_jobs: Option<Vec<SlurmQueueJob>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
