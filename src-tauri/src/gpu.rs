@@ -21,7 +21,8 @@ const GPU_CACHE_FILE: &str = "gpu_data_cache.json";
 /// forever showing stale values as if the host were still reachable.
 const GPU_STALE_CACHE_MAX_FAILURES: u32 = 2;
 /// Minimum seconds between full squeue refreshes (job list + queue panel).
-const SLURM_SQUEUE_INTERVAL_SECS: i64 = 10;
+/// Keep this close to the GPU poll interval so new/finished jobs show up quickly.
+const SLURM_SQUEUE_INTERVAL_SECS: i64 = 3;
 /// After this many consecutive squeue failures, drop retained Slurm job state.
 const SLURM_SQUEUE_STALE_MAX_FAILURES: u32 = 2;
 
@@ -683,86 +684,116 @@ pub fn start_ssh_monitor_task(
                 };
                 let timeout_secs = (interval * 3).max(15) + 10;
                 if s_m.use_ssh_config.unwrap_or(false) {
-                    let watch_cmd = match &j_m {
-                        Some(id) => {
-                            let node_arg = match &node_m {
-                                Some(node) => format!("-N 1 -n 1 -w {}", node),
-                                None => "-n 1".to_string(),
-                            };
-                            format!(
-                                "srun --jobid {} --overlap {} --job-name=widgitron-gpu sh -c 'node=$(hostname -s 2>/dev/null || hostname); {} | sed \"s/^/${{node}}: /\" || exit; echo \"${{node}}: END_BATCH\"'",
-                                id,
-                                node_arg,
-                                smi_cmd
-                            )
+                    // OpenSSH one-shot poll loop (no persistent stream). Emit each batch so the
+                    // UI does not wait on the slower main worker cycle.
+                    loop {
+                        let still_active = {
+                            if let Ok(monitors) = state_inner.active_monitors.lock() {
+                                monitors.contains_key(&my_key)
+                            } else {
+                                true
+                            }
+                        };
+                        if !still_active {
+                            return Ok(());
                         }
-                        None => format!("sh -c '{} || exit; echo \"END_BATCH\"'", smi_cmd),
-                    };
-                    let output = run_openssh_command(
-                        &s_m,
-                        &watch_cmd,
-                        Duration::from_secs(timeout_secs),
-                    )?;
-                    let mut task_batches: HashMap<String, String> = HashMap::new();
-                    for l in output.lines() {
-                        let task_id = if let Some((prefix, _)) = l.split_once(": ") {
-                            let prefix = prefix.trim();
-                            if !prefix.is_empty() {
-                                prefix.to_string()
+
+                        let watch_cmd = match &j_m {
+                            Some(id) => {
+                                let node_arg = match &node_m {
+                                    Some(node) => format!("-N 1 -n 1 -w {}", node),
+                                    None => "-n 1".to_string(),
+                                };
+                                format!(
+                                    "srun --jobid {} --overlap {} --job-name=widgitron-gpu sh -c 'node=$(hostname -s 2>/dev/null || hostname); {} | sed \"s/^/${{node}}: /\" || exit; echo \"${{node}}: END_BATCH\"'",
+                                    id,
+                                    node_arg,
+                                    smi_cmd
+                                )
+                            }
+                            None => format!("sh -c '{} || exit; echo \"END_BATCH\"'", smi_cmd),
+                        };
+                        let output = run_openssh_command(
+                            &s_m,
+                            &watch_cmd,
+                            Duration::from_secs(timeout_secs),
+                        )?;
+                        let mut task_batches: HashMap<String, String> = HashMap::new();
+                        for l in output.lines() {
+                            let task_id = if let Some((prefix, _)) = l.split_once(": ") {
+                                let prefix = prefix.trim();
+                                if !prefix.is_empty() {
+                                    prefix.to_string()
+                                } else {
+                                    "default".to_string()
+                                }
                             } else {
                                 "default".to_string()
-                            }
-                        } else {
-                            "default".to_string()
-                        };
+                            };
 
-                        if l.contains("END_BATCH") {
-                            let app_config = config_store::read_config::<AppConfig>(&app_inner, "app_config.json");
-                            if !app_config.gpu_enabled.unwrap_or(true) {
-                                return Err("GPU monitoring disabled".to_string());
-                            }
-                            let batch = task_batches.entry(task_id.clone()).or_default();
-                            let mut parsed = parse_nvidia_smi_output(batch);
-                            if !parsed.is_empty() {
-                                for p in &mut parsed {
-                                    p.job_id = j_m.clone();
-                                    if p.node.is_none() {
-                                        p.node = node_m.clone();
+                            if l.contains("END_BATCH") {
+                                let app_config =
+                                    config_store::read_config::<AppConfig>(&app_inner, "app_config.json");
+                                if !app_config.gpu_enabled.unwrap_or(true) {
+                                    return Err("GPU monitoring disabled".to_string());
+                                }
+                                let batch = task_batches.entry(task_id.clone()).or_default();
+                                let mut parsed = parse_nvidia_smi_output(batch);
+                                if !parsed.is_empty() {
+                                    for p in &mut parsed {
+                                        p.job_id = j_m.clone();
+                                        if p.node.is_none() {
+                                            p.node = node_m.clone();
+                                        }
+                                    }
+                                    let node_to_replace = parsed[0].node.clone();
+                                    let mut emitted: Option<ServerGpuData> = None;
+                                    if let Ok(mut state_gpu) = state_inner.gpu_data.lock() {
+                                        let data =
+                                            state_gpu.entry(s_m.host.clone()).or_insert(ServerGpuData {
+                                                host: s_m.host.clone(),
+                                                is_online: true,
+                                                gpu_list: vec![],
+                                                error: None,
+                                                last_update: None,
+                                                slurm_steps: None,
+                                                slurm_nodelists: None,
+                                                slurm_times: None,
+                                                slurm_queue_jobs: None,
+                                            });
+                                        data.is_online = true;
+                                        data.error = None;
+                                        if let Some(node) = node_to_replace {
+                                            data.gpu_list.retain(|g| {
+                                                !(g.job_id == j_m && g.node == Some(node.clone()))
+                                            });
+                                        } else {
+                                            data.gpu_list.retain(|g| g.job_id != j_m);
+                                        }
+                                        data.gpu_list.extend(parsed);
+                                        data.last_update =
+                                            Some(Utc::now().format("%H:%M:%S").to_string());
+                                        emitted = Some(data.clone());
+                                    }
+                                    if let Some(gpu_data) = emitted {
+                                        emit_gpu_update_if_changed(
+                                            &app_inner,
+                                            state_inner.as_ref(),
+                                            &gpu_data,
+                                        );
                                     }
                                 }
-                                let node_to_replace = parsed[0].node.clone();
-                                if let Ok(mut state_gpu) = state_inner.gpu_data.lock() {
-                                    let data = state_gpu.entry(s_m.host.clone()).or_insert(ServerGpuData {
-                                        host: s_m.host.clone(),
-                                        is_online: true,
-                                        gpu_list: vec![],
-                                        error: None,
-                                        last_update: None,
-                                        slurm_steps: None,
-                                        slurm_nodelists: None,
-                                        slurm_times: None,
-                                        slurm_queue_jobs: None,
-                                    });
-                                    data.is_online = true;
-                                    data.error = None;
-                                    if let Some(node) = node_to_replace {
-                                        data.gpu_list.retain(|g| !(g.job_id == j_m && g.node == Some(node.clone())));
-                                    } else {
-                                        data.gpu_list.retain(|g| g.job_id != j_m);
-                                    }
-                                    data.gpu_list.extend(parsed);
-                                    data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
-                                }
+                                batch.clear();
+                            } else {
+                                let batch = task_batches.entry(task_id).or_default();
+                                batch.push_str(l);
+                                batch.push('\n');
                             }
-                            batch.clear();
-                        } else {
-                            let batch = task_batches.entry(task_id).or_default();
-                            batch.push_str(l);
-                            batch.push('\n');
                         }
+                        std::thread::sleep(Duration::from_secs(interval.max(1)));
                     }
-                    return Ok(());
-                }                let sess = connect_ssh_session_with_read_timeout(
+                }
+                let sess = connect_ssh_session_with_read_timeout(
                     &s_m,
                     Duration::from_secs(timeout_secs),
                 )?;
@@ -847,6 +878,7 @@ pub fn start_ssh_monitor_task(
 
                             let node_to_replace = parsed[0].node.clone();
 
+                            let mut emitted: Option<ServerGpuData> = None;
                             if let Ok(mut state_gpu) = state_inner.gpu_data.lock() {
                                 let data = state_gpu.entry(s_m.host.clone()).or_insert(ServerGpuData {
                                     host: s_m.host.clone(),
@@ -871,6 +903,15 @@ pub fn start_ssh_monitor_task(
 
                                 data.gpu_list.extend(parsed.clone());
                                 data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
+                                emitted = Some(data.clone());
+                            }
+                            // Push GPU samples immediately — do not wait for the main worker.
+                            if let Some(gpu_data) = emitted {
+                                emit_gpu_update_if_changed(
+                                    &app_inner,
+                                    state_inner.as_ref(),
+                                    &gpu_data,
+                                );
                             }
                         }
                         batch.clear();
@@ -1287,39 +1328,40 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                              }
 
                                              let mut expanded_job_nodes: HashMap<String, Vec<String>> = HashMap::new();
-                                             for jid in &job_ids {
-                                                 let mut expanded = Vec::new();
-                                                 if let Some(nodelist) = nodelists.get(jid) {
-                                                     if let Ok(mut channel) = sess.channel_session() {
-                                                         let host_cmd = format!("scontrol show hostnames {}", nodelist);
-                                                         if channel.exec(&host_cmd).is_ok() {
-                                                             let mut host_out = String::new();
-                                                             if channel.read_to_string(&mut host_out).is_ok() {
-                                                                 expanded = host_out
-                                                                     .lines()
-                                                                     .map(|line| line.trim().to_string())
-                                                                     .filter(|line| !line.is_empty())
-                                                                     .collect();
+                                             if squeue_needed {
+                                                 for jid in &job_ids {
+                                                     let mut expanded = Vec::new();
+                                                     if let Some(nodelist) = nodelists.get(jid) {
+                                                         if let Ok(mut channel) = sess.channel_session() {
+                                                             let host_cmd = format!("scontrol show hostnames {}", nodelist);
+                                                             if channel.exec(&host_cmd).is_ok() {
+                                                                 let mut host_out = String::new();
+                                                                 if channel.read_to_string(&mut host_out).is_ok() {
+                                                                     expanded = host_out
+                                                                         .lines()
+                                                                         .map(|line| line.trim().to_string())
+                                                                         .filter(|line| !line.is_empty())
+                                                                         .collect();
+                                                                 }
                                                              }
+                                                         }
+
+                                                         if expanded.is_empty()
+                                                             && !nodelist.contains('[')
+                                                             && !nodelist.contains(',')
+                                                         {
+                                                             expanded.push(nodelist.clone());
                                                          }
                                                      }
 
-                                                     if expanded.is_empty()
-                                                         && !nodelist.contains('[')
-                                                         && !nodelist.contains(',')
-                                                     {
-                                                         expanded.push(nodelist.clone());
-                                                     }
+                                                     log::debug!(
+                                                         "Slurm job {} on {} expanded nodes: {:?}",
+                                                         jid,
+                                                         s.host,
+                                                         expanded
+                                                     );
+                                                     expanded_job_nodes.insert(jid.clone(), expanded);
                                                  }
-
-                                                 log::debug!(
-                                                     "Slurm job {} on {} expanded nodes: {:?}",
-                                                     jid,
-                                                     s.host,
-                                                     expanded
-                                                 );
-                                                 expanded_job_nodes.insert(jid.clone(), expanded);
-                                             }
 
                                                 // Now, if we have job_ids, query sacct for SubmitLine of these job steps!
                                                 let mut submit_lines = HashMap::new();
@@ -1408,6 +1450,31 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                         steps = new_steps;
                                                     }
                                                 }
+                                             } else {
+                                                 // Between squeue refreshes: reuse simple nodelists / existing
+                                                 // monitors instead of re-running scontrol/sacct every tick.
+                                                 for jid in &job_ids {
+                                                     let mut expanded = Vec::new();
+                                                     if let Some(nodelist) = nodelists.get(jid) {
+                                                         if !nodelist.contains('[') && !nodelist.contains(',') {
+                                                             expanded.push(nodelist.clone());
+                                                         }
+                                                     }
+                                                     if expanded.is_empty() {
+                                                         let prefix = format!("{}:{}:", s.host, jid);
+                                                         if let Ok(monitors) = state_task.active_monitors.lock() {
+                                                             for key in monitors.keys() {
+                                                                 if let Some(rest) = key.strip_prefix(&prefix) {
+                                                                     if rest != "job" && !rest.is_empty() {
+                                                                         expanded.push(rest.to_string());
+                                                                     }
+                                                                 }
+                                                             }
+                                                         }
+                                                     }
+                                                     expanded_job_nodes.insert(jid.clone(), expanded);
+                                                 }
+                                             }
 
                                                 if s.show_squeue_list.unwrap_or(false) && squeue_needed {
                                                     queue_jobs.clear();
@@ -1734,15 +1801,17 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                     slurm_queue_jobs = queue_jobs;
                                     consecutive_failures = 0;
                                     match squeue_ok {
-                                        Some(true) => consecutive_squeue_failures = 0,
+                                        Some(true) => {
+                                            consecutive_squeue_failures = 0;
+                                            // Only throttle after a successful refresh so failures
+                                            // retry on the next worker tick instead of waiting again.
+                                            last_squeue_update = Utc::now();
+                                        }
                                         Some(false) => {
                                             consecutive_squeue_failures =
                                                 consecutive_squeue_failures.saturating_add(1);
                                         }
                                         None => {}
-                                    }
-                                    if (Utc::now() - last_squeue_update).num_seconds() >= SLURM_SQUEUE_INTERVAL_SECS {
-                                        last_squeue_update = Utc::now();
                                     }
                                 }
                                 _ => {
@@ -1877,6 +1946,6 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
             last_cache_persist = std::time::Instant::now();
         }
 
-        tokio::time::sleep(Duration::from_secs(5)).await; // Re-check config every 5s
+        tokio::time::sleep(Duration::from_secs(1)).await; // Re-check config / respawn workers quickly
     }
 }

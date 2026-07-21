@@ -88,7 +88,8 @@ export function GPUWidgetContent({ hideHeader = false }: { hideHeader?: boolean 
   const hasTrackedDurations = serverData.some(
     (server) =>
       Object.keys(server.slurm_times || {}).length > 0 ||
-      Object.values(server.slurm_steps || {}).some((steps) => steps.length > 0)
+      Object.values(server.slurm_steps || {}).some((steps) => steps.length > 0) ||
+      (server.slurm_queue_jobs || []).length > 0
   );
 
   useEffect(() => {
@@ -119,6 +120,13 @@ export function GPUWidgetContent({ hideHeader = false }: { hideHeader?: boolean 
         return next;
       };
 
+      // Accept backend time when missing/ahead, or when far behind (job restart / clock reset).
+      // Never snap back on stale squeue strings re-emitted between refreshes.
+      const shouldSyncDuration = (currentSecs: number | undefined, backendSecs: number) =>
+        currentSecs === undefined ||
+        backendSecs > currentSecs ||
+        backendSecs < currentSecs - 3600;
+
       // 1. Gather all visible job IDs and step IDs
       serverData.forEach((server) => {
         server.gpu_list.forEach((gpu) => {
@@ -126,6 +134,11 @@ export function GPUWidgetContent({ hideHeader = false }: { hideHeader?: boolean 
             visibleJobs.add(gpu.job_id);
           }
         });
+        if (server.slurm_times) {
+          Object.keys(server.slurm_times).forEach((jobId) => {
+            visibleJobs.add(jobId);
+          });
+        }
         if (server.slurm_steps) {
           Object.values(server.slurm_steps).forEach((steps) => {
             steps.forEach((step) => {
@@ -133,6 +146,9 @@ export function GPUWidgetContent({ hideHeader = false }: { hideHeader?: boolean 
             });
           });
         }
+        (server.slurm_queue_jobs || []).forEach((job) => {
+          visibleJobs.add(`queue:${job.id}`);
+        });
       });
 
       // 2. Update durations from backend values if available
@@ -141,7 +157,7 @@ export function GPUWidgetContent({ hideHeader = false }: { hideHeader?: boolean 
           Object.entries(server.slurm_times).forEach(([jobId, timeStr]) => {
             const backendSecs = parseSlurmTime(timeStr);
             const currentSecs = next[jobId];
-            if (currentSecs === undefined || backendSecs > currentSecs || backendSecs < currentSecs - 45) {
+            if (shouldSyncDuration(currentSecs, backendSecs)) {
               ensureNext()[jobId] = backendSecs;
               changed = true;
             }
@@ -152,13 +168,22 @@ export function GPUWidgetContent({ hideHeader = false }: { hideHeader?: boolean 
             steps.forEach((step) => {
               const backendSecs = parseSlurmTime(step.time);
               const currentSecs = next[step.id];
-              if (currentSecs === undefined || backendSecs > currentSecs || backendSecs < currentSecs - 45) {
+              if (shouldSyncDuration(currentSecs, backendSecs)) {
                 ensureNext()[step.id] = backendSecs;
                 changed = true;
               }
             });
           });
         }
+        (server.slurm_queue_jobs || []).forEach((job) => {
+          const key = `queue:${job.id}`;
+          const backendSecs = parseSlurmTime(job.time);
+          const currentSecs = next[key];
+          if (shouldSyncDuration(currentSecs, backendSecs)) {
+            ensureNext()[key] = backendSecs;
+            changed = true;
+          }
+        });
       });
 
       // 3. Clean up keys that are no longer visible
@@ -756,7 +781,11 @@ export function GPUWidgetContent({ hideHeader = false }: { hideHeader?: boolean 
                               <span className="truncate max-w-[100px]" title={job.nodelist}>
                                 {job.nodelist}
                               </span>
-                              <span>{formatSlurmTime(parseSlurmTime(job.time))}</span>
+                              <span>
+                                {formatSlurmTime(
+                                  durations[`queue:${job.id}`] ?? parseSlurmTime(job.time)
+                                )}
+                              </span>
                             </div>
                           </div>
                         ))}
