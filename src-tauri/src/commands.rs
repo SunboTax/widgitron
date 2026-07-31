@@ -1,4 +1,6 @@
+use once_cell::sync::Lazy;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window};
+use widgitron_core::validate_external_link;
 
 use crate::config_store;
 use crate::models::{
@@ -11,6 +13,8 @@ const SIDEBAR_WIDTH_LOGICAL: f64 = 420.0;
 const SIDEBAR_MIN_WIDTH_LOGICAL: f64 = 320.0;
 const SIDEBAR_MARGIN_LOGICAL: f64 = 16.0;
 const SIDEBAR_MIN_HEIGHT_LOGICAL: f64 = 480.0;
+
+static ARXIV_ACTION_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Clone, Copy)]
 struct SidebarWorkArea {
@@ -125,8 +129,8 @@ fn place_sidebar_window(app: &AppHandle, window: &WebviewWindow) -> Result<(), S
     let scale = area.scale_factor;
     let margin = (SIDEBAR_MARGIN_LOGICAL * scale).round() as i32;
     let config = config_store::read_config::<AppConfig>(app, "app_config.json");
-    let max_width_logical = (area.width as f64 / scale - SIDEBAR_MARGIN_LOGICAL * 2.0)
-        .max(SIDEBAR_MIN_WIDTH_LOGICAL);
+    let max_width_logical =
+        (area.width as f64 / scale - SIDEBAR_MARGIN_LOGICAL * 2.0).max(SIDEBAR_MIN_WIDTH_LOGICAL);
     let width_logical = config
         .sidebar_width
         .unwrap_or(SIDEBAR_WIDTH_LOGICAL)
@@ -143,10 +147,14 @@ fn place_sidebar_window(app: &AppHandle, window: &WebviewWindow) -> Result<(), S
     let x = area.x + area.width as i32 - width as i32 - margin;
 
     window
-        .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(width, height)))
+        .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
+            width, height,
+        )))
         .map_err(|e| e.to_string())?;
     window
-        .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)))
+        .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+            x, y,
+        )))
         .map_err(|e| e.to_string())?;
 
     Ok(())
@@ -165,20 +173,27 @@ pub fn persist_sidebar_width(app: &AppHandle, window: &Window) {
         .round()
         .max(SIDEBAR_MIN_WIDTH_LOGICAL);
 
-    let mut config = config_store::read_config::<AppConfig>(app, "app_config.json");
-    if config
-        .sidebar_width
-        .map(|current| (current - width_logical).abs() < 1.0)
-        .unwrap_or(false)
-    {
-        return;
-    }
-
-    config.sidebar_width = Some(width_logical);
-    if let Err(err) = config_store::write_config(app, "app_config.json", &config) {
-        log::warn!("Failed to persist sidebar width: {}", err);
-        return;
-    }
+    let config = match config_store::update_config_if_changed::<AppConfig, _>(
+        app,
+        "app_config.json",
+        |config| {
+            if config
+                .sidebar_width
+                .is_some_and(|current| (current - width_logical).abs() < 1.0)
+            {
+                return false;
+            }
+            config.sidebar_width = Some(width_logical);
+            true
+        },
+    ) {
+        Ok(Some(config)) => config,
+        Ok(None) => return,
+        Err(err) => {
+            log::warn!("Failed to persist sidebar width: {}", err);
+            return;
+        }
+    };
     let _ = app.emit("app_config_update", &config);
 }
 
@@ -210,6 +225,7 @@ pub async fn save_gpu_config(
     config
         .servers
         .retain(|server| !server.host.trim().is_empty());
+    crate::gpu::normalize_gpu_config(&mut config);
 
     let previous = crate::gpu::read_gpu_config(&app);
     let previous_hosts: std::collections::HashSet<String> = previous
@@ -247,8 +263,9 @@ pub async fn save_gpu_config(
 pub async fn save_paper_config(
     app: AppHandle,
     state: tauri::State<'_, GlobalState>,
-    config: PaperConfig,
+    mut config: PaperConfig,
 ) -> Result<(), String> {
+    crate::deadlines::normalize_paper_config(&mut config);
     config_store::write_config(&app, "paper_deadline.json", &config)?;
     let _ = app.emit("paper_config_update", &config);
 
@@ -299,15 +316,23 @@ pub async fn get_gpu_config(app: AppHandle) -> Result<GpuConfig, String> {
 
 #[tauri::command]
 pub async fn get_paper_config(app: AppHandle) -> Result<PaperConfig, String> {
-    Ok(config_store::read_config::<PaperConfig>(
-        &app,
-        "paper_deadline.json",
-    ))
+    let mut config = config_store::read_config::<PaperConfig>(&app, "paper_deadline.json");
+    crate::deadlines::normalize_paper_config(&mut config);
+    Ok(config)
 }
 
 #[tauri::command]
 pub async fn save_app_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
-    config_store::write_config(&app, "app_config.json", &config)?;
+    let config = config_store::update_config::<AppConfig, _>(&app, "app_config.json", |current| {
+        let sidebar_width = current.sidebar_width.or(config.sidebar_width);
+        let active_widgets = current
+            .active_widgets
+            .clone()
+            .or_else(|| config.active_widgets.clone());
+        *current = config;
+        current.sidebar_width = sidebar_width;
+        current.active_widgets = active_widgets;
+    })?;
     crate::sidebar_hotkey::update_global_sidebar_hotkey(config.sidebar_hotkey.clone());
     let _ = app.emit("app_config_update", &config);
     Ok(())
@@ -372,6 +397,26 @@ pub async fn refresh_gpu_data(
     app: AppHandle,
     state: tauri::State<'_, GlobalState>,
 ) -> Result<Vec<ServerGpuData>, String> {
+    let config = crate::gpu::read_gpu_config(&app);
+    let hosts: Vec<String> = config
+        .servers
+        .iter()
+        .map(|server| server.host.trim())
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+        .collect();
+    if hosts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    {
+        let mut gpu_data = state.gpu_data.lock().map_err(|e| e.to_string())?;
+        for host in &hosts {
+            if let Some(item) = gpu_data.get_mut(host) {
+                item.last_update = None;
+            }
+        }
+    }
     {
         let mut workers = state.active_workers.lock().map_err(|e| e.to_string())?;
         for (_, handle) in workers.drain() {
@@ -384,8 +429,40 @@ pub async fn refresh_gpu_data(
             handle.abort();
         }
     }
-    log::info!("GPU workers restarted via manual refresh");
-    get_gpu_data(app, state).await
+    crate::gpu::clear_gpu_emit_cache(state.inner());
+    log::info!("GPU workers restarted via manual refresh; waiting for fresh samples");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let refreshed = {
+            let gpu_data = state.gpu_data.lock().map_err(|e| e.to_string())?;
+            if hosts.iter().all(|host| {
+                gpu_data
+                    .get(host)
+                    .and_then(|item| item.last_update.as_ref())
+                    .is_some()
+            }) {
+                Some(
+                    hosts
+                        .iter()
+                        .filter_map(|host| gpu_data.get(host).cloned())
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            }
+        };
+        if let Some(refreshed) = refreshed {
+            crate::gpu::persist_gpu_data_cache(&app, state.inner());
+            return Ok(refreshed);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                "Timed out waiting for fresh GPU samples; cached data was retained".to_string(),
+            );
+        }
+    }
 }
 
 #[tauri::command]
@@ -497,8 +574,7 @@ async fn create_widget_impl_with_options(
         let _ = win.set_focus();
     }
 
-    let _ = config_store::update_widget_visibility_config(&app, &id, true).await;
-    Ok(())
+    config_store::update_widget_visibility_config(&app, &id, true).await
 }
 
 pub async fn create_widget_impl(app: AppHandle, id: String, title: String) -> Result<(), String> {
@@ -534,8 +610,7 @@ pub async fn close_widget(
     if let Some(win) = app.get_webview_window(&id) {
         let _ = win.hide();
     }
-    let _ = config_store::update_widget_visibility_config(&app, &id, false).await;
-    Ok(())
+    config_store::update_widget_visibility_config(&app, &id, false).await
 }
 
 #[tauri::command]
@@ -566,10 +641,11 @@ pub async fn toggle_widget(
         }
     } else {
         if new_visible {
-            let _ = create_widget_impl(app.clone(), id.clone(), title).await?;
+            create_widget_impl(app.clone(), id.clone(), title).await?;
+            return Ok(ToggleWidgetResponse { visible: true });
         }
     }
-    let _ = config_store::update_widget_visibility_config(&app, &id, new_visible).await;
+    config_store::update_widget_visibility_config(&app, &id, new_visible).await?;
     Ok(ToggleWidgetResponse {
         visible: new_visible,
     })
@@ -579,15 +655,19 @@ pub async fn toggle_widget(
 pub async fn save_arxiv_config(
     app: AppHandle,
     state: tauri::State<'_, GlobalState>,
-    config: ArxivConfig,
+    mut config: ArxivConfig,
 ) -> Result<(), String> {
+    crate::arxiv::normalize_arxiv_config(&mut config);
+    let previous_config = config_store::read_config::<ArxivConfig>(&app, "arxiv_config.json");
+    let query_changed = previous_config.keywords != config.keywords
+        || previous_config.categories != config.categories;
     config_store::write_config(&app, "arxiv_config.json", &config)?;
     let _ = app.emit("arxiv_config_update", &config);
 
     let app_config = config_store::read_config::<AppConfig>(&app, "app_config.json");
-    if app_config.arxiv_enabled.unwrap_or(true) {
+    if query_changed && app_config.arxiv_enabled.unwrap_or(true) {
         if let Err(e) = crate::arxiv::perform_arxiv_fetch(&app, state.inner()).await {
-            log::warn!("Arxiv immediate fetch after config save failed: {}", e);
+            log::warn!("Arxiv immediate fetch after query update failed: {}", e);
             let _ = app.emit("arxiv_error", e);
         }
     }
@@ -596,10 +676,9 @@ pub async fn save_arxiv_config(
 
 #[tauri::command]
 pub async fn get_arxiv_config(app: AppHandle) -> Result<ArxivConfig, String> {
-    Ok(config_store::read_config::<ArxivConfig>(
-        &app,
-        "arxiv_config.json",
-    ))
+    let mut config = config_store::read_config::<ArxivConfig>(&app, "arxiv_config.json");
+    crate::arxiv::normalize_arxiv_config(&mut config);
+    Ok(config)
 }
 
 #[tauri::command]
@@ -631,49 +710,47 @@ pub async fn mark_arxiv_seen(
     id: String,
     saved: bool,
 ) -> Result<(), String> {
+    let _action_guard = ARXIV_ACTION_LOCK.lock().await;
+    let paper = {
+        let papers = state.arxiv_papers.lock().map_err(|e| e.to_string())?;
+        papers.iter().find(|paper| paper.id == id).cloned()
+    };
+
     let mut seen = config_store::read_config::<Vec<String>>(&app, "arxiv_seen.json");
-    if !seen.contains(&id) {
+    let seen_changed = !seen.contains(&id);
+    if seen_changed {
         seen.push(id.clone());
-        let _ = config_store::write_config(&app, "arxiv_seen.json", &seen);
     }
 
-    if saved {
-        let mut paper_to_save = None;
-        if let Ok(mut papers) = state.arxiv_papers.lock() {
-            if let Some(idx) = papers.iter().position(|p| p.id == id) {
-                paper_to_save = Some(papers[idx].clone());
-                papers.remove(idx);
-            }
-        }
-
-        if let Some(p) = paper_to_save {
-            let mut saved_papers =
-                config_store::read_config::<Vec<ArxivPaper>>(&app, "arxiv_saved.json");
-            saved_papers.push(p);
-            let _ = config_store::write_config(&app, "arxiv_saved.json", &saved_papers);
-        }
-    } else {
-        let mut paper_to_discard = None;
-        if let Ok(mut papers) = state.arxiv_papers.lock() {
-            if let Some(idx) = papers.iter().position(|p| p.id == id) {
-                paper_to_discard = Some(papers[idx].clone());
-                papers.remove(idx);
-            }
-        }
-
-        if let Some(p) = paper_to_discard {
-            let mut discarded =
-                config_store::read_config::<Vec<ArxivPaper>>(&app, "arxiv_discarded.json");
-            discarded.push(p);
-            let _ = config_store::write_config(&app, "arxiv_discarded.json", &discarded);
+    if let Some(paper) = paper {
+        let archive_file = if saved {
+            "arxiv_saved.json"
+        } else {
+            "arxiv_discarded.json"
+        };
+        let mut archived = config_store::read_config::<Vec<ArxivPaper>>(&app, archive_file);
+        if !archived
+            .iter()
+            .any(|archived_paper| archived_paper.id == id)
+        {
+            archived.push(paper);
+            config_store::write_config(&app, archive_file, &archived)?;
         }
     }
 
-    // Save updated papers list to cache and emit update
-    if let Ok(papers) = state.arxiv_papers.lock() {
-        let _ = config_store::write_config(&app, "arxiv_cache.json", &*papers);
-        let _ = app.emit("arxiv_update", &*papers);
+    if seen_changed {
+        config_store::write_config(&app, "arxiv_seen.json", &seen)?;
     }
+
+    let remaining_papers = {
+        let mut papers = state.arxiv_papers.lock().map_err(|e| e.to_string())?;
+        papers.retain(|paper| paper.id != id);
+        papers.clone()
+    };
+    if let Err(error) = config_store::write_config(&app, "arxiv_cache.json", &remaining_papers) {
+        log::warn!("Failed to persist derived Arxiv cache: {}", error);
+    }
+    let _ = app.emit("arxiv_update", &remaining_papers);
 
     let _ = app.emit("arxiv_saved_update", ());
     let _ = app.emit("arxiv_discarded_update", ());
@@ -699,6 +776,7 @@ pub async fn get_arxiv_saved_papers(app: AppHandle) -> Result<Vec<ArxivPaper>, S
 
 #[tauri::command]
 pub async fn open_link(app: AppHandle, url: String) -> Result<(), String> {
+    validate_external_link(&url)?;
     log::info!("Opening link: {}", url);
     use tauri_plugin_opener::OpenerExt;
     app.opener().open_url(&url, None::<String>).map_err(|e| {
@@ -821,6 +899,7 @@ pub async fn save_quota_config(
         active_monitors: state.active_monitors.clone(),
         active_workers: state.active_workers.clone(),
         arxiv_papers: state.arxiv_papers.clone(),
+        arxiv_fetch_lock: state.arxiv_fetch_lock.clone(),
         quota_data: state.quota_data.clone(),
         quota_fetch_lock: state.quota_fetch_lock.clone(),
         widget_toggle_lock: state.widget_toggle_lock.clone(),
@@ -905,34 +984,30 @@ pub async fn restore_widget_position(
     title: String,
 ) -> Result<(), String> {
     let _lock = state.widget_toggle_lock.lock().await;
-    // Ensure widget is created/shown first
     if app.get_webview_window(&id).is_none() {
-        let _ = create_widget_impl(app.clone(), id.clone(), title).await;
+        create_widget_impl(app.clone(), id.clone(), title).await?;
     }
 
-    if let Some(win) = app.get_webview_window(&id) {
-        // Read app config to know if it's always_on_top (pinned)
-        let config = config_store::read_config::<AppConfig>(&app, "app_config.json");
-        let always_on_top = config
-            .always_on_top
-            .and_then(|m| m.get(&id).cloned())
-            .unwrap_or(false);
+    let win = app
+        .get_webview_window(&id)
+        .ok_or_else(|| format!("Widget '{}' was not created", id))?;
+    let config = config_store::read_config::<AppConfig>(&app, "app_config.json");
+    let always_on_top = config
+        .always_on_top
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .copied()
+        .unwrap_or(false);
 
-        // Disable desktop mode to make it a normal top-level window first
-        let _ = crate::desktop::set_desktop_mode(app.clone(), id.clone(), false).await;
+    crate::desktop::set_desktop_mode(app.clone(), id.clone(), false).await?;
+    crate::widget_layout::ensure_widget_layout_for_window(&app, &win, &id)?;
+    win.show().map_err(|e| e.to_string())?;
+    win.set_focus().map_err(|e| e.to_string())?;
 
-        // Restore to the normalized layout tracked for the current or fallback monitor
-        let _ = crate::widget_layout::ensure_widget_layout_for_window(&app, &win, &id);
-        let _ = win.show();
-        let _ = win.set_focus();
-
-        // Re-apply desktop mode if not pinned/always_on_top
-        if always_on_top {
-            let _ = win.set_always_on_top(true);
-        } else {
-            let _ = win.set_always_on_top(false);
-            let _ = crate::desktop::set_desktop_mode(app.clone(), id.clone(), true).await;
-        }
+    win.set_always_on_top(always_on_top)
+        .map_err(|e| e.to_string())?;
+    if !always_on_top {
+        crate::desktop::set_desktop_mode(app, id, true).await?;
     }
     Ok(())
 }

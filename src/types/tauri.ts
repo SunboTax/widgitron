@@ -205,7 +205,7 @@ export interface TauriCommandArgs {
   remove_arxiv_saved_paper: { id: string };
   remove_arxiv_discarded_paper: { id: string };
   update_manual_quota: { id: string; value: number };
-  download_and_install_update: { downloadUrl: string; assetName: string };
+  download_and_install_update: undefined;
   restore_widget_position: { id: string; title: string };
   log_frontend_error: {
     message: string;

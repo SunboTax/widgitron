@@ -4,6 +4,8 @@ import type { TauriCommandArgs } from "./types/tauri";
 import { tauriInvoke } from "./utils/tauriInvoke";
 
 const ERROR_LOG_DEBOUNCE_MS = 2000;
+const ERROR_LOG_RETENTION_MS = 60_000;
+const MAX_RECENT_ERROR_LOGS = 256;
 const recentErrorLogs = new Map<string, number>();
 
 function frontendErrorDedupeKey(
@@ -14,9 +16,26 @@ function frontendErrorDedupeKey(
   return `${source}:${line}:${args.message}`;
 }
 
+function pruneRecentErrorLogs(now: number): void {
+  for (const [key, timestamp] of recentErrorLogs) {
+    if (now - timestamp >= ERROR_LOG_RETENTION_MS) {
+      recentErrorLogs.delete(key);
+    }
+  }
+
+  while (recentErrorLogs.size >= MAX_RECENT_ERROR_LOGS) {
+    const oldestKey = recentErrorLogs.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    recentErrorLogs.delete(oldestKey);
+  }
+}
+
 function shouldLogFrontendError(args: TauriCommandArgs["log_frontend_error"]): boolean {
   const key = frontendErrorDedupeKey(args);
   const now = Date.now();
+  pruneRecentErrorLogs(now);
   const lastLogged = recentErrorLogs.get(key);
   if (lastLogged !== undefined && now - lastLogged < ERROR_LOG_DEBOUNCE_MS) {
     return false;

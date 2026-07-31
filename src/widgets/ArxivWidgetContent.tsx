@@ -161,6 +161,7 @@ export function ArxivWidgetContent() {
           unlisteners.push(u5);
         }
       } catch (e) {
+        unlisteners.splice(0).forEach((unlisten) => unlisten());
         console.error("Failed to setup arxiv listeners", e);
       }
     };

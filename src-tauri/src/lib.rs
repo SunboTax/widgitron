@@ -42,6 +42,13 @@ mod widget_layout;
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
@@ -134,6 +141,7 @@ pub fn run() {
                 active_monitors: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 active_workers: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 arxiv_papers: Arc::new(std::sync::Mutex::new(cached_arxiv)),
+                arxiv_fetch_lock: Arc::new(tokio::sync::Mutex::new(())),
                 quota_data: Arc::new(std::sync::Mutex::new(cached_quota_items)),
                 quota_fetch_lock: Arc::new(tokio::sync::Mutex::new(())),
                 widget_toggle_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -146,6 +154,7 @@ pub fn run() {
                 active_monitors: state.active_monitors.clone(),
                 active_workers: state.active_workers.clone(),
                 arxiv_papers: state.arxiv_papers.clone(),
+                arxiv_fetch_lock: state.arxiv_fetch_lock.clone(),
                 quota_data: state.quota_data.clone(),
                 quota_fetch_lock: state.quota_fetch_lock.clone(),
                 widget_toggle_lock: state.widget_toggle_lock.clone(),
@@ -404,10 +413,7 @@ pub fn run() {
 
             match event {
                 tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
-                    widget_layout::schedule_layout_persist(
-                        window.app_handle().clone(),
-                        label,
-                    );
+                    widget_layout::schedule_layout_persist(window.app_handle().clone(), label);
                 }
                 tauri::WindowEvent::CloseRequested { .. } => {
                     let _ = widget_layout::persist_layout_now(&window.app_handle(), &label);

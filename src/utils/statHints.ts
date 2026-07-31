@@ -32,7 +32,6 @@ export function serviceUpdateStatHint(
 export interface GpuStatHintInput {
   refreshError: string | null | undefined;
   totalGpus: number;
-  gpuStaleCount: number;
   gpuServerCount: number;
   gpuServersOnline: number;
   gpuOfflineCount: number;
@@ -42,7 +41,6 @@ export function gpuStatHint(input: GpuStatHintInput): StatHintResult {
   const {
     refreshError,
     totalGpus,
-    gpuStaleCount,
     gpuServerCount,
     gpuServersOnline,
     gpuOfflineCount,
@@ -54,17 +52,11 @@ export function gpuStatHint(input: GpuStatHintInput): StatHintResult {
     const hasCached = refreshError.includes("cached") || totalGpus > 0;
     return { hint: refreshFailedStatHint(hasCached), tone: "warning" };
   }
-  if (gpuStaleCount > 0) {
-    return { hint: staleCountHint(gpuStaleCount), tone: "warning" };
-  }
   if (gpuHasPartialOffline) {
     return {
       hint: `${gpuServersOnline}/${gpuServerCount} servers online`,
       tone: "warning",
     };
-  }
-  if (gpuServerCount > 0 && gpuServersOnline === 0 && totalGpus > 0) {
-    return { hint: "Offline · cached", tone: "warning" };
   }
   if (gpuServerCount > 0 && gpuServersOnline === 0) {
     return { hint: "All servers offline", tone: "warning" };

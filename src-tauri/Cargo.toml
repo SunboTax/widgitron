@@ -5,6 +5,10 @@ description = "A modular desktop widget framework for researchers and developers
 authors = ["you"]
 edition = "2021"
 
+[workspace]
+members = ["crates/widgitron-core"]
+resolver = "2"
+
 [lib]
 name = "widgitron_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -26,11 +30,13 @@ tauri-plugin-shell = "2"
 reqwest = { version = "0.12", features = ["json"] }
 serde_yaml = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
+widgitron-core = { path = "crates/widgitron-core" }
 lazy_static = "1.4"
 shellexpand = "3.1"
 tauri-plugin-autostart = "2"
 tauri-plugin-window-state = "2"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Dwm", "Win32_Security_Cryptography"] }
+tauri-plugin-single-instance = "2"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Dwm", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 quick-xml = "0.40.0"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 aes-gcm = "0.10"
@@ -38,5 +44,3 @@ base64 = "0.22"
 pbkdf2 = { version = "0.12", features = ["sha1"] }
 sha1 = "0.10"
 semver = "1.0"
-
-

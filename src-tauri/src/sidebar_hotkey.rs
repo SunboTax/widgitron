@@ -13,8 +13,7 @@ pub const DEFAULT_SIDEBAR_HOTKEY: &str = "Ctrl+Alt+W";
 
 const SIDEBAR_HOTKEY_ID: i32 = 0x5754;
 
-static HOTKEY_SENDER: Lazy<Mutex<Option<Sender<HotkeyCommand>>>> =
-    Lazy::new(|| Mutex::new(None));
+static HOTKEY_SENDER: Lazy<Mutex<Option<Sender<HotkeyCommand>>>> = Lazy::new(|| Mutex::new(None));
 
 enum HotkeyCommand {
     Register(Option<String>),
@@ -56,7 +55,8 @@ pub fn start_global_sidebar_hotkey(app: AppHandle, hotkey: Option<String>) {
                     }
                 }
             }
-        }) {
+        })
+    {
         log::warn!("Failed to start sidebar hotkey thread: {}", err);
     }
 }
@@ -116,7 +116,11 @@ fn register_sidebar_hotkey(hotkey: Option<String>) -> Option<ParsedHotkey> {
             Some(parsed)
         }
         Err(err) => {
-            log::warn!("Failed to register sidebar hotkey '{}': {}", parsed.display, err);
+            log::warn!(
+                "Failed to register sidebar hotkey '{}': {}",
+                parsed.display,
+                err
+            );
             None
         }
     }

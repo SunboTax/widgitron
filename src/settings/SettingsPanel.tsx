@@ -709,7 +709,8 @@ export function SettingsPanel({
     }
 
     const setup = async () => {
-      const u1 = await listenServiceUpdateEvents(
+      try {
+        const u1 = await listenServiceUpdateEvents(
         () => active,
         {
           gpu: { clearRefresh: () => setGpuRefreshError(null) },
@@ -728,24 +729,44 @@ export function SettingsPanel({
           arxivSetter: setLiveArxivPapers,
         }
       );
-      unsubs.push(u1);
+        if (!active) {
+          u1();
+          return;
+        }
+        unsubs.push(u1);
 
-      const u1e = await listenBackendServiceError(
+        const u1e = await listenBackendServiceError(
         "paper_error",
         setPaperBackendError,
         () => active
       );
-      unsubs.push(u1e);
+        if (!active) {
+          u1e();
+          return;
+        }
+        unsubs.push(u1e);
 
-      const u1f = await listenBackendServiceError(
+        const u1f = await listenBackendServiceError(
         "arxiv_error",
         setArxivBackendError,
         () => active
       );
-      unsubs.push(u1f);
+        if (!active) {
+          u1f();
+          return;
+        }
+        unsubs.push(u1f);
 
-      const u3 = await listenGpuDataSync(setLiveGpuData, () => active);
-      unsubs.push(u3);
+        const u3 = await listenGpuDataSync(setLiveGpuData, () => active);
+        if (!active) {
+          u3();
+          return;
+        }
+        unsubs.push(u3);
+      } catch (error) {
+        unsubs.splice(0).forEach((unsubscribe) => unsubscribe());
+        console.error("Failed to setup settings listeners", error);
+      }
     };
     setup();
 
@@ -756,9 +777,11 @@ export function SettingsPanel({
   }, []);
 
   useEffect(() => {
+    let active = true;
     let unlisten: (() => void) | undefined;
     const setup = async () => {
-      unlisten = await tauriListen("ota_download_progress", (event) => {
+      const registered = await tauriListen("ota_download_progress", (event) => {
+        if (!active) return;
         const { state, progress, error } = event.payload;
         setDownloadState(state);
         setDownloadProgress(progress);
@@ -766,9 +789,15 @@ export function SettingsPanel({
           setUpdateError(error);
         }
       });
+      if (!active) {
+        registered();
+      } else {
+        unlisten = registered;
+      }
     };
-    setup();
+    setup().catch((error) => console.error("Failed to listen for OTA progress", error));
     return () => {
+      active = false;
       if (unlisten) unlisten();
     };
   }, []);
@@ -808,10 +837,7 @@ export function SettingsPanel({
     setDownloadProgress(0);
     setDownloadState("downloading");
     try {
-      await tauriInvoke("download_and_install_update", {
-        downloadUrl: updateInfo.download_url,
-        assetName: updateInfo.asset_name,
-      });
+      await tauriInvoke("download_and_install_update");
     } catch (err) {
       console.error(err);
       setUpdateError(String(err));

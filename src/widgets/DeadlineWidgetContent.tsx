@@ -109,6 +109,7 @@ export function DeadlineWidgetContent() {
           unlisteners.push(u5);
         }
       } catch (e) {
+        unlisteners.splice(0).forEach((unlisten) => unlisten());
         console.error("Failed to setup deadline listeners", e);
       }
     };

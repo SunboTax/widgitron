@@ -52,7 +52,7 @@ import { formatArxivKeywordLabel, groupArxivPapersByKeyword } from "./utils/arxi
 import type { AppConfig, ArxivConfig, ArxivPaper, GpuConfig, GpuInfo, PaperConfig, PaperDeadlineInfo, QuotaBarDisplay, QuotaConfig, QuotaItem, ServerGpuData } from "./types/config";
 import type { UpdateInfo } from "./types/tauri";
 import { resolveWidgetTheme } from "./utils/widgetTheme";
-import { CACHED_LABELS, cachedLabelWhen, gpuRefreshCachedLabel, messageShowsCached } from "./utils/cachedLabels";
+import { CACHED_LABELS, cachedLabelWhen, gpuRefreshCachedLabel } from "./utils/cachedLabels";
 import { SidebarLink } from "./components/SidebarLink";
 import { WindowButton } from "./components/WindowButton";
 import { MasterSwitch } from "./components/MasterSwitch";
@@ -445,11 +445,9 @@ function App() {
   const gpuServerCount = visibleGpuData.length;
   const gpuServersOnline = visibleGpuData.filter((s) => s.is_online).length;
   const gpuOfflineCount = gpuServerCount - gpuServersOnline;
-  const gpuStaleCount = visibleGpuData.filter((s) => messageShowsCached(s.error)).length;
   const gpuStat = computeGpuStatHint({
     refreshError: gpuRefreshError,
     totalGpus,
-    gpuStaleCount,
     gpuServerCount,
     gpuServersOnline,
     gpuOfflineCount,
@@ -558,7 +556,10 @@ function App() {
   const [activeSidebarTile, setActiveSidebarTile] = useState<SidebarSectionKey | null>(null);
   const sidebarOrderRef = useRef<SidebarSectionKey[]>(DEFAULT_SIDEBAR_ORDER);
   const sidebarBoardRef = useRef<HTMLDivElement | null>(null);
+  const sidebarPointerCleanupRef = useRef<(() => void) | null>(null);
   const prevActiveTabRef = useRef(activeTab);
+
+  useEffect(() => () => sidebarPointerCleanupRef.current?.(), []);
 
   useEffect(() => {
     const prevTab = prevActiveTabRef.current;
@@ -707,13 +708,28 @@ function App() {
             }
           }, stagger);
 
+          const uAppConfig = await tauriListen("app_config_update", (event) => {
+            if (!active) return;
+            const nextConfig = event.payload;
+            setAppConfig(nextConfig);
+            setIsPinned(nextConfig.always_on_top?.[label] ?? false);
+          });
+          if (!active) {
+            uAppConfig();
+          } else {
+            unlisteners.push(() => uAppConfig());
+          }
           const uTheme = await tauriListen("theme_update", (event) => {
             if (!active) return;
             const config = event.payload;
             setThemeConfig(config);
             setCurrentTheme(resolveWidgetTheme(config, label));
           });
-          unlisteners.push(() => uTheme());
+          if (!active) {
+            uTheme();
+          } else {
+            unlisteners.push(() => uTheme());
+          }
           return;
         }
 
@@ -774,7 +790,11 @@ function App() {
               setActiveWidgets((prev) => applyWidgetVisibilityChange(prev, id, visible));
             }
           );
-          unlisteners.push(() => uWidgetVis());
+          if (!active) {
+            uWidgetVis();
+          } else {
+            unlisteners.push(() => uWidgetVis());
+          }
         }
 
         const u1 = await win.onResized(async () => {
@@ -967,6 +987,7 @@ function App() {
           unlisteners.push(() => clearInterval(updateInterval));
         }
       } catch (e) {
+        unlisteners.splice(0).forEach((unlisten) => unlisten());
         console.error("Init failed", e);
       }
     };
@@ -1421,15 +1442,25 @@ function App() {
         setSidebarTileLayoutDraft(latestLayout);
       };
 
-      const onPointerUp = () => {
+      const cleanupPointerListeners = () => {
         window.removeEventListener("pointermove", onPointerMove);
         window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        if (sidebarPointerCleanupRef.current === cleanupPointerListeners) {
+          sidebarPointerCleanupRef.current = null;
+        }
+      };
+      const onPointerUp = () => {
+        cleanupPointerListeners();
         setActiveSidebarTile(null);
         saveSidebarTileLayout(latestLayout);
       };
 
+      sidebarPointerCleanupRef.current?.();
+      sidebarPointerCleanupRef.current = cleanupPointerListeners;
       window.addEventListener("pointermove", onPointerMove);
       window.addEventListener("pointerup", onPointerUp, { once: true });
+      window.addEventListener("pointercancel", onPointerUp, { once: true });
     };
     const startSidebarTileResize = (
       event: ReactPointerEvent<HTMLButtonElement>,
@@ -1468,15 +1499,25 @@ function App() {
         setSidebarTileLayoutDraft(latestLayout);
       };
 
-      const onPointerUp = () => {
+      const cleanupPointerListeners = () => {
         window.removeEventListener("pointermove", onPointerMove);
         window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        if (sidebarPointerCleanupRef.current === cleanupPointerListeners) {
+          sidebarPointerCleanupRef.current = null;
+        }
+      };
+      const onPointerUp = () => {
+        cleanupPointerListeners();
         setActiveSidebarTile(null);
         saveSidebarTileLayout(latestLayout);
       };
 
+      sidebarPointerCleanupRef.current?.();
+      sidebarPointerCleanupRef.current = cleanupPointerListeners;
       window.addEventListener("pointermove", onPointerMove);
       window.addEventListener("pointerup", onPointerUp, { once: true });
+      window.addEventListener("pointercancel", onPointerUp, { once: true });
     };
 
     return (
@@ -1957,10 +1998,6 @@ function App() {
                     </div>
                   ) : (
                     visibleGpuData.map((server, idx) => {
-                      const hasCachedGpus =
-                        Array.isArray(server.gpu_list) && server.gpu_list.length > 0;
-                      const showStaleOffline = !server.is_online && hasCachedGpus;
-
                       return (
                       <div key={idx} className="glass-card p-6">
                         <div className="flex items-center justify-between mb-6">
@@ -1969,8 +2006,6 @@ function App() {
                               className={`w-3 h-3 rounded-full ${
                                 server.is_online
                                   ? "bg-emerald-500 shadow-[0_0_10px_#10b981]"
-                                  : showStaleOffline
-                                  ? "bg-amber-500 shadow-[0_0_10px_#f59e0b]"
                                   : "bg-red-500"
                               }`}
                             />
@@ -1981,11 +2016,6 @@ function App() {
                             >
                               {server.host}
                             </span>
-                            {showStaleOffline && (
-                              <span className="text-[10px] font-black uppercase tracking-widest text-amber-400">
-                                Offline · cached
-                              </span>
-                            )}
                           </div>
                           <span className="text-xs font-black text-slate-500 uppercase tracking-widest">
                             {server.gpu_list.length} GPUs Detected
@@ -2093,15 +2123,6 @@ function App() {
                             ));
                           })()}
                         </div>
-                        {server.error && (
-                          <p
-                            className={`mt-4 text-[10px] italic font-medium break-all ${
-                              showStaleOffline ? "text-amber-400/80" : "text-red-400/60"
-                            }`}
-                          >
-                            {server.error}
-                          </p>
-                        )}
                       </div>
                     );
                     })

@@ -111,6 +111,10 @@ export function QuotaWidgetContent() {
           },
           { quotaSetter: setQuotas }
         );
+        if (!active) {
+          u1();
+          return;
+        }
         unlisteners.push(u1);
 
         const u3 = await tauriListen("quota_config_update", (event) => {
@@ -119,6 +123,10 @@ export function QuotaWidgetContent() {
           setShowPlanType(event.payload?.show_plan_type !== false);
           setConfigItems(event.payload?.items || []);
         });
+        if (!active) {
+          u3();
+          return;
+        }
         unlisteners.push(u3);
 
         const u4 = await listenQuotaMonitorStatus(
@@ -126,6 +134,10 @@ export function QuotaWidgetContent() {
           setQuotaBackendError,
           () => active
         );
+        if (!active) {
+          u4();
+          return;
+        }
         unlisteners.push(u4);
 
         const appConfig = await tauriInvoke("get_app_config");
@@ -149,8 +161,13 @@ export function QuotaWidgetContent() {
             },
           });
         });
+        if (!active) {
+          u5();
+          return;
+        }
         unlisteners.push(u5);
       } catch (e) {
+        unlisteners.splice(0).forEach((unlisten) => unlisten());
         console.error("Failed to setup quota listeners", e);
       }
     };

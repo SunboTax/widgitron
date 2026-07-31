@@ -101,19 +101,34 @@ export async function listenGpuDataSync(
   isActive: () => boolean
 ): Promise<() => void> {
   const unsubs: (() => void)[] = [];
+  const cleanup = () => unsubs.splice(0).forEach((unsubscribe) => unsubscribe());
 
-  const uClear = await tauriListen("gpu_clear", () => {
-    if (!isActive()) return;
-    setter([]);
-  });
-  unsubs.push(uClear);
+  try {
+    const uClear = await tauriListen("gpu_clear", () => {
+      if (!isActive()) return;
+      setter([]);
+    });
+    if (!isActive()) {
+      uClear();
+      return () => {};
+    }
+    unsubs.push(uClear);
 
-  const uPrune = await tauriListen("gpu_prune", (event) => {
-    if (!isActive()) return;
-    const host = event.payload;
-    setter((prev) => prev.filter((s) => s.host !== host));
-  });
-  unsubs.push(uPrune);
+    const uPrune = await tauriListen("gpu_prune", (event) => {
+      if (!isActive()) return;
+      const host = event.payload;
+      setter((prev) => prev.filter((s) => s.host !== host));
+    });
+    if (!isActive()) {
+      uPrune();
+      cleanup();
+      return () => {};
+    }
+    unsubs.push(uPrune);
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
 
-  return () => unsubs.forEach((f) => f());
+  return cleanup;
 }

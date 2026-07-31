@@ -9,34 +9,53 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+use widgitron_core::clamp_poll_interval_secs;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use crate::{config_store, secrets};
 use crate::models::{AppConfig, GlobalState, GpuConfig, GpuInfo, ServerConfig, ServerGpuData};
+use crate::{config_store, secrets};
 
 const GPU_CACHE_FILE: &str = "gpu_data_cache.json";
+const MIN_GPU_POLL_INTERVAL_SECS: u64 = 1;
+const MAX_GPU_POLL_INTERVAL_SECS: u64 = 86_400;
 
+pub fn normalize_gpu_config(config: &mut GpuConfig) {
+    config.update_interval = Some(clamp_poll_interval_secs(
+        config.update_interval.unwrap_or(5),
+        MIN_GPU_POLL_INTERVAL_SECS,
+        MAX_GPU_POLL_INTERVAL_SECS,
+    ));
+}
 
 pub fn read_gpu_config(app: &AppHandle) -> GpuConfig {
     let mut config = config_store::read_config::<GpuConfig>(app, "gpu_monitor.json");
     decrypt_gpu_config_secrets(&mut config);
+    normalize_gpu_config(&mut config);
     config
 }
 
 pub fn write_gpu_config(app: &AppHandle, config: &GpuConfig) -> Result<(), String> {
     let mut disk_config = config.clone();
+    normalize_gpu_config(&mut disk_config);
     encrypt_gpu_config_secrets(&mut disk_config)?;
     config_store::write_config(app, "gpu_monitor.json", &disk_config)
 }
 
 fn encrypt_gpu_config_secrets(config: &mut GpuConfig) -> Result<(), String> {
     for server in &mut config.servers {
-        if let Some(password) = server.password.as_mut() {
-            if !password.trim().is_empty() {
-                *password = secrets::encrypt_secret(password)?;
-            }
+        let Some(password) = server.password.as_deref() else {
+            continue;
+        };
+        if !password.trim().is_empty() {
+            server.password = Some(secrets::encrypt_secret(password)?);
+            server.password_decryption_failed = false;
+            server.preserved_encrypted_password = None;
+        } else if server.password_decryption_failed {
+            server.password = Some(server.preserved_encrypted_password.clone().ok_or_else(|| {
+                format!("Missing preserved encrypted SSH password for {}", server.host)
+            })?);
         }
     }
     Ok(())
@@ -44,20 +63,31 @@ fn encrypt_gpu_config_secrets(config: &mut GpuConfig) -> Result<(), String> {
 
 fn decrypt_gpu_config_secrets(config: &mut GpuConfig) {
     for server in &mut config.servers {
-        if let Some(password) = server.password.as_mut() {
-            if secrets::is_encrypted_secret(password) {
-                match secrets::decrypt_secret(password) {
-                    Ok(decrypted) => *password = decrypted,
-                    Err(err) => {
-                        log::warn!("Failed to decrypt SSH password for {}: {}", server.host, err);
-                        password.clear();
-                    }
-                }
+        let Some(password) = server.password.clone() else {
+            continue;
+        };
+        if !secrets::is_encrypted_secret(&password) {
+            continue;
+        }
+        match secrets::decrypt_secret(&password) {
+            Ok(decrypted) => {
+                server.password = Some(decrypted);
+                server.password_decryption_failed = false;
+                server.preserved_encrypted_password = None;
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to decrypt SSH password for {}: {}",
+                    server.host,
+                    err
+                );
+                server.preserved_encrypted_password = Some(password);
+                server.password = Some(String::new());
+                server.password_decryption_failed = true;
             }
         }
     }
 }
-
 #[derive(Default)]
 struct SshConfigHost {
     host_name: Option<String>,
@@ -78,7 +108,11 @@ fn user_home_dir() -> Option<PathBuf> {
         }
     }
     let expanded = shellexpand::tilde("~").to_string();
-    if expanded.starts_with('~') { None } else { Some(PathBuf::from(expanded)) }
+    if expanded.starts_with('~') {
+        None
+    } else {
+        Some(PathBuf::from(expanded))
+    }
 }
 
 fn ssh_pattern_matches(pattern: &str, host: &str) -> bool {
@@ -104,7 +138,9 @@ fn read_ssh_config_file_for_host(host: &str) -> Option<SshConfigHost> {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let Some(key) = parts.next() else { continue; };
+        let Some(key) = parts.next() else {
+            continue;
+        };
         let value = parts.collect::<Vec<_>>().join(" ");
         if key.eq_ignore_ascii_case("Host") {
             current_matches = value
@@ -139,7 +175,9 @@ fn parse_ssh_resolved_config(content: &str) -> Option<SshConfigHost> {
             continue;
         }
         let mut parts = line.splitn(2, char::is_whitespace);
-        let Some(key) = parts.next() else { continue; };
+        let Some(key) = parts.next() else {
+            continue;
+        };
         let value = parts.next().unwrap_or("").trim();
         if value.is_empty() {
             continue;
@@ -159,7 +197,7 @@ fn parse_ssh_resolved_config(content: &str) -> Option<SshConfigHost> {
         || cfg.user.is_some()
         || cfg.port.is_some()
         || !cfg.identity_files.is_empty())
-        .then_some(cfg)
+    .then_some(cfg)
 }
 
 fn read_openssh_config_for_host(host: &str) -> Option<SshConfigHost> {
@@ -270,7 +308,10 @@ fn run_openssh_command(
     cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
-        .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30).max(1)))
+        .arg(format!(
+            "ConnectTimeout={}",
+            timeout.as_secs().min(30).max(1)
+        ))
         .arg("-T");
 
     if !server.use_ssh_config.unwrap_or(false) {
@@ -304,7 +345,11 @@ fn run_openssh_command(
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("ssh {} timed out after {}s", target, timeout.as_secs()));
+                    return Err(format!(
+                        "ssh {} timed out after {}s",
+                        target,
+                        timeout.as_secs()
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -502,7 +547,11 @@ pub fn ssh_authenticate(sess: &mut Session, s: &ServerConfig) -> Result<(), Stri
         Ok(_) => Ok(()),
         Err(agent_err) => {
             errors.push(format!("ssh-agent: {}", agent_err));
-            Err(format!("Authentication failed for user '{}'. Tried {}", user, errors.join("; ")))
+            Err(format!(
+                "Authentication failed for user '{}'. Tried {}",
+                user,
+                errors.join("; ")
+            ))
         }
     }
 }

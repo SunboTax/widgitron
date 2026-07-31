@@ -29,7 +29,7 @@
 > [!TIP]
 > Windows users can download the pre-compiled standalone executable directly from the [Releases](https://github.com/starkmomo/widgitron/releases) page.
 
-Widgitron is a modern, cross-platform dashboard built with **Tauri**, **Rust**, and **React**. It provides a premium, glassmorphic UI for monitoring GPUs, conference deadlines, and arxiv research papers.
+Widgitron is a modern Windows desktop dashboard built with **Tauri**, **Rust**, and **React**. It provides a premium, glassmorphic UI for monitoring GPUs, conference deadlines, and arxiv research papers. The current release depends on Windows APIs for desktop integration, credential encryption, and updates; macOS and Linux are not yet supported.
 
 <p align="center">
   <img src="assets/quota_monitor.png" width="50%" />
@@ -56,6 +56,8 @@ Widgitron is a modern, cross-platform dashboard built with **Tauri**, **Rust**, 
 ## 🚀 Quick Start
 
 ### Installation
+
+Development and production builds currently require Windows 10 or later.
 
 ```bash
 # Clone the repository

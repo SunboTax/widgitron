@@ -120,3 +120,27 @@ Before submitting code changes, run the following command checklist from the wor
     *   Compile TS and build: `npm run build` or `pnpm build`
 3.  **Memory Audits**:
     *   Periodically check the Webview and Rust backend memory consumption during extended mock runs (e.g., 24+ hour run simulation).
+
+### 3.1 Portable Core Tests (No Visual Studio Required)
+
+Pure business logic belongs in `src-tauri/crates/widgitron-core`. It must not depend on Tauri,
+WebView2, or Windows APIs, so its tests can run with the GNU Rust toolchain:
+
+```powershell
+rustup run stable-x86_64-pc-windows-gnu cargo test `
+  --manifest-path src-tauri/Cargo.toml `
+  -p widgitron-core `
+  --target x86_64-pc-windows-gnu
+```
+
+Type-check the full application and all test targets without linking the Tauri test binary:
+
+```powershell
+rustup run stable-x86_64-pc-windows-gnu cargo check `
+  --manifest-path src-tauri/Cargo.toml `
+  --workspace --all-targets `
+  --target x86_64-pc-windows-gnu
+```
+
+The Windows CI workflow runs the complete workspace test suite with MSVC. Keep platform-neutral
+parsing, validation, and state-transition logic in `widgitron-core` so local tests remain executable.

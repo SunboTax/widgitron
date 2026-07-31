@@ -8,7 +8,7 @@ import { gpuStatHint } from "../utils/statHints";
 import { listenServiceUpdateEvents } from "../utils/serviceUpdateEvents";
 import { listenGpuDataSync } from "../utils/gpuDataSync";
 import { LIVE_DATA_SECTION, refetchSectionLiveData } from "../utils/sectionLiveData";
-import { gpuRefreshCachedLabel, messageShowsCached } from "../utils/cachedLabels";
+import { gpuRefreshCachedLabel } from "../utils/cachedLabels";
 import { CopyButton } from "../components/CopyButton";
 import { ServiceErrorBanners } from "../components/ServiceErrorBanners";
 import type { GpuConfig, GpuInfo, ServerGpuData, SlurmStep } from "../types/config";
@@ -236,6 +236,7 @@ export function GPUWidgetContent() {
           unlisteners.push(() => u6());
         }
       } catch (e) {
+        unlisteners.splice(0).forEach((unlisten) => unlisten());
         console.error("Widget init failed", e);
       }
     };
@@ -274,12 +275,10 @@ export function GPUWidgetContent() {
   const gpuOnlineCount = orderedServerData.filter((s) => s.is_online).length;
   const gpuOfflineCount = orderedServerData.length - gpuOnlineCount;
   const totalGpus = orderedServerData.reduce((acc, s) => acc + (s.gpu_list?.length ?? 0), 0);
-  const gpuStaleCount = orderedServerData.filter((s) => messageShowsCached(s.error)).length;
   const configuredServerCount = (gpuConfig.servers || []).length;
   const gpuStat = gpuStatHint({
     refreshError,
     totalGpus,
-    gpuStaleCount,
     gpuServerCount: orderedServerData.length,
     gpuServersOnline: gpuOnlineCount,
     gpuOfflineCount,
@@ -351,9 +350,6 @@ export function GPUWidgetContent() {
           </div>
         ) : orderedServerData.length > 0 ? (
           orderedServerData.map((server, idx) => {
-            const hasCachedGpus = Array.isArray(server.gpu_list) && server.gpu_list.length > 0;
-            const showStaleOffline = !server.is_online && hasCachedGpus;
-
             const groups: Record<string, GpuInfo[]> = {};
             server.gpu_list.forEach((gpu) => {
               const gid = gpu.job_id || "SYSTEM";
@@ -392,19 +388,6 @@ export function GPUWidgetContent() {
                     >
                       Online
                     </span>
-                  ) : showStaleOffline ? (
-                    <span
-                      className={`text-[7px] font-black uppercase shrink-0 ${
-                        isCompact ? "" : "rounded border px-1.5 py-0.5"
-                      }`}
-                      style={{
-                        color: warning,
-                        borderColor: isCompact ? undefined : `${warning}44`,
-                        backgroundColor: isCompact ? undefined : `${warning}12`,
-                      }}
-                    >
-                      Offline · cached
-                    </span>
                   ) : (
                     <span
                       className={`text-[7px] font-black uppercase shrink-0 ${
@@ -420,15 +403,6 @@ export function GPUWidgetContent() {
                     </span>
                   )}
                 </div>
-
-                {server.error && (
-                  <div
-                    className="text-[9px] font-medium italic px-2"
-                    style={{ color: showStaleOffline ? warning : danger }}
-                  >
-                    {server.error}
-                  </div>
-                )}
 
                 <div className={`${isCompact ? "space-y-3" : "space-y-2"} pl-2`}>
                   {isCompact ? (

@@ -41,6 +41,10 @@ export function useWidgetTheme(kind: WidgetThemeKind): WidgetTheme | null {
           latestThemeConfig = event.payload;
           updateTheme();
         });
+        if (!active) {
+          unlistenTheme();
+          return;
+        }
         unlisteners.push(() => unlistenTheme());
 
         const unlistenApp = await tauriListen("app_config_update", (event) => {
@@ -48,8 +52,13 @@ export function useWidgetTheme(kind: WidgetThemeKind): WidgetTheme | null {
           latestAppConfig = event.payload;
           updateTheme();
         });
+        if (!active) {
+          unlistenApp();
+          return;
+        }
         unlisteners.push(() => unlistenApp());
       } catch (e) {
+        unlisteners.splice(0).forEach((unlisten) => unlisten());
         console.error("Widget theme load failed", e);
       }
     };
