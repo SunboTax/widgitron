@@ -24,7 +24,12 @@ const GPU_STALE_CACHE_MAX_FAILURES: u32 = 2;
 /// Keep this close to the GPU poll interval so new/finished jobs show up quickly.
 const SLURM_SQUEUE_INTERVAL_SECS: i64 = 3;
 /// After this many consecutive squeue failures, drop retained Slurm job state.
-const SLURM_SQUEUE_STALE_MAX_FAILURES: u32 = 2;
+/// Busy controllers (e.g. LRZ AI) can flake for several polls; keep jobs sticky.
+const SLURM_SQUEUE_STALE_MAX_FAILURES: u32 = 8;
+/// Minimum seconds between launching a new widgitron-gpu srun for the same job.
+/// Each launch consumes a Slurm step ID; rapid retries can hit MaxJobSteps and
+/// kill the user's entire allocation (including interactive work).
+const SLURM_MONITOR_RESTART_COOLDOWN_SECS: u64 = 120;
 
 fn clear_job_gpus_from_list(
     gpu_list: &mut Vec<GpuInfo>,
@@ -51,6 +56,136 @@ fn prune_slurm_maps_for_missing_jobs(
     nodelists.retain(|jid, _| active_job_ids.iter().any(|active| active == jid));
     times.retain(|jid, _| active_job_ids.iter().any(|active| active == jid));
     steps.retain(|jid, _| active_job_ids.iter().any(|active| active == jid));
+}
+
+/// Run a remote command over an existing SSH session and return `(exit_status, stdout)`.
+/// Callers must treat non-zero exit as failure — empty stdout is not "no data" by itself.
+fn ssh_exec_capture(sess: &Session, cmd: &str) -> Result<(i32, String), String> {
+    let mut channel = sess
+        .channel_session()
+        .map_err(|e| format!("SSH channel open failed: {}", e))?;
+    channel
+        .exec(cmd)
+        .map_err(|e| format!("SSH exec failed: {}", e))?;
+    let mut stdout = String::new();
+    channel
+        .read_to_string(&mut stdout)
+        .map_err(|e| format!("SSH read failed: {}", e))?;
+    let _ = channel.wait_close();
+    let status = channel.exit_status().unwrap_or(-1);
+    Ok((status, stdout))
+}
+
+/// Parse `jobid|nodes|nodelist|time` (or shorter) lines from squeue.
+fn parse_squeue_allocation_lines(
+    output: &str,
+) -> (
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+) {
+    let mut job_nodes = HashMap::new();
+    let mut nodelists = HashMap::new();
+    let mut times = HashMap::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Ignore shell/controller noise that sometimes lands on stdout under load.
+        if line.starts_with("squeue:")
+            || line.starts_with("slurm_load")
+            || line.contains("Socket timed out")
+            || line.contains("Unable to contact")
+        {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() >= 4 {
+            let job_id = parts[0].trim();
+            if job_id.is_empty() || !job_id.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            job_nodes.insert(job_id.to_string(), parts[1].trim().to_string());
+            nodelists.insert(job_id.to_string(), parts[2].trim().to_string());
+            times.insert(job_id.to_string(), parts[3].trim().to_string());
+        } else if parts.len() == 3 {
+            let job_id = parts[0].trim();
+            if job_id.is_empty() || !job_id.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            job_nodes.insert(job_id.to_string(), parts[1].trim().to_string());
+            nodelists.insert(job_id.to_string(), parts[2].trim().to_string());
+        } else if parts.len() == 2 {
+            let job_id = parts[0].trim();
+            if job_id.is_empty() || !job_id.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            job_nodes.insert(job_id.to_string(), parts[1].trim().to_string());
+        } else if line.chars().all(|c| c.is_ascii_digit()) {
+            job_nodes.insert(line.to_string(), "1".to_string());
+        }
+    }
+    (job_nodes, nodelists, times)
+}
+
+/// True when squeue stdout looks like a controller/error dump rather than a job table.
+fn squeue_output_looks_like_error(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("socket timed out")
+        || lower.contains("unable to contact")
+        || lower.contains("slurm_load_jobs error")
+        || lower.contains("error: ")
+        || lower.contains("invalid user")
+}
+
+/// Cancel only widgitron-gpu probe steps — never the user's interactive/batch steps.
+fn cancel_widgitron_gpu_steps(sess: &Session, user: &str, job_id: Option<&str>) {
+    let cmd = match job_id {
+        Some(jid) => format!(
+            "steps=$(squeue -s -j {jid} -h -o \"%i %j\" 2>/dev/null || true); \
+             targets=$(echo \"$steps\" | awk '$2==\"widgitron-gpu\" {{print $1}}'); \
+             [ -n \"$targets\" ] && scancel $targets"
+        ),
+        None => format!(
+            "steps=$(squeue -s --me -h -o \"%i %j\" 2>/dev/null \
+              || squeue -s -u $(whoami) -h -o \"%i %j\" 2>/dev/null \
+              || squeue -s -u {user} -h -o \"%i %j\"); \
+             targets=$(echo \"$steps\" | awk '$2==\"widgitron-gpu\" {{print $1}}'); \
+             [ -n \"$targets\" ] && scancel $targets"
+        ),
+    };
+    match ssh_exec_capture(sess, &cmd) {
+        Ok((status, out)) => {
+            if status != 0 {
+                log::debug!(
+                    "widgitron-gpu step cleanup exit {} preview {:?}",
+                    status,
+                    out.chars().take(120).collect::<String>()
+                );
+            }
+        }
+        Err(e) => log::debug!("widgitron-gpu step cleanup failed: {}", e),
+    }
+}
+
+fn cancel_widgitron_gpu_steps_openssh(server: &ServerConfig, job_id: Option<&str>) {
+    let user = server.user.as_deref().unwrap_or("root");
+    let cmd = match job_id {
+        Some(jid) => format!(
+            "steps=$(squeue -s -j {jid} -h -o \"%i %j\" 2>/dev/null || true); \
+             targets=$(echo \"$steps\" | awk '$2==\"widgitron-gpu\" {{print $1}}'); \
+             [ -n \"$targets\" ] && scancel $targets"
+        ),
+        None => format!(
+            "steps=$(squeue -s --me -h -o \"%i %j\" 2>/dev/null \
+              || squeue -s -u $(whoami) -h -o \"%i %j\" 2>/dev/null \
+              || squeue -s -u {user} -h -o \"%i %j\"); \
+             targets=$(echo \"$steps\" | awk '$2==\"widgitron-gpu\" {{print $1}}'); \
+             [ -n \"$targets\" ] && scancel $targets"
+        ),
+    };
+    let _ = run_openssh_command(server, &cmd, Duration::from_secs(20));
 }
 
 fn apply_offline_gpu_state(
@@ -402,6 +537,69 @@ fn run_openssh_command(
         Err(format!("ssh {} failed: {}", target, detail))
     }
 }
+
+/// Stream stdout lines from a long-lived OpenSSH remote command.
+/// `on_line` returns `Ok(true)` to continue, `Ok(false)` to stop cleanly.
+fn stream_openssh_lines<F>(server: &ServerConfig, remote_cmd: &str, mut on_line: F) -> Result<(), String>
+where
+    F: FnMut(&str) -> Result<bool, String>,
+{
+    let target = openssh_target(server);
+    if target.is_empty() {
+        return Err("SSH target is empty".to_string());
+    }
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=30")
+        .arg("-T");
+
+    if !server.use_ssh_config.unwrap_or(false) {
+        if let Some(port) = server.port {
+            cmd.arg("-p").arg(port.to_string());
+        }
+        if let Some(key_file) = server.key_file.as_deref() {
+            if !key_file.trim().is_empty() {
+                cmd.arg("-i").arg(shellexpand::tilde(key_file).to_string());
+            }
+        }
+    }
+
+    cmd.arg(&target)
+        .arg(remote_cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start ssh for {}: {}", target, e))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("ssh {} missing stdout pipe", target))?;
+    let reader = std::io::BufReader::new(stdout);
+    use std::io::BufRead;
+    for line in reader.lines() {
+        let l = line.map_err(|e| format!("ssh {} read error: {}", target, e))?;
+        match on_line(&l)? {
+            true => {}
+            false => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+    }
+    let _ = child.wait();
+    Err(format!("ssh {} stream closed EOF", target))
+}
+
 pub fn load_gpu_cache(app: &AppHandle) -> HashMap<String, ServerGpuData> {
     let items: Vec<ServerGpuData> = config_store::read_config(app, GPU_CACHE_FILE);
     items
@@ -645,16 +843,9 @@ fn reuse_or_connect_ssh_session(
     let sess = connect_ssh_session(server)?;
 
     if server.use_slurm.unwrap_or(false) {
-        if let Ok(mut clean_chan) = sess.channel_session() {
-            let user = server.user.as_deref().unwrap_or("root");
-            let cleanup_cmd = format!(
-                "steps=$(squeue -s --me -h -o \"%i %j\" 2>/dev/null || squeue -s -u $(whoami) -h -o \"%i %j\" || squeue -s -u {} -h -o \"%i %j\"); targets=$(echo \"$steps\" | grep \"widgitron-gpu\" | awk '{{print $1}}'); [ -n \"$targets\" ] && scancel $targets",
-                user
-            );
-            let _ = clean_chan.exec(&cleanup_cmd);
-            let mut dummy = String::new();
-            let _ = clean_chan.read_to_string(&mut dummy);
-        }
+        let user = server.user.as_deref().unwrap_or("root");
+        // Drop orphaned probe steps only — never interactive user steps.
+        cancel_widgitron_gpu_steps(&sess, user, None);
     }
 
     Ok(sess)
@@ -683,122 +874,8 @@ pub fn start_ssh_monitor_task(
                     None => format!("{}:node:0", s_m.host),
                 };
                 let timeout_secs = (interval * 3).max(15) + 10;
-                if s_m.use_ssh_config.unwrap_or(false) {
-                    // OpenSSH one-shot poll loop (no persistent stream). Emit each batch so the
-                    // UI does not wait on the slower main worker cycle.
-                    loop {
-                        let still_active = {
-                            if let Ok(monitors) = state_inner.active_monitors.lock() {
-                                monitors.contains_key(&my_key)
-                            } else {
-                                true
-                            }
-                        };
-                        if !still_active {
-                            return Ok(());
-                        }
-
-                        let watch_cmd = match &j_m {
-                            Some(id) => {
-                                let node_arg = match &node_m {
-                                    Some(node) => format!("-N 1 -n 1 -w {}", node),
-                                    None => "-n 1".to_string(),
-                                };
-                                format!(
-                                    "srun --jobid {} --overlap {} --job-name=widgitron-gpu sh -c 'node=$(hostname -s 2>/dev/null || hostname); {} | sed \"s/^/${{node}}: /\" || exit; echo \"${{node}}: END_BATCH\"'",
-                                    id,
-                                    node_arg,
-                                    smi_cmd
-                                )
-                            }
-                            None => format!("sh -c '{} || exit; echo \"END_BATCH\"'", smi_cmd),
-                        };
-                        let output = run_openssh_command(
-                            &s_m,
-                            &watch_cmd,
-                            Duration::from_secs(timeout_secs),
-                        )?;
-                        let mut task_batches: HashMap<String, String> = HashMap::new();
-                        for l in output.lines() {
-                            let task_id = if let Some((prefix, _)) = l.split_once(": ") {
-                                let prefix = prefix.trim();
-                                if !prefix.is_empty() {
-                                    prefix.to_string()
-                                } else {
-                                    "default".to_string()
-                                }
-                            } else {
-                                "default".to_string()
-                            };
-
-                            if l.contains("END_BATCH") {
-                                let app_config =
-                                    config_store::read_config::<AppConfig>(&app_inner, "app_config.json");
-                                if !app_config.gpu_enabled.unwrap_or(true) {
-                                    return Err("GPU monitoring disabled".to_string());
-                                }
-                                let batch = task_batches.entry(task_id.clone()).or_default();
-                                let mut parsed = parse_nvidia_smi_output(batch);
-                                if !parsed.is_empty() {
-                                    for p in &mut parsed {
-                                        p.job_id = j_m.clone();
-                                        if p.node.is_none() {
-                                            p.node = node_m.clone();
-                                        }
-                                    }
-                                    let node_to_replace = parsed[0].node.clone();
-                                    let mut emitted: Option<ServerGpuData> = None;
-                                    if let Ok(mut state_gpu) = state_inner.gpu_data.lock() {
-                                        let data =
-                                            state_gpu.entry(s_m.host.clone()).or_insert(ServerGpuData {
-                                                host: s_m.host.clone(),
-                                                is_online: true,
-                                                gpu_list: vec![],
-                                                error: None,
-                                                last_update: None,
-                                                slurm_steps: None,
-                                                slurm_nodelists: None,
-                                                slurm_times: None,
-                                                slurm_queue_jobs: None,
-                                            });
-                                        data.is_online = true;
-                                        data.error = None;
-                                        if let Some(node) = node_to_replace {
-                                            data.gpu_list.retain(|g| {
-                                                !(g.job_id == j_m && g.node == Some(node.clone()))
-                                            });
-                                        } else {
-                                            data.gpu_list.retain(|g| g.job_id != j_m);
-                                        }
-                                        data.gpu_list.extend(parsed);
-                                        data.last_update =
-                                            Some(Utc::now().format("%H:%M:%S").to_string());
-                                        emitted = Some(data.clone());
-                                    }
-                                    if let Some(gpu_data) = emitted {
-                                        emit_gpu_update_if_changed(
-                                            &app_inner,
-                                            state_inner.as_ref(),
-                                            &gpu_data,
-                                        );
-                                    }
-                                }
-                                batch.clear();
-                            } else {
-                                let batch = task_batches.entry(task_id).or_default();
-                                batch.push_str(l);
-                                batch.push('\n');
-                            }
-                        }
-                        std::thread::sleep(Duration::from_secs(interval.max(1)));
-                    }
-                }
-                let sess = connect_ssh_session_with_read_timeout(
-                    &s_m,
-                    Duration::from_secs(timeout_secs),
-                )?;
-
-                let mut channel = sess.channel_session().map_err(|e| format!("Channel open failed: {}", e))?;
+                // One long-lived remote loop per monitor. Never poll with repeated
+                // one-shot `srun` — each launch burns a Slurm step ID.
                 let watch_cmd = match &j_m {
                     Some(id) => {
                         let node_arg = match &node_m {
@@ -812,9 +889,121 @@ pub fn start_ssh_monitor_task(
                             smi_cmd,
                             interval
                         )
-                    },
-                    None => format!("sh -c 'while true; do {} || exit; echo \"END_BATCH\" || exit; sleep {}; done'", smi_cmd, interval),
+                    }
+                    None => format!(
+                        "sh -c 'while true; do {} || exit; echo \"END_BATCH\" || exit; sleep {}; done'",
+                        smi_cmd,
+                        interval
+                    ),
                 };
+
+                if s_m.use_ssh_config.unwrap_or(false) {
+                    if j_m.is_some() {
+                        cancel_widgitron_gpu_steps_openssh(&s_m, j_m.as_deref());
+                    }
+                    log::debug!(
+                        "Launching OpenSSH GPU watch on host {} job {:?} node {:?}",
+                        s_m.host,
+                        j_m,
+                        node_m
+                    );
+                    let mut task_batches: HashMap<String, String> = HashMap::new();
+                    stream_openssh_lines(&s_m, &watch_cmd, |l| {
+                        let task_id = if let Some((prefix, _)) = l.split_once(": ") {
+                            let prefix = prefix.trim();
+                            if !prefix.is_empty() {
+                                prefix.to_string()
+                            } else {
+                                "default".to_string()
+                            }
+                        } else {
+                            "default".to_string()
+                        };
+
+                        if l.contains("END_BATCH") {
+                            let app_config =
+                                config_store::read_config::<AppConfig>(&app_inner, "app_config.json");
+                            if !app_config.gpu_enabled.unwrap_or(true) {
+                                return Err("GPU monitoring disabled".to_string());
+                            }
+                            let still_active = {
+                                if let Ok(monitors) = state_inner.active_monitors.lock() {
+                                    monitors.contains_key(&my_key)
+                                } else {
+                                    true
+                                }
+                            };
+                            if !still_active {
+                                return Ok(false);
+                            }
+
+                            let batch = task_batches.entry(task_id.clone()).or_default();
+                            let mut parsed = parse_nvidia_smi_output(batch);
+                            if !parsed.is_empty() {
+                                for p in &mut parsed {
+                                    p.job_id = j_m.clone();
+                                    if p.node.is_none() {
+                                        p.node = node_m.clone();
+                                    }
+                                }
+                                let node_to_replace = parsed[0].node.clone();
+                                let mut emitted: Option<ServerGpuData> = None;
+                                if let Ok(mut state_gpu) = state_inner.gpu_data.lock() {
+                                    let data =
+                                        state_gpu.entry(s_m.host.clone()).or_insert(ServerGpuData {
+                                            host: s_m.host.clone(),
+                                            is_online: true,
+                                            gpu_list: vec![],
+                                            error: None,
+                                            last_update: None,
+                                            slurm_steps: None,
+                                            slurm_nodelists: None,
+                                            slurm_times: None,
+                                            slurm_queue_jobs: None,
+                                        });
+                                    data.is_online = true;
+                                    data.error = None;
+                                    if let Some(node) = node_to_replace {
+                                        data.gpu_list.retain(|g| {
+                                            !(g.job_id == j_m && g.node == Some(node.clone()))
+                                        });
+                                    } else {
+                                        data.gpu_list.retain(|g| g.job_id != j_m);
+                                    }
+                                    data.gpu_list.extend(parsed);
+                                    data.last_update =
+                                        Some(Utc::now().format("%H:%M:%S").to_string());
+                                    emitted = Some(data.clone());
+                                }
+                                if let Some(gpu_data) = emitted {
+                                    emit_gpu_update_if_changed(
+                                        &app_inner,
+                                        state_inner.as_ref(),
+                                        &gpu_data,
+                                    );
+                                }
+                            }
+                            batch.clear();
+                        } else {
+                            let batch = task_batches.entry(task_id).or_default();
+                            batch.push_str(l);
+                            batch.push('\n');
+                        }
+                        Ok(true)
+                    })?;
+                    return Err("SSH stream closed EOF".to_string());
+                }
+
+                let sess = connect_ssh_session_with_read_timeout(
+                    &s_m,
+                    Duration::from_secs(timeout_secs),
+                )?;
+                if let Some(id) = j_m.as_deref() {
+                    let user = s_m.user.as_deref().unwrap_or("root");
+                    cancel_widgitron_gpu_steps(&sess, user, Some(id));
+                }
+
+                let mut channel = sess.channel_session().map_err(|e| format!("Channel open failed: {}", e))?;
 
                 log::debug!(
                     "Launching GPU watch on host {} job {:?} node {:?}",
@@ -930,9 +1119,6 @@ pub fn start_ssh_monitor_task(
                 }
                 Ok(Err(err_msg)) => {
                     log::warn!("SSH monitor task for {} failed: {}", server.host, err_msg);
-                    // Stream death for a Slurm job usually means the job ended (or the
-                    // allocate node is gone). Drop that job's rows instead of forever
-                    // resurfacing them as "online cached" GPUs.
                     let mut emitted: Option<ServerGpuData> = None;
                     if let Ok(mut state_gpu) = state.gpu_data.lock() {
                         let entry =
@@ -949,23 +1135,21 @@ pub fn start_ssh_monitor_task(
                                     slurm_times: None,
                                     slurm_queue_jobs: None,
                                 });
-                        if let Some(ref job_id) = jid {
-                            clear_job_gpus_from_list(
-                                &mut entry.gpu_list,
-                                job_id,
-                                target_node.as_deref(),
-                            );
-                            if let Some(maps) = entry.slurm_steps.as_mut() {
-                                maps.remove(job_id);
+                        if jid.is_some() {
+                            // Keep last sample — do NOT immediately relaunch srun here.
+                            // Main worker may restart after a long cooldown (step-ID safety).
+                            entry.is_online = !entry.gpu_list.is_empty();
+                            if !entry.gpu_list.is_empty() {
+                                entry.error = Some(format!(
+                                    "{} (keeping job cache; probe restart cooled down)",
+                                    err_msg
+                                ));
+                            } else {
+                                entry.error = Some(format!(
+                                    "{} (probe idle until restart cooldown)",
+                                    err_msg
+                                ));
                             }
-                            if let Some(maps) = entry.slurm_nodelists.as_mut() {
-                                maps.remove(job_id);
-                            }
-                            if let Some(maps) = entry.slurm_times.as_mut() {
-                                maps.remove(job_id);
-                            }
-                            entry.is_online = true;
-                            entry.error = None;
                         } else {
                             // Non-slurm / login-node stream died: mark offline and drop rows.
                             apply_offline_gpu_state(entry, &err_msg, false);
@@ -976,8 +1160,8 @@ pub fn start_ssh_monitor_task(
                     if let Some(gpu_data) = emitted {
                         emit_gpu_update_if_changed(&app, state.as_ref(), &gpu_data);
                     }
-                    // Job monitors should exit after clearing; main worker restarts if needed.
                     if jid.is_some() {
+                        // Exit: another srun would consume a new Slurm step ID.
                         break;
                     }
                     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1065,6 +1249,9 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                         let mut slurm_queue_jobs: Vec<crate::models::SlurmQueueJob> = Vec::new();
                         let mut consecutive_failures: u32 = 0;
                         let mut consecutive_squeue_failures: u32 = 0;
+                        // Per-monitor last srun launch time — prevents step-ID exhaustion.
+                        let monitor_launch_at: Arc<std::sync::Mutex<HashMap<String, Instant>>> =
+                            Arc::new(std::sync::Mutex::new(HashMap::new()));
 
                         loop {
                             let res = tokio::task::spawn_blocking({
@@ -1073,6 +1260,7 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                 let state_task = state_inner.clone();
                                 let app_task = app_inner.clone();
                                 let sess_opt = session.take();
+                                let launch_at = monitor_launch_at.clone();
                                 let mut job_ids = slurm_job_ids.clone();
                                 let mut nodelists = slurm_nodelists.clone();
                                 let mut times = slurm_times.clone();
@@ -1204,37 +1392,47 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
 
                                         if s.use_slurm.unwrap_or(false) {
                                              let user = s.user.as_deref().unwrap_or("root");
-                                             let mut job_nodes = HashMap::new();
                                              if squeue_needed {
                                                  let mut squeue_success = false;
-                                                 if let Ok(mut channel) = sess.channel_session() {
-                                                     let q_cmd = format!("squeue --me -t RUNNING -h -o \"%A|%D|%N|%M\" 2>/dev/null || squeue -t RUNNING -u $(whoami) -h -o \"%A|%D|%N|%M\" || squeue -t RUNNING -u {} -h -o \"%A|%D|%N|%M\"", user);
-                                                     if let Ok(_) = channel.exec(&q_cmd) {
-                                                         let mut s_q = String::new();
-                                                         if channel.read_to_string(&mut s_q).is_ok() {
-                                                             let lines: Vec<String> = s_q.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-                                                             let mut new_nodelists = HashMap::new();
-                                                             let mut new_times = HashMap::new();
-                                                             for line in lines {
-                                                                 let parts: Vec<&str> = line.split('|').collect();
-                                                                 if parts.len() >= 4 {
-                                                                     job_nodes.insert(parts[0].to_string(), parts[1].to_string());
-                                                                     new_nodelists.insert(parts[0].to_string(), parts[2].to_string());
-                                                                     new_times.insert(parts[0].to_string(), parts[3].to_string());
-                                                                 } else if parts.len() == 3 {
-                                                                     job_nodes.insert(parts[0].to_string(), parts[1].to_string());
-                                                                     new_nodelists.insert(parts[0].to_string(), parts[2].to_string());
-                                                                 } else if parts.len() == 2 {
-                                                                     job_nodes.insert(parts[0].to_string(), parts[1].to_string());
-                                                                 } else if !line.is_empty() {
-                                                                     job_nodes.insert(line, "1".to_string());
-                                                                 }
-                                                             }
-                                                             job_ids = job_nodes.keys().cloned().collect();
-                                                             nodelists = new_nodelists;
-                                                             times = new_times;
-                                                             squeue_success = true;
-                                                         }
+                                                 // Include CONFIGURING/COMPLETING — interactive
+                                                 // allocations on busy AI clusters often leave R
+                                                 // briefly. Require exit 0 so controller blips with
+                                                 // empty stdout are not treated as "no jobs".
+                                                 // Only live allocations. Do not include COMPLETING —
+                                                 // those are already draining and look like "finished"
+                                                 // jobs lingering in the UI.
+                                                 let q_cmd = format!(
+                                                     "squeue --me -t RUNNING,CONFIGURING -h -o \"%A|%D|%N|%M\" 2>/dev/null \
+                                                      || squeue -t RUNNING,CONFIGURING -u $(whoami) -h -o \"%A|%D|%N|%M\" 2>/dev/null \
+                                                      || squeue -t R,CF -u $(whoami) -h -o \"%A|%D|%N|%M\" 2>/dev/null \
+                                                      || squeue -t RUNNING -u {} -h -o \"%A|%D|%N|%M\"",
+                                                     user
+                                                 );
+                                                 match ssh_exec_capture(&sess, &q_cmd) {
+                                                     Ok((status, s_q))
+                                                         if status == 0 && !squeue_output_looks_like_error(&s_q) =>
+                                                     {
+                                                         let (parsed_nodes, new_nodelists, new_times) =
+                                                             parse_squeue_allocation_lines(&s_q);
+                                                         job_ids = parsed_nodes.keys().cloned().collect();
+                                                         nodelists = new_nodelists;
+                                                         times = new_times;
+                                                         squeue_success = true;
+                                                     }
+                                                     Ok((status, s_q)) => {
+                                                         log::warn!(
+                                                             "squeue non-success for {} (exit {}, preview {:?})",
+                                                             s.host,
+                                                             status,
+                                                             s_q.chars().take(160).collect::<String>()
+                                                         );
+                                                     }
+                                                     Err(e) => {
+                                                         log::warn!(
+                                                             "squeue exec failed for {}: {}",
+                                                             s.host,
+                                                             e
+                                                         );
                                                      }
                                                  }
                                                  if !squeue_success {
@@ -1386,12 +1584,16 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                     }
                                                 }
 
-                                                // Query Slurm Job Steps
-                                                if let Ok(mut channel) = sess.channel_session() {
-                                                    let s_cmd = format!("squeue -s --me -h -o \"%i|%j|%M\" 2>/dev/null || squeue -s -u $(whoami) -h -o \"%i|%j|%M\" || squeue -s -u {} -h -o \"%i|%j|%M\"", user);
-                                                    if let Ok(_) = channel.exec(&s_cmd) {
-                                                        let mut s_s = String::new();
-                                                        let _ = channel.read_to_string(&mut s_s);
+                                                // Query Slurm Job Steps — only replace on exit 0 so
+                                                // controller blips do not wipe the step list.
+                                                let s_cmd = format!(
+                                                    "squeue -s --me -h -o \"%i|%j|%M\" 2>/dev/null \
+                                                     || squeue -s -u $(whoami) -h -o \"%i|%j|%M\" 2>/dev/null \
+                                                     || squeue -s -u {} -h -o \"%i|%j|%M\"",
+                                                    user
+                                                );
+                                                if let Ok((status, s_s)) = ssh_exec_capture(&sess, &s_cmd) {
+                                                    if status == 0 && !squeue_output_looks_like_error(&s_s) {
                                                         let lines: Vec<String> = s_s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
                                                         let mut new_steps = HashMap::new();
                                                         for line in lines {
@@ -1447,7 +1649,16 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                                 }
                                                             }
                                                         }
+                                                        // squeue -s can still list steps for jobs that
+                                                        // just left the allocation query — keep only
+                                                        // currently active job IDs.
                                                         steps = new_steps;
+                                                        prune_slurm_maps_for_missing_jobs(
+                                                            &mut nodelists,
+                                                            &mut times,
+                                                            &mut steps,
+                                                            &job_ids,
+                                                        );
                                                     }
                                                 }
                                              } else {
@@ -1477,37 +1688,59 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                              }
 
                                                 if s.show_squeue_list.unwrap_or(false) && squeue_needed {
-                                                    queue_jobs.clear();
                                                     let list_cmd = if s.squeue_all_users.unwrap_or(false) {
                                                         "squeue -h -o \"%A|%j|%u|%T|%M|%R\"".to_string()
                                                     } else {
                                                         format!(
-                                                            "squeue --me -h -o \"%A|%j|%u|%T|%M|%R\" 2>/dev/null || squeue -u $(whoami) -h -o \"%A|%j|%u|%T|%M|%R\" || squeue -u {} -h -o \"%A|%j|%u|%T|%M|%R\"",
+                                                            "squeue --me -h -o \"%A|%j|%u|%T|%M|%R\" 2>/dev/null \
+                                                             || squeue -u $(whoami) -h -o \"%A|%j|%u|%T|%M|%R\" 2>/dev/null \
+                                                             || squeue -u {} -h -o \"%A|%j|%u|%T|%M|%R\"",
                                                             user
                                                         )
                                                     };
-                                                    if let Ok(mut channel) = sess.channel_session() {
-                                                        if channel.exec(&list_cmd).is_ok() {
-                                                            let mut list_out = String::new();
-                                                            if channel.read_to_string(&mut list_out).is_ok() {
-                                                                for line in list_out.lines() {
-                                                                    let line = line.trim();
-                                                                    if line.is_empty() {
+                                                    // Only replace the panel on a confirmed success so
+                                                    // transient controller errors do not flash empty.
+                                                    if let Ok((status, list_out)) =
+                                                        ssh_exec_capture(&sess, &list_cmd)
+                                                    {
+                                                        if status == 0
+                                                            && !squeue_output_looks_like_error(&list_out)
+                                                        {
+                                                            let mut parsed = Vec::new();
+                                                            for line in list_out.lines() {
+                                                                let line = line.trim();
+                                                                if line.is_empty() {
+                                                                    continue;
+                                                                }
+                                                                let parts: Vec<&str> =
+                                                                    line.split('|').collect();
+                                                                if parts.len() >= 6 {
+                                                                    let id = parts[0].trim();
+                                                                    if id.is_empty()
+                                                                        || !id
+                                                                            .chars()
+                                                                            .all(|c| c.is_ascii_digit())
+                                                                    {
                                                                         continue;
                                                                     }
-                                                                    let parts: Vec<&str> = line.split('|').collect();
-                                                                    if parts.len() >= 6 {
-                                                                        queue_jobs.push(crate::models::SlurmQueueJob {
-                                                                            id: parts[0].to_string(),
-                                                                            name: parts[1].to_string(),
-                                                                            user: parts[2].to_string(),
-                                                                            state: parts[3].to_string(),
-                                                                            time: parts[4].to_string(),
-                                                                            nodelist: parts[5].to_string(),
-                                                                        });
-                                                                    }
+                                                                    parsed.push(
+                                                                        crate::models::SlurmQueueJob {
+                                                                            id: id.to_string(),
+                                                                            name: parts[1]
+                                                                                .to_string(),
+                                                                            user: parts[2]
+                                                                                .to_string(),
+                                                                            state: parts[3]
+                                                                                .to_string(),
+                                                                            time: parts[4]
+                                                                                .to_string(),
+                                                                            nodelist: parts[5]
+                                                                                .to_string(),
+                                                                        },
+                                                                    );
                                                                 }
                                                             }
+                                                            queue_jobs = parsed;
                                                         }
                                                     }
                                                 }
@@ -1547,12 +1780,44 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                     (None, None)
                                                 };
 
+                                                // Slurm probes: hard cooldown between srun launches.
+                                                if jid.is_some() {
+                                                    if let Ok(times) = launch_at.lock() {
+                                                        if let Some(started) = times.get(key) {
+                                                            if started.elapsed()
+                                                                < Duration::from_secs(
+                                                                    SLURM_MONITOR_RESTART_COOLDOWN_SECS,
+                                                                )
+                                                            {
+                                                                log::debug!(
+                                                                    "Deferring Slurm GPU probe restart for {} (cooldown {}s)",
+                                                                    key,
+                                                                    SLURM_MONITOR_RESTART_COOLDOWN_SECS
+                                                                );
+                                                                continue;
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(ref id) = jid {
+                                                        let user =
+                                                            s.user.as_deref().unwrap_or("root");
+                                                        cancel_widgitron_gpu_steps(
+                                                            &sess,
+                                                            user,
+                                                            Some(id),
+                                                        );
+                                                    }
+                                                }
+
                                                 log::debug!(
                                                     "Starting GPU monitor for host {} job {:?} node {:?}",
                                                     s.host,
                                                     jid,
                                                     target_node
                                                 );
+                                                if let Ok(mut times) = launch_at.lock() {
+                                                    times.insert(key.clone(), Instant::now());
+                                                }
                                                 let handle = start_ssh_monitor_task(
                                                     app_task.clone(),
                                                     state_task.clone(),
@@ -1583,6 +1848,9 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                             };
                                                             removed_targets.push((parts[1].to_string(), removed_node));
                                                         }
+                                                        if let Ok(mut times) = launch_at.lock() {
+                                                            times.remove(key);
+                                                        }
                                                         false
                                                     } else {
                                                         true
@@ -1593,23 +1861,24 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                             });
 
                                             if !removed_targets.is_empty() {
+                                                let user = s.user.as_deref().unwrap_or("root");
+                                                for (removed_jid, _) in &removed_targets {
+                                                    // Free probe step IDs when the allocation ends.
+                                                    cancel_widgitron_gpu_steps(
+                                                        &sess,
+                                                        user,
+                                                        Some(removed_jid),
+                                                    );
+                                                }
                                                 if let Ok(mut data) = state_task.gpu_data.lock() {
                                                     if let Some(server_data) = data.get_mut(&s.host) {
-                                                        server_data.gpu_list.retain(|g| {
-                                                            if let Some(jid) = &g.job_id {
-                                                                !removed_targets.iter().any(|(removed_jid, removed_node)| {
-                                                                    if jid != removed_jid {
-                                                                        return false;
-                                                                    }
-                                                                    match removed_node {
-                                                                        Some(node) => g.node.as_ref() == Some(node),
-                                                                        None => true,
-                                                                    }
-                                                                })
-                                                            } else {
-                                                                true
-                                                            }
-                                                        });
+                                                        for (removed_jid, removed_node) in &removed_targets {
+                                                            clear_job_gpus_from_list(
+                                                                &mut server_data.gpu_list,
+                                                                removed_jid,
+                                                                removed_node.as_deref(),
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1752,14 +2021,29 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                         let mut emitted_gpu_data = gpu_data.clone();
                                         if let Ok(mut data) = state_task.gpu_data.lock() {
                                              if s.use_slurm.unwrap_or(false) {
-                                                 // Prefer freshly computed / cleaned state — do not
-                                                 // blindly restore an older gpu_list over an empty
-                                                 // post-job-end snapshot.
-                                                 if matches!(squeue_outcome, Some(true)) && job_ids.is_empty() {
+                                                 // On a confirmed squeue refresh, drop GPU rows / maps
+                                                 // for any job that is no longer in the live list.
+                                                 // (Previously we only cleared when the list was fully
+                                                 // empty, so finished jobs lingered beside active ones.)
+                                                 if matches!(squeue_outcome, Some(true)) {
+                                                     prune_slurm_maps_for_missing_jobs(
+                                                         &mut nodelists,
+                                                         &mut times,
+                                                         &mut steps,
+                                                         &job_ids,
+                                                     );
+                                                     let retain_live = |list: &mut Vec<GpuInfo>| {
+                                                         list.retain(|g| match &g.job_id {
+                                                             None => true,
+                                                             Some(jid) => {
+                                                                 job_ids.iter().any(|active| active == jid)
+                                                             }
+                                                         });
+                                                     };
                                                      if let Some(entry) = data.get_mut(&s.host) {
-                                                         entry.gpu_list.retain(|g| g.job_id.is_none());
+                                                         retain_live(&mut entry.gpu_list);
                                                      }
-                                                     gpu_data.gpu_list.retain(|g| g.job_id.is_none());
+                                                     retain_live(&mut gpu_data.gpu_list);
                                                  }
                                                  gpu_data.is_online = true;
                                                  gpu_data.last_update = Some(Utc::now().format("%H:%M:%S").to_string());
@@ -1773,6 +2057,8 @@ pub async fn start_gpu_monitor(app: AppHandle, state: Arc<GlobalState>) {
                                                  }
                                                  if gpu_data.error.as_ref().is_some_and(|e| {
                                                      e.contains("showing cached")
+                                                         || e.contains("keeping job cache")
+                                                         || e.contains("probe idle")
                                                  }) && matches!(squeue_outcome, Some(true))
                                                  {
                                                      gpu_data.error = None;
