@@ -416,6 +416,18 @@ export function GPUWidgetContent({ hideHeader = false }: { hideHeader?: boolean 
               if (!groups[gid]) groups[gid] = [];
               groups[gid].push(gpu);
             });
+            // Keep headers for live allocations when GPU probe blips. Only use
+            // nodelist/time (from allocation squeue) — not steps, which can lag
+            // and resurface jobs that already left the queue.
+            if (slurmEnabled) {
+              const knownJobIds = new Set<string>([
+                ...Object.keys(server.slurm_nodelists || {}),
+                ...Object.keys(server.slurm_times || {}),
+              ]);
+              knownJobIds.forEach((jid) => {
+                if (!groups[jid]) groups[jid] = [];
+              });
+            }
 
             return (
               <div
